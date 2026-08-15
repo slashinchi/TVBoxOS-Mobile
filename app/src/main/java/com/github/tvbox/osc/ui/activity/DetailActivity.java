@@ -937,7 +937,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
                     .setAspectRatio(ratio)
                     .setActions(actions).build();
             playFragment.getPlayer().postDelayed(() -> {//代码模拟home键时会立即执行,toggleFullPreview中竖屏有切换横屏操作,
-                if (!fullWindows) {
+                if (isInPictureInPictureMode() && !fullWindows) {
                     toggleFullPreview();
                 }
             }, 300);
@@ -945,7 +945,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
             playFragment.getController().hideBottom();
 
             playFragment.getPlayer().postDelayed(() -> {
-                if (!playFragment.getPlayer().isPlaying()) {
+                if (isInPictureInPictureMode() && !playFragment.getPlayer().isPlaying()) {
                     playFragment.getController().togglePlay();
                 }
             }, 400);
