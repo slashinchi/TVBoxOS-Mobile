@@ -178,9 +178,19 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
         isReverse = false;
         preFlag = "";
         if (showPreview) {
-            playFragment = new PlayFragment();
-            getSupportFragmentManager().beginTransaction().add(R.id.previewPlayer, playFragment).commit();
-            getSupportFragmentManager().beginTransaction().show(playFragment).commitAllowingStateLoss();
+            playFragment = ensurePlayFragment();
+            if (playFragment.isHidden()) {
+                getSupportFragmentManager().beginTransaction().show(playFragment).commitAllowingStateLoss();
+                getSupportFragmentManager().executePendingTransactions();
+            }
+        } else {
+            // no-preview：不主动创建；Activity 恢复出的 fragment 隐藏，避免 250dp overlay 与隐形播放
+            playFragment = (PlayFragment) getSupportFragmentManager().findFragmentById(R.id.previewPlayer);
+            if (playFragment != null && !playFragment.isHidden()) {
+                getSupportFragmentManager().beginTransaction().hide(playFragment).commitAllowingStateLoss();
+                getSupportFragmentManager().executePendingTransactions();
+            }
+            mBinding.previewPlayer.setVisibility(View.GONE);
         }
 
         findViewById(R.id.ll_title).setOnClickListener(view -> {
@@ -424,14 +434,10 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
 //                    bundle.putSerializable("VodInfo", previewVodInfo);
                 App.getInstance().setVodInfo(previewVodInfo);
             }
-            if (playFragment == null) {
-                playFragment = (PlayFragment) getSupportFragmentManager().findFragmentById(R.id.previewPlayer);
-                if (playFragment == null) {
-                    // showPreview=false 时不创建预览播放器；点集数时按原设计懒创建并同步完成初始化
-                    playFragment = new PlayFragment();
-                    getSupportFragmentManager().beginTransaction().add(R.id.previewPlayer, playFragment).commit();
-                    getSupportFragmentManager().executePendingTransactions();
-                }
+            playFragment = ensurePlayFragment();
+            if (playFragment.isHidden()) {
+                getSupportFragmentManager().beginTransaction().show(playFragment).commitAllowingStateLoss();
+                getSupportFragmentManager().executePendingTransactions();
             }
             playFragment.setData(bundle);
 
@@ -444,6 +450,22 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
             //定位选集
             mBinding.mGridView.scrollToPosition(vodInfo.playIndex);
         }
+    }
+
+    /**
+     * 复用或创建预览播放器 fragment。
+     * Activity 恢复后成员引用为 null 而 FragmentManager 中实例仍在，必须先 findFragmentById 复用，避免重复 add。
+     */
+    private PlayFragment ensurePlayFragment() {
+        if (playFragment == null) {
+            playFragment = (PlayFragment) getSupportFragmentManager().findFragmentById(R.id.previewPlayer);
+        }
+        if (playFragment == null) {
+            playFragment = new PlayFragment();
+            getSupportFragmentManager().beginTransaction().add(R.id.previewPlayer, playFragment).commit();
+            getSupportFragmentManager().executePendingTransactions();
+        }
+        return playFragment;
     }
 
     @SuppressLint("NotifyDataSetChanged")
@@ -813,7 +835,10 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
         fullWindows = !fullWindows;
 
         if (!showPreview && !fullWindows) {
-            // no-preview：退出全屏后隐藏播放器容器，避免覆盖详情内容
+            // no-preview：退出全屏后暂停播放并隐藏容器，避免覆盖详情内容与隐形音频
+            if (playFragment.getPlayer() != null && playFragment.getPlayer().isPlaying()) {
+                playFragment.getPlayer().pause();
+            }
             mBinding.previewPlayer.setVisibility(View.GONE);
         }
 
