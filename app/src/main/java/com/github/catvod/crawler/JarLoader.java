@@ -1,6 +1,7 @@
 package com.github.catvod.crawler;
 
 import android.content.Context;
+import android.os.Build;
 
 import com.github.tvbox.osc.base.App;
 import com.github.tvbox.osc.util.MD5;
@@ -46,6 +47,10 @@ public class JarLoader {
             File cacheDir = new File(App.getInstance().getCacheDir().getAbsolutePath() + "/catvod_csp");
             if (!cacheDir.exists())
                 cacheDir.mkdirs();
+            File jarFile = new File(jar);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && jarFile.exists() && !jarFile.setReadOnly()) {
+                return false;
+            }
             DexClassLoader classLoader = new DexClassLoader(jar, cacheDir.getAbsolutePath(), null, App.getInstance().getClassLoader());
             // make force wait here, some device async dex load
             int count = 0;
@@ -95,8 +100,20 @@ public class JarLoader {
         try {
             Response response = OkGo.<File>get(jar).execute();
             InputStream is = response.body().byteStream();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                if (cache.exists() && !cache.delete()) {
+                    try {
+                        is.close();
+                    } catch (Exception ignored) {
+                    }
+                    return null;
+                }
+            }
             OutputStream os = new FileOutputStream(cache);
             try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && !cache.setReadOnly()) {
+                    return null;
+                }
                 byte[] buffer = new byte[2048];
                 int length;
                 while ((length = is.read(buffer)) > 0) {

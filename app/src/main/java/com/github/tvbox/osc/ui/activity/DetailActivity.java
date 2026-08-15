@@ -26,6 +26,7 @@ import android.widget.Toast;
 
 import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AlertDialog;
+import androidx.core.content.ContextCompat;
 import androidx.lifecycle.Observer;
 import androidx.lifecycle.ViewModelProvider;
 
@@ -286,11 +287,11 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
                 public void onReceive(Context context, Intent intent) {
                     String action = intent.getAction();
                     if (action != null && action.equals(Intent.ACTION_CLOSE_SYSTEM_DIALOGS)) {
-                        openBackgroundPlay = Hawk.get(HawkConfig.BACKGROUND_PLAY_TYPE, 0) == 1 && playFragment.getPlayer() != null && playFragment.getPlayer().isPlaying();
+                        openBackgroundPlay = Hawk.get(HawkConfig.BACKGROUND_PLAY_TYPE, 0) == 1 && playFragment != null && playFragment.getPlayer() != null && playFragment.getPlayer().isPlaying();
                     }
                 }
             };
-            registerReceiver(mHomeKeyReceiver, new IntentFilter(Intent.ACTION_CLOSE_SYSTEM_DIALOGS));
+            ContextCompat.registerReceiver(this, mHomeKeyReceiver, new IntentFilter(Intent.ACTION_CLOSE_SYSTEM_DIALOGS), ContextCompat.RECEIVER_NOT_EXPORTED);
         }
     }
 
@@ -908,8 +909,8 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
                 PendingIntent.getBroadcast(
                         DetailActivity.this,
                         actionCode,
-                        new Intent(IntentKey.BROADCAST_ACTION).putExtra("action", actionCode),
-                        0);
+                        new Intent(IntentKey.BROADCAST_ACTION).putExtra("action", actionCode).setPackage(getPackageName()),
+                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         final Icon icon = Icon.createWithResource(DetailActivity.this, iconResId);
         return (new RemoteAction(icon, title, desc, intent));
     }
@@ -920,6 +921,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
      */
     private void registerActionReceiver(boolean isRegister) {
         if (isRegister) {
+            if (mRemoteActionReceiver != null) return;
             mRemoteActionReceiver = new BroadcastReceiver() {
 
                 @Override
@@ -942,13 +944,13 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
                     }
                 }
             };
-            registerReceiver(mRemoteActionReceiver, new IntentFilter(IntentKey.BROADCAST_ACTION));
+            ContextCompat.registerReceiver(this, mRemoteActionReceiver, new IntentFilter(IntentKey.BROADCAST_ACTION), ContextCompat.RECEIVER_NOT_EXPORTED);
         } else {
             if (mRemoteActionReceiver != null) {
                 unregisterReceiver(mRemoteActionReceiver);
                 mRemoteActionReceiver = null;
             }
-            if (playFragment.getPlayer().isPlaying()) {// 退出画中画时,暂停播放(画中画的全屏也会触发,但全屏后会自动播放)
+            if (playFragment != null && playFragment.getPlayer() != null && playFragment.getPlayer().isPlaying()) {// 退出画中画时,暂停播放(画中画的全屏也会触发,但全屏后会自动播放)
                 playFragment.getController().togglePlay();
             }
         }
