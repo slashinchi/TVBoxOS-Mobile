@@ -285,8 +285,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
             mHomeKeyReceiver = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context context, Intent intent) {
-                    String action = intent.getAction();
-                    if (action != null && action.equals(Intent.ACTION_CLOSE_SYSTEM_DIALOGS)) {
+                    if (Intent.ACTION_CLOSE_SYSTEM_DIALOGS.equals(intent.getAction())) {
                         openBackgroundPlay = Hawk.get(HawkConfig.BACKGROUND_PLAY_TYPE, 0) == 1 && playFragment != null && playFragment.getPlayer() != null && playFragment.getPlayer().isPlaying();
                     }
                 }
@@ -425,9 +424,13 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
 //                    bundle.putSerializable("VodInfo", previewVodInfo);
                 App.getInstance().setVodInfo(previewVodInfo);
             }
-            if (playFragment != null) {
-                playFragment.setData(bundle);
+            if (playFragment == null) {
+                // showPreview=false 时不创建预览播放器；点集数时按原设计懒创建并同步完成初始化
+                playFragment = new PlayFragment();
+                getSupportFragmentManager().beginTransaction().add(R.id.previewPlayer, playFragment).commit();
+                getSupportFragmentManager().executePendingTransactions();
             }
+            playFragment.setData(bundle);
 
             //定位选集
             mBinding.mGridView.scrollToPosition(vodInfo.playIndex);
@@ -930,7 +933,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
 
                 @Override
                 public void onReceive(Context context, Intent intent) {
-                    if (intent == null || !intent.getAction().equals(IntentKey.BROADCAST_ACTION) || playFragment == null || playFragment.getController() == null) {
+                    if (intent == null || !IntentKey.BROADCAST_ACTION.equals(intent.getAction()) || playFragment == null || playFragment.getController() == null) {
                         return;
                     }
 
