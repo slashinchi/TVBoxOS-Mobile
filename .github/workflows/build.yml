@@ -141,6 +141,10 @@ jobs:
         run: |
           printf '%s' "$TVBOX_KEYSTORE_BASE64" | base64 --decode > TVBoxOSC.jks
           chmod 600 TVBoxOSC.jks
+          if [ ! -s TVBoxOSC.jks ]; then
+            echo "::error::Decoded keystore is empty or invalid"
+            exit 1
+          fi
 
       - name: Build signed release APK
         env:
@@ -167,16 +171,29 @@ jobs:
           apk="${apks[0]}"
           echo "APK: $apk"
           "$BT/apksigner" verify --verbose --print-certs "$apk" | tee build/apk-signature.txt
-          actual_sha=$(grep -m 1 -E 'certificate SHA-256 digest' build/apk-signature.txt | awk '{print $NF}')
-          if [ -z "$actual_sha" ] || [ "$actual_sha" != "$TVBOX_SIGNER_SHA256" ]; then
-            echo "::error::Signer fingerprint mismatch. Expected ${TVBOX_SIGNER_SHA256}, got ${actual_sha}"
+          actual_sha=$(grep -m 1 -E 'certificate SHA-256 digest' build/apk-signature.txt | awk '{print $NF}' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' | tr -d ':')
+          expected_sha=$(printf '%s' "$TVBOX_SIGNER_SHA256" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' | tr -d ':')
+          if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::TVBOX_SIGNER_SHA256 is not a 64-char hex fingerprint"
+            exit 1
+          fi
+          if [ "$actual_sha" != "$expected_sha" ]; then
+            echo "::error::Signer fingerprint mismatch. Expected ${expected_sha}, got ${actual_sha}"
             exit 1
           fi
           badging=$("$BT/aapt2" dump badging "$apk")
           pkg=$(echo "$badging" | sed -nE "s/^package: name='([^']+)'.*/\1/p" | head -1)
           vcode=$(echo "$badging" | sed -nE "s/^package:.*versionCode='([^']+)'.*/\1/p" | head -1)
           vname=$(echo "$badging" | sed -nE "s/^package:.*versionName='([^']+)'.*/\1/p" | head -1)
-          echo "package=$pkg versionCode=$vcode versionName=$vname" | tee build/rc-identity.txt
+          apk_sha=$(sha256sum "$apk" | awk '{print $1}')
+          {
+            echo "signer_sha256=${actual_sha}"
+            echo "apk_sha256=${apk_sha}"
+            echo "package=${pkg}"
+            echo "versionCode=${vcode}"
+            echo "versionName=${vname}"
+            echo "commit=${GITHUB_SHA}"
+          } | tee build/rc-identity.txt
           [ "$pkg" = "com.github.tvbox.osc" ] || { echo "::error::package mismatch"; exit 1; }
           [ "$vcode" = "23601" ] || { echo "::error::versionCode mismatch"; exit 1; }
           [ "$vname" = "2.1.26.1" ] || { echo "::error::versionName mismatch"; exit 1; }
