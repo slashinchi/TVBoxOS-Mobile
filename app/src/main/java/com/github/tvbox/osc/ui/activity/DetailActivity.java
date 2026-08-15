@@ -425,12 +425,21 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
                 App.getInstance().setVodInfo(previewVodInfo);
             }
             if (playFragment == null) {
-                // showPreview=false 时不创建预览播放器；点集数时按原设计懒创建并同步完成初始化
-                playFragment = new PlayFragment();
-                getSupportFragmentManager().beginTransaction().add(R.id.previewPlayer, playFragment).commit();
-                getSupportFragmentManager().executePendingTransactions();
+                playFragment = (PlayFragment) getSupportFragmentManager().findFragmentById(R.id.previewPlayer);
+                if (playFragment == null) {
+                    // showPreview=false 时不创建预览播放器；点集数时按原设计懒创建并同步完成初始化
+                    playFragment = new PlayFragment();
+                    getSupportFragmentManager().beginTransaction().add(R.id.previewPlayer, playFragment).commit();
+                    getSupportFragmentManager().executePendingTransactions();
+                }
             }
             playFragment.setData(bundle);
+
+            if (!showPreview && !fullWindows) {
+                // no-preview：直接进入全屏播放，避免 250dp overlay 覆盖详情内容
+                mBinding.previewPlayer.setVisibility(View.VISIBLE);
+                toggleFullPreview();
+            }
 
             //定位选集
             mBinding.mGridView.scrollToPosition(vodInfo.playIndex);
@@ -803,6 +812,11 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
         }
         fullWindows = !fullWindows;
 
+        if (!showPreview && !fullWindows) {
+            // no-preview：退出全屏后隐藏播放器容器，避免覆盖详情内容
+            mBinding.previewPlayer.setVisibility(View.GONE);
+        }
+
         //交由fragment处理播放器全屏逻辑
         playFragment.changedLandscape(fullWindows);
         //activity处理预览尺寸(全屏/非全屏预览)
@@ -869,6 +883,9 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
      */
     public void enterPip() {
         if (playFragment == null || playFragment.getPlayer() == null) return;
+        if (!showPreview) {
+            mBinding.previewPlayer.setVisibility(View.VISIBLE);
+        }
         if (Utils.supportsPiPMode()) {
             // 创建一个Intent对象，模拟按下Home键
             Intent intent = new Intent(Intent.ACTION_MAIN);
