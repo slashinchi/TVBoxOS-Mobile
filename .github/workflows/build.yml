@@ -208,9 +208,11 @@ jobs:
         run: |
           failure_line=$(grep -m 1 -E 'Execution failed for task|^e: | error: ' build/gradle-build.log || true)
           if [ -z "$failure_line" ]; then
-            failure_line=$(tail -n 1 build/gradle-build.log)
+            failure_line=$(tail -n 1 build/gradle-build.log || true)
           fi
-          echo "::error title=Gradle build failure::$failure_line"
+          if [ -n "$failure_line" ]; then
+            echo "::error title=Gradle build failure::$failure_line"
+          fi
 
   publish-github-release:
     if: startsWith(github.ref, 'refs/tags/v')
