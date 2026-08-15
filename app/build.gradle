@@ -2,9 +2,9 @@ apply plugin: 'com.android.application'
 apply plugin: 'org.jetbrains.kotlin.android'
 
 def tvBoxSigningStore = rootProject.file('TVBoxOSC.jks')
-def tvBoxKeyAlias = System.getenv('TVBOX_KEY_ALIAS') ?: 'TVBoxOSC'
-def tvBoxKeyPassword = System.getenv('TVBOX_KEY_PASSWORD') ?: 'TVBoxOSC'
-def tvBoxStorePassword = System.getenv('TVBOX_STORE_PASSWORD') ?: 'TVBoxOSC'
+def tvBoxKeyAlias = System.getenv('TVBOX_KEY_ALIAS')
+def tvBoxKeyPassword = System.getenv('TVBOX_KEY_PASSWORD')
+def tvBoxStorePassword = System.getenv('TVBOX_STORE_PASSWORD')
 
 android {
     namespace 'com.github.tvbox.osc'
@@ -14,8 +14,8 @@ android {
         applicationId 'com.github.tvbox.osc'
         minSdkVersion 24
         targetSdkVersion 34
-        versionCode 236
-        versionName '2.1.26'
+        versionCode 23601
+        versionName '2.1.26.1'
         multiDexEnabled true
         //设置room的Schema的位置
         javaCompileOptions {
@@ -47,6 +47,9 @@ android {
     signingConfigs {
         config {
             if (tvBoxSigningStore.exists()) {
+                if (tvBoxKeyAlias == null || tvBoxKeyPassword == null || tvBoxStorePassword == null) {
+                    throw new GradleException("TVBoxOSC.jks exists but TVBOX_KEY_ALIAS / TVBOX_KEY_PASSWORD / TVBOX_STORE_PASSWORD are not all set. Refusing to sign with fallback values.")
+                }
                 keyAlias tvBoxKeyAlias
                 keyPassword tvBoxKeyPassword
                 storeFile tvBoxSigningStore
