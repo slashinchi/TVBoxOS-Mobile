@@ -425,7 +425,9 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
 //                    bundle.putSerializable("VodInfo", previewVodInfo);
                 App.getInstance().setVodInfo(previewVodInfo);
             }
-            playFragment.setData(bundle);
+            if (playFragment != null) {
+                playFragment.setData(bundle);
+            }
 
             //定位选集
             mBinding.mGridView.scrollToPosition(vodInfo.playIndex);
@@ -759,7 +761,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
             mAllSeriesBottomDialog.dismiss();
             return;
         }
-        if (playFragment.hideAllDialogSuccess()) {//fragment有弹窗隐藏并拦截返回
+        if (playFragment != null && playFragment.hideAllDialogSuccess()) {//fragment有弹窗隐藏并拦截返回
             return;
         }
         if (fullWindows) {
@@ -789,6 +791,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
     ViewGroup.LayoutParams windowsFull = null;
 
     public void toggleFullPreview() {
+        if (playFragment == null) return;
         if (windowsPreview == null) {
             windowsPreview = mBinding.previewPlayer.getLayoutParams();
         }
@@ -821,7 +824,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
     public void use1DMDownload() {
         if (vodInfo != null && vodInfo.seriesMap.get(vodInfo.playFlag).size() > 0) {
             VodInfo.VodSeries vod = vodInfo.seriesMap.get(vodInfo.playFlag).get(vodInfo.playIndex);
-            String url = TextUtils.isEmpty(playFragment.getFinalUrl()) ? vod.url : playFragment.getFinalUrl();
+            String url = playFragment == null || TextUtils.isEmpty(playFragment.getFinalUrl()) ? vod.url : playFragment.getFinalUrl();
             // 创建Intent对象，启动1DM App
             Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
             intent.setDataAndType(Uri.parse(url), "video/mp4");
@@ -862,6 +865,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
      * 画中画模式
      */
     public void enterPip() {
+        if (playFragment == null || playFragment.getPlayer() == null) return;
         if (Utils.supportsPiPMode()) {
             // 创建一个Intent对象，模拟按下Home键
             Intent intent = new Intent(Intent.ACTION_MAIN);
@@ -926,7 +930,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
 
                 @Override
                 public void onReceive(Context context, Intent intent) {
-                    if (intent == null || !intent.getAction().equals(IntentKey.BROADCAST_ACTION) || playFragment.getController() == null) {
+                    if (intent == null || !intent.getAction().equals(IntentKey.BROADCAST_ACTION) || playFragment == null || playFragment.getController() == null) {
                         return;
                     }
 
@@ -967,6 +971,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
      */
     private void playServerSwitch(boolean open) {
         if (open) {
+            if (playFragment == null || playFragment.getPlayer() == null) return;
             VodInfo.VodSeries vod = vodInfo.seriesMap.get(vodInfo.playFlag).get(vodInfo.playIndex);
             PlayService.start(playFragment.getPlayer(), vodInfo.name + "&&" + vod.name);
             registerActionReceiver(true);
@@ -1023,7 +1028,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
             }
             screenShotListenManager.setListener(imagePath -> {
 
-                if (playFragment.getPlayer().isInPlaybackState())return;
+                if (playFragment != null && playFragment.getPlayer() != null && playFragment.getPlayer().isInPlaybackState()) return;
 
                 new XPopup.Builder(this)
                         .isDarkTheme(Utils.isDarkTheme())
