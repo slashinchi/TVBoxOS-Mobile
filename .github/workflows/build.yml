@@ -2,7 +2,7 @@ name: TVBox Mobile Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, patched]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
