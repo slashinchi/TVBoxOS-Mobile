@@ -48,8 +48,12 @@ public class JarLoader {
             if (!cacheDir.exists())
                 cacheDir.mkdirs();
             File jarFile = new File(jar);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && jarFile.exists() && !jarFile.setReadOnly()) {
-                return false;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && jarFile.exists()) {
+                if (isHardenedJar(jar)) {
+                    jarFile.setWritable(true);
+                } else if (!jarFile.setReadOnly()) {
+                    return false;
+                }
             }
             DexClassLoader classLoader = new DexClassLoader(jar, cacheDir.getAbsolutePath(), null, App.getInstance().getClassLoader());
             // make force wait here, some device async dex load
@@ -111,9 +115,6 @@ public class JarLoader {
             }
             OutputStream os = new FileOutputStream(cache);
             try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && !cache.setReadOnly()) {
-                    return null;
-                }
                 byte[] buffer = new byte[2048];
                 int length;
                 while ((length = is.read(buffer)) > 0) {
@@ -126,6 +127,9 @@ public class JarLoader {
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && !isHardenedJar(cache.getAbsolutePath()) && !cache.setReadOnly()) {
+                return null;
             }
             loadClassLoader(cache.getAbsolutePath(), key);
             return classLoaders.get(key);
@@ -211,5 +215,24 @@ public class JarLoader {
 
         }
         return null;
+    }
+
+    private static final ConcurrentHashMap<String, Boolean> hardenedCache = new ConcurrentHashMap<>();
+
+    private boolean isHardenedJar(String jarPath) {
+        if (jarPath == null) return false;
+        return hardenedCache.computeIfAbsent(jarPath, p -> {
+            try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(p)) {
+                java.util.Enumeration<? extends java.util.zip.ZipEntry> es = zf.entries();
+                while (es.hasMoreElements()) {
+                    String name = es.nextElement().getName();
+                    if (name.contains("ftyguard") || name.endsWith(".guard")) {
+                        return true;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            return false;
+        });
     }
 }
