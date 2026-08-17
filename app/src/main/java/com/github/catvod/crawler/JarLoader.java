@@ -50,7 +50,9 @@ public class JarLoader {
             File jarFile = new File(jar);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && jarFile.exists()) {
                 if (isHardenedJar(jar)) {
-                    jarFile.setWritable(true);
+                    if (!jarFile.setWritable(true)) {
+                        return false;
+                    }
                 } else if (!jarFile.setReadOnly()) {
                     return false;
                 }
@@ -217,22 +219,19 @@ public class JarLoader {
         return null;
     }
 
-    private static final ConcurrentHashMap<String, Boolean> hardenedCache = new ConcurrentHashMap<>();
-
     private boolean isHardenedJar(String jarPath) {
         if (jarPath == null) return false;
-        return hardenedCache.computeIfAbsent(jarPath, p -> {
-            try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(p)) {
-                java.util.Enumeration<? extends java.util.zip.ZipEntry> es = zf.entries();
-                while (es.hasMoreElements()) {
-                    String name = es.nextElement().getName();
-                    if (name.contains("ftyguard") || name.endsWith(".guard")) {
-                        return true;
-                    }
+        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(jarPath)) {
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> es = zf.entries();
+            while (es.hasMoreElements()) {
+                String name = es.nextElement().getName();
+                if (name.contains("ftyguard") || name.endsWith(".guard")) {
+                    return true;
                 }
-            } catch (Throwable ignored) {
             }
-            return false;
-        });
+        } catch (Throwable th) {
+            return true;
+        }
+        return false;
     }
 }
