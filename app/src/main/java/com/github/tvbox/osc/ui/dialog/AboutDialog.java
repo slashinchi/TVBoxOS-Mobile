@@ -38,7 +38,7 @@ public class AboutDialog extends BottomPopupView {
     // Secondary acceleration mirror when primary is unavailable
     private static final String ACCEL_FALLBACK = "https://gh-proxy.com/";
 
-    private static final String RAW_UPDATE_JSON = "https://raw.githubusercontent.com/kukuqi666/TVBoxOS-Mobile/main/update.json";
+    private static final String RAW_UPDATE_JSON = "https://raw.githubusercontent.com/slashinchi/TVBoxOS-Mobile/patched/update.json";
 
     private LinearLayout downloadProgressLayout;
     private ProgressBar downloadProgressBar;

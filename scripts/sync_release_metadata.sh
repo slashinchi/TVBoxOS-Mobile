@@ -9,7 +9,7 @@ fi
 
 tag_name="${1:?Usage: sync_release_metadata.sh [--skip-version-check] vX.Y.Z}"
 version="${tag_name#v}"
-repository="${GITHUB_REPOSITORY:-kukuqi666/TVBoxOS-Mobile}"
+repository="${GITHUB_REPOSITORY:-slashinchi/TVBoxOS-Mobile}"
 app_version=$(sed -nE "s/^[[:space:]]*versionName '([^']+)'/\1/p" app/build.gradle)
 
 if [[ "$tag_name" != v* || ! "$version" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
