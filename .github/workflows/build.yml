@@ -330,6 +330,7 @@ jobs:
           TVBOX_SIGNER_SHA256: ${{ vars.TVBOX_SIGNER_SHA256 }}
         run: |
           set -euo pipefail
+          mkdir -p build
           BT="$ANDROID_HOME/build-tools/34.0.0"
           apks=("$PWD"/app/build/outputs/apk/release/*.apk)
           if [ "${#apks[@]}" -ne 1 ]; then
