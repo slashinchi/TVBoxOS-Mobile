@@ -82,7 +82,7 @@ https://github.com/UndCover/PyramidStore/
 
 ## 📲软件合集（软件安装）
 ### TVBox for Android
-- TVbox-Mobile：[kukuqi666/TVBoxOS-Mobile](https://gh.xxooo.cf/https://github.com/kukuqi666/TVBoxOS-Mobile/releases/download/v2.1.26/TVBox-Mobile-v2.1.26.apk)
+- TVbox-Mobile：[slashinchi/TVBoxOS-Mobile](https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/v2.1.26.1/TVBox-Mobile-v2.1.26.1.apk)
 
 
 ## 🎁福利18+
