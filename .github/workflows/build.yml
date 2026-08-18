@@ -195,8 +195,10 @@ jobs:
             echo "commit=${GITHUB_SHA}"
           } | tee build/rc-identity.txt
           [ "$pkg" = "com.github.tvbox.osc" ] || { echo "::error::package mismatch"; exit 1; }
-          [ "$vcode" = "23601" ] || { echo "::error::versionCode mismatch"; exit 1; }
-          [ "$vname" = "2.1.26.1" ] || { echo "::error::versionName mismatch"; exit 1; }
+          expected_vcode=$(sed -nE "s/^[[:space:]]*versionCode ([0-9]+).*/\1/p" app/build.gradle | head -1)
+          expected_vname=$(sed -nE "s/^[[:space:]]*versionName '([^']+)'.*/\1/p" app/build.gradle | head -1)
+          [ "$vcode" = "$expected_vcode" ] || { echo "::error::versionCode mismatch (apk=${vcode} expected=${expected_vcode})"; exit 1; }
+          [ "$vname" = "$expected_vname" ] || { echo "::error::versionName mismatch (apk=${vname} expected=${expected_vname})"; exit 1; }
 
       - name: Upload signed RC APK
         if: success()
@@ -241,6 +243,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -272,9 +276,28 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           version="${TAG_NAME#v}"
-          app_version=$(sed -nE "s/^[[:space:]]*versionName '([^']+)'/\1/p" app/build.gradle)
+          app_version=$(sed -nE "s/^[[:space:]]*versionName '([^']+)'/\1/p" app/build.gradle | head -1)
           if [ "$app_version" != "$version" ]; then
             echo "::error::Tag ${TAG_NAME} does not match app version ${app_version}"
+            exit 1
+          fi
+
+      - name: Verify signing configuration fail-fast
+        env:
+          TVBOX_KEYSTORE_BASE64: ${{ secrets.TVBOX_KEYSTORE_BASE64 }}
+          TVBOX_KEY_ALIAS: ${{ secrets.TVBOX_KEY_ALIAS }}
+          TVBOX_KEY_PASSWORD: ${{ secrets.TVBOX_KEY_PASSWORD }}
+          TVBOX_STORE_PASSWORD: ${{ secrets.TVBOX_STORE_PASSWORD }}
+          TVBOX_SIGNER_SHA256: ${{ vars.TVBOX_SIGNER_SHA256 }}
+        run: |
+          missing=""
+          [ -z "$TVBOX_KEYSTORE_BASE64" ] && missing="$missing TVBOX_KEYSTORE_BASE64"
+          [ -z "$TVBOX_KEY_ALIAS" ] && missing="$missing TVBOX_KEY_ALIAS"
+          [ -z "$TVBOX_KEY_PASSWORD" ] && missing="$missing TVBOX_KEY_PASSWORD"
+          [ -z "$TVBOX_STORE_PASSWORD" ] && missing="$missing TVBOX_STORE_PASSWORD"
+          [ -z "$TVBOX_SIGNER_SHA256" ] && missing="$missing TVBOX_SIGNER_SHA256"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing signing configuration:$missing"
             exit 1
           fi
 
@@ -287,6 +310,11 @@ jobs:
             exit 1
           fi
           printf '%s' "$TVBOX_KEYSTORE_BASE64" | base64 --decode > TVBoxOSC.jks
+          chmod 600 TVBoxOSC.jks
+          if [ ! -s TVBoxOSC.jks ]; then
+            echo "::error::Decoded keystore is empty or invalid"
+            exit 1
+          fi
 
       - name: Build release artifact
         env:
@@ -335,8 +363,10 @@ jobs:
             echo "commit=${GITHUB_SHA}"
           } | tee build/rc-identity.txt
           [ "$pkg" = "com.github.tvbox.osc" ] || { echo "::error::package mismatch"; exit 1; }
-          [ "$vcode" = "23601" ] || { echo "::error::versionCode mismatch"; exit 1; }
-          [ "$vname" = "2.1.26.1" ] || { echo "::error::versionName mismatch"; exit 1; }
+          expected_vcode=$(sed -nE "s/^[[:space:]]*versionCode ([0-9]+).*/\1/p" app/build.gradle | head -1)
+          expected_vname=$(sed -nE "s/^[[:space:]]*versionName '([^']+)'.*/\1/p" app/build.gradle | head -1)
+          [ "$vcode" = "$expected_vcode" ] || { echo "::error::versionCode mismatch (apk=${vcode} expected=${expected_vcode})"; exit 1; }
+          [ "$vname" = "$expected_vname" ] || { echo "::error::versionName mismatch (apk=${vname} expected=${expected_vname})"; exit 1; }
 
       - name: Create update manifest
         env:
@@ -370,3 +400,7 @@ jobs:
           done
           echo "::error::Unable to publish update manifest after three attempts"
           exit 1
+
+      - name: Cleanup signing key
+        if: always()
+        run: rm -f TVBoxOSC.jks
