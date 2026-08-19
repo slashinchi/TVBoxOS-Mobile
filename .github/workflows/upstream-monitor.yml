@@ -1016,25 +1016,32 @@ jobs:
           issue_has_marker() {
             local number="$1"
             local marker="$2"
-            local issue_data issue_body comments
-            if ! issue_data=$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/issues/$number"); then
+            local issue_data issue_body comments attempt marker_status
+            issue_data=""
+            for attempt in 1 2 3; do
+              if issue_data=$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/issues/$number"); then
+                break
+              fi
+              sleep $((attempt * 2))
+            done
+            if [[ -z "$issue_data" ]]; then
               return 2
             fi
             if ! issue_body=$(jq -r '.body // ""' <<<"$issue_data"); then
               return 2
             fi
+            if [[ "$issue_body" == *"$marker"* ]]; then
+              return 0
+            fi
             if ! comments=$(list_issue_comments "$number"); then
               return 2
             fi
-            if jq -e \
-              --arg marker "$marker" \
-              --arg body "$issue_body" \
-              --argjson comments "$comments" \
-              '($body | contains($marker)) or any($comments[][]; (.body // "") | contains($marker))' \
-              <<<"null" >/dev/null; then
+            if jq -e --arg marker "$marker" 'any(.[][]; (.body // "") | contains($marker))' <<<"$comments" >/dev/null; then
               return 0
             fi
-            return 1
+            marker_status=$?
+            [[ "$marker_status" -eq 1 ]] && return 1
+            return 2
           }
 
           comment_issue_idempotent() {
@@ -1165,25 +1172,32 @@ jobs:
           issue_has_marker() {
             local number="$1"
             local marker="$2"
-            local issue_data issue_body comments
-            if ! issue_data=$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/issues/$number"); then
+            local issue_data issue_body comments attempt marker_status
+            issue_data=""
+            for attempt in 1 2 3; do
+              if issue_data=$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/issues/$number"); then
+                break
+              fi
+              sleep $((attempt * 2))
+            done
+            if [[ -z "$issue_data" ]]; then
               return 2
             fi
             if ! issue_body=$(jq -r '.body // ""' <<<"$issue_data"); then
               return 2
             fi
+            if [[ "$issue_body" == *"$marker"* ]]; then
+              return 0
+            fi
             if ! comments=$(list_issue_comments "$number"); then
               return 2
             fi
-            if jq -e \
-              --arg marker "$marker" \
-              --arg body "$issue_body" \
-              --argjson comments "$comments" \
-              '($body | contains($marker)) or any($comments[][]; (.body // "") | contains($marker))' \
-              <<<"null" >/dev/null; then
+            if jq -e --arg marker "$marker" 'any(.[][]; (.body // "") | contains($marker))' <<<"$comments" >/dev/null; then
               return 0
             fi
-            return 1
+            marker_status=$?
+            [[ "$marker_status" -eq 1 ]] && return 1
+            return 2
           }
 
           comment_issue_idempotent() {
