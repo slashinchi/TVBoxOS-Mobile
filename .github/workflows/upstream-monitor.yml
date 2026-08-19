@@ -956,7 +956,9 @@ jobs:
           else
             candidate_build_status="not run / failed closed"
           fi
+          comment_marker="<!-- tvbox-upstream-monitor:$reason:$issue_key -->"
           body=$(cat <<EOF
+          $comment_marker
           @slashinchi U1 upstream monitor 已 fail closed。
 
           - reason：$reason
@@ -995,17 +997,43 @@ jobs:
             return 1
           }
 
-          comment_issue_with_retry() {
+          list_issue_comments() {
             local number="$1"
-            local comment="$2"
-            local attempt
+            local comments attempt
             for attempt in 1 2 3; do
-              if timeout 30s gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$comment"; then
+              if comments=$(timeout 30s gh api \
+                --paginate \
+                --slurp \
+                "repos/$GITHUB_REPOSITORY/issues/$number/comments?per_page=100"); then
+                printf '%s' "$comments"
                 return 0
               fi
               sleep $((attempt * 2))
             done
             return 1
+          }
+
+          issue_has_marker() {
+            local number="$1"
+            local marker="$2"
+            local comments
+            if ! comments=$(list_issue_comments "$number"); then
+              return 1
+            fi
+            jq -e --arg marker "$marker" 'any(.[][]; (.body // "") | contains($marker))' <<<"$comments" >/dev/null
+          }
+
+          comment_issue_idempotent() {
+            local number="$1"
+            local comment="$2"
+            local marker="$3"
+            if issue_has_marker "$number" "$marker"; then
+              return 0
+            fi
+            if timeout 30s gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$comment"; then
+              return 0
+            fi
+            issue_has_marker "$number" "$marker"
           }
 
           edit_issue_with_retry() {
@@ -1020,29 +1048,29 @@ jobs:
             return 1
           }
 
-          create_issue_with_retry() {
+          create_issue_with_reconcile() {
             local issue_title="$1"
             local issue_body="$2"
-            local attempt
-            for attempt in 1 2 3; do
-              if timeout 30s gh issue create \
-                --repo "$GITHUB_REPOSITORY" \
-                --title "$issue_title" \
-                --assignee slashinchi \
-                --body "$issue_body"; then
-                return 0
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
+            if timeout 30s gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$issue_title" \
+              --assignee slashinchi \
+              --body "$issue_body"; then
+              return 0
+            fi
+            local existing_after_failure
+            if ! existing_after_failure=$(list_open_issues | jq -r --arg title "$issue_title" 'map(select(.title == $title)) | .[0].number // empty'); then
+              return 1
+            fi
+            [[ -n "$existing_after_failure" ]]
           }
 
           existing=$(list_open_issues | jq -r --arg title "$title" 'map(select(.title == $title)) | .[0].number // empty')
           if [[ -n "$existing" ]]; then
-            comment_issue_with_retry "$existing" "$body"
+            comment_issue_idempotent "$existing" "$body" "$comment_marker"
             edit_issue_with_retry "$existing"
           else
-            create_issue_with_retry "$title" "$body"
+            create_issue_with_reconcile "$title" "$body"
           fi
           exit 1
 
@@ -1095,17 +1123,43 @@ jobs:
             return 1
           }
 
-          comment_issue_with_retry() {
+          list_issue_comments() {
             local number="$1"
-            local comment="$2"
-            local attempt
+            local comments attempt
             for attempt in 1 2 3; do
-              if timeout 30s gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$comment"; then
+              if comments=$(timeout 30s gh api \
+                --paginate \
+                --slurp \
+                "repos/$GITHUB_REPOSITORY/issues/$number/comments?per_page=100"); then
+                printf '%s' "$comments"
                 return 0
               fi
               sleep $((attempt * 2))
             done
             return 1
+          }
+
+          issue_has_marker() {
+            local number="$1"
+            local marker="$2"
+            local comments
+            if ! comments=$(list_issue_comments "$number"); then
+              return 1
+            fi
+            jq -e --arg marker "$marker" 'any(.[][]; (.body // "") | contains($marker))' <<<"$comments" >/dev/null
+          }
+
+          comment_issue_idempotent() {
+            local number="$1"
+            local comment="$2"
+            local marker="$3"
+            if issue_has_marker "$number" "$marker"; then
+              return 0
+            fi
+            if timeout 30s gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$comment"; then
+              return 0
+            fi
+            issue_has_marker "$number" "$marker"
           }
 
           close_issue_with_retry() {
@@ -1151,6 +1205,10 @@ jobs:
           ' <<<"$open_issues")
           while IFS= read -r number; do
             [[ -z "$number" ]] && continue
-            comment_issue_with_retry "$number" "U1 已恢复；本次检查通过，自动关闭该去重 Issue。"
+            recovery_marker="<!-- tvbox-upstream-recovery:$number -->"
+            comment_issue_idempotent "$number" \
+              "$recovery_marker
+              U1 已恢复；本次检查通过，自动关闭该去重 Issue。" \
+              "$recovery_marker"
             close_issue_with_retry "$number"
           done <<<"$resolved_issue_numbers"

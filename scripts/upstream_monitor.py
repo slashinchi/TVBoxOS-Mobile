@@ -315,6 +315,9 @@ class U1FixtureTests(unittest.TestCase):
         self.assertIn("needs.notify.result == 'success'", workflow)
         self.assertIn("timeout 30s gh pr close", workflow)
         self.assertIn("gh pr view", workflow)
+        self.assertIn("create_issue_with_reconcile", workflow)
+        self.assertIn("issue_has_marker", workflow)
+        self.assertIn("resolved_issue_numbers", workflow)
         write_block = workflow.split("  write_candidate:", 1)[1].split("\n  notify:", 1)[0]
         self.assertNotIn("gradle", write_block.lower())
 
