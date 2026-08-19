@@ -1016,24 +1016,47 @@ jobs:
           issue_has_marker() {
             local number="$1"
             local marker="$2"
-            local comments
-            if ! comments=$(list_issue_comments "$number"); then
-              return 1
+            local issue_data issue_body comments
+            if ! issue_data=$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/issues/$number"); then
+              return 2
             fi
-            jq -e --arg marker "$marker" 'any(.[][]; (.body // "") | contains($marker))' <<<"$comments" >/dev/null
+            if ! issue_body=$(jq -r '.body // ""' <<<"$issue_data"); then
+              return 2
+            fi
+            if ! comments=$(list_issue_comments "$number"); then
+              return 2
+            fi
+            if jq -e \
+              --arg marker "$marker" \
+              --arg body "$issue_body" \
+              --argjson comments "$comments" \
+              '($body | contains($marker)) or any($comments[][]; (.body // "") | contains($marker))' \
+              <<<"null" >/dev/null; then
+              return 0
+            fi
+            return 1
           }
 
           comment_issue_idempotent() {
             local number="$1"
             local comment="$2"
             local marker="$3"
+            local marker_status
             if issue_has_marker "$number" "$marker"; then
               return 0
+            else
+              marker_status=$?
             fi
+            [[ "$marker_status" -eq 1 ]] || return "$marker_status"
             if timeout 30s gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$comment"; then
               return 0
             fi
-            issue_has_marker "$number" "$marker"
+            if issue_has_marker "$number" "$marker"; then
+              return 0
+            fi
+            marker_status=$?
+            [[ "$marker_status" -eq 1 ]] || return "$marker_status"
+            return 1
           }
 
           edit_issue_with_retry() {
@@ -1142,24 +1165,47 @@ jobs:
           issue_has_marker() {
             local number="$1"
             local marker="$2"
-            local comments
-            if ! comments=$(list_issue_comments "$number"); then
-              return 1
+            local issue_data issue_body comments
+            if ! issue_data=$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/issues/$number"); then
+              return 2
             fi
-            jq -e --arg marker "$marker" 'any(.[][]; (.body // "") | contains($marker))' <<<"$comments" >/dev/null
+            if ! issue_body=$(jq -r '.body // ""' <<<"$issue_data"); then
+              return 2
+            fi
+            if ! comments=$(list_issue_comments "$number"); then
+              return 2
+            fi
+            if jq -e \
+              --arg marker "$marker" \
+              --arg body "$issue_body" \
+              --argjson comments "$comments" \
+              '($body | contains($marker)) or any($comments[][]; (.body // "") | contains($marker))' \
+              <<<"null" >/dev/null; then
+              return 0
+            fi
+            return 1
           }
 
           comment_issue_idempotent() {
             local number="$1"
             local comment="$2"
             local marker="$3"
+            local marker_status
             if issue_has_marker "$number" "$marker"; then
               return 0
+            else
+              marker_status=$?
             fi
+            [[ "$marker_status" -eq 1 ]] || return "$marker_status"
             if timeout 30s gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$comment"; then
               return 0
             fi
-            issue_has_marker "$number" "$marker"
+            if issue_has_marker "$number" "$marker"; then
+              return 0
+            fi
+            marker_status=$?
+            [[ "$marker_status" -eq 1 ]] || return "$marker_status"
+            return 1
           }
 
           close_issue_with_retry() {
