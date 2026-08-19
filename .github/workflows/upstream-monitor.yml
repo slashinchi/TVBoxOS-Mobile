@@ -1,0 +1,398 @@
+name: Upstream Maintenance Monitor
+
+on:
+  schedule:
+    - cron: '22 12 * * *'
+      timezone: Asia/Shanghai
+    - cron: '22 22 * * *'
+      timezone: Asia/Shanghai
+  workflow_dispatch:
+    inputs:
+      force_check:
+        description: Run the upstream check even on an off day
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-maintenance-monitor
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  fixture_tests:
+    name: U1 fixture tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted monitor code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Run deterministic fixtures
+        run: python3 scripts/upstream_monitor.py fixture-test
+
+  date_gate:
+    name: Check schedule gate
+    needs: fixture_tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      active: ${{ steps.gate.outputs.active }}
+      local_date: ${{ steps.gate.outputs.local_date }}
+    steps:
+      - name: Check out trusted monitor code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - id: gate
+        name: Apply strict every-two-days gate
+        env:
+          FORCE_CHECK: ${{ inputs.force_check || false }}
+        run: |
+          set -euo pipefail
+          local_date=$(TZ=Asia/Shanghai date +%F)
+          args=(date-gate --date "$local_date")
+          if [[ "$FORCE_CHECK" == "true" ]]; then
+            args+=(--force-check)
+          fi
+          result=$(python3 scripts/upstream_monitor.py "${args[@]}")
+          active=$(jq -r '.active' <<<"$result")
+          echo "local_date=$local_date" >> "$GITHUB_OUTPUT"
+          echo "active=$active" >> "$GITHUB_OUTPUT"
+          if [[ "$active" != "true" ]]; then
+            echo "Off-day: no upstream repository check will run."
+          fi
+
+  probe:
+    name: Probe upstream and repository state
+    needs: date_gate
+    if: needs.date_gate.outputs.active == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      state: ${{ steps.probe.outputs.state }}
+      upstream_sha: ${{ steps.probe.outputs.upstream_sha }}
+      fork_main_sha: ${{ steps.probe.outputs.fork_main_sha }}
+      patched_sha: ${{ steps.probe.outputs.patched_sha }}
+    steps:
+      - name: Check out trusted monitor code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: probe
+        name: Compare upstream, main, patched, and open candidates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: kukuqi666/TVBoxOS-Mobile
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+            +refs/heads/main:refs/remotes/upstream/main
+
+          upstream_sha=$(git rev-parse refs/remotes/upstream/main)
+          fork_main_sha=$(git rev-parse refs/remotes/origin/main)
+          patched_sha=$(git rev-parse HEAD)
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "fork_main_sha=$fork_main_sha" >> "$GITHUB_OUTPUT"
+          echo "patched_sha=$patched_sha" >> "$GITHUB_OUTPUT"
+
+          main_is_ancestor=false
+          patched_contains_main=false
+          if git merge-base --is-ancestor "$fork_main_sha" "$upstream_sha"; then
+            main_is_ancestor=true
+          fi
+          if git merge-base --is-ancestor "$fork_main_sha" "$patched_sha"; then
+            patched_contains_main=true
+          fi
+
+          policy=none
+          if [[ "$fork_main_sha" == "$upstream_sha" && "$patched_contains_main" != "true" ]] || \
+             [[ "$fork_main_sha" != "$upstream_sha" && "$patched_contains_main" == "true" ]]; then
+            open_prs=$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --base patched \
+              --state open \
+              --limit 100 \
+              --json number,headRefName,headRefOid,url,title)
+            exact_branch="automation/upstream-${upstream_sha:0:7}"
+            policy=$(jq -r \
+              --arg exact "$exact_branch" \
+              'if any(.[]; .headRefName == $exact) then "already-open" elif any(.[]; (.headRefName | startswith("automation/upstream-"))) then "stale-open" else "create" end' \
+              <<<"$open_prs")
+          fi
+
+          if [[ "$main_is_ancestor" != "true" ]]; then
+            state=main-divergence
+          elif [[ "$fork_main_sha" == "$upstream_sha" && "$patched_contains_main" != "true" ]]; then
+            state=$([[ "$policy" == "create" ]] && echo patched-behind-main || echo "$policy")
+          elif [[ "$patched_contains_main" != "true" ]]; then
+            state=patched-behind-main
+          elif [[ "$fork_main_sha" == "$upstream_sha" ]]; then
+            state=no-change
+          else
+            state=$([[ "$policy" == "create" ]] && echo fast-forward || echo "$policy")
+          fi
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "Probe state: $state"
+
+  candidate_validation:
+    name: Validate upstream candidate without write or signing access
+    needs: [date_gate, probe]
+    if: needs.probe.result == 'success' && needs.probe.outputs.state == 'fast-forward'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      validation: ${{ steps.prepare.outputs.validation }}
+      classification: ${{ steps.prepare.outputs.classification }}
+    steps:
+      - name: Check out trusted monitor code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.probe.outputs.patched_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: prepare
+        name: Prepare candidate merge and classify changes
+        env:
+          UPSTREAM_REPO: kukuqi666/TVBoxOS-Mobile
+          UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
+        run: |
+          set +e
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+            +refs/heads/main:refs/remotes/upstream/main
+          if [[ "$(git rev-parse refs/remotes/upstream/main)" != "$UPSTREAM_SHA" ]]; then
+            echo "Candidate upstream SHA changed during validation."
+            echo 'validation=fail' >> "$GITHUB_OUTPUT"
+            echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 scripts/upstream_monitor.py prepare-candidate \
+            --repo . \
+            --upstream-ref "$UPSTREAM_SHA" \
+            --base-ref HEAD > candidate-result.json 2> candidate-error.log
+          prepare_status=$?
+          set -e
+          if ! jq -e . candidate-result.json >/dev/null 2>&1; then
+            cat candidate-error.log
+            echo 'validation=fail' >> "$GITHUB_OUTPUT"
+            echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          classification=$(jq -r '.classification' candidate-result.json)
+          status=$(jq -r '.status' candidate-result.json)
+          echo "classification=$classification" >> "$GITHUB_OUTPUT"
+          if [[ "$prepare_status" -eq 0 && "$status" == "clean" ]]; then
+            echo 'validation=pass' >> "$GITHUB_OUTPUT"
+          else
+            echo 'validation=fail' >> "$GITHUB_OUTPUT"
+          fi
+          cat candidate-result.json
+
+      - name: Set up JDK 17 for candidate build
+        if: steps.prepare.outputs.validation == 'pass' && steps.prepare.outputs.classification != 'docs-only'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK for candidate build
+        if: steps.prepare.outputs.validation == 'pass' && steps.prepare.outputs.classification != 'docs-only'
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android API 34 for candidate build
+        if: steps.prepare.outputs.validation == 'pass' && steps.prepare.outputs.classification != 'docs-only'
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle for candidate build
+        if: steps.prepare.outputs.validation == 'pass' && steps.prepare.outputs.classification != 'docs-only'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build candidate with read-only job permissions
+        if: steps.prepare.outputs.validation == 'pass' && steps.prepare.outputs.classification != 'docs-only'
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          chmod +x gradlew
+          mkdir -p build
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
+
+  write_candidate:
+    name: Fast-forward main and open candidate PR
+    needs: [probe, candidate_validation]
+    if: needs.probe.result == 'success' && needs.probe.outputs.state == 'fast-forward' && needs.candidate_validation.result == 'success' && needs.candidate_validation.outputs.validation == 'pass'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out patched without executing candidate code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Fast-forward main and create candidate branch
+        env:
+          UPSTREAM_REPO: kukuqi666/TVBoxOS-Mobile
+          UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
+          FORK_MAIN_SHA: ${{ needs.probe.outputs.fork_main_sha }}
+          PATCHED_SHA: ${{ needs.probe.outputs.patched_sha }}
+          EXPECTED_CLASSIFICATION: ${{ needs.candidate_validation.outputs.classification }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+            +refs/heads/main:refs/remotes/upstream/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$FORK_MAIN_SHA"
+          test "$(git rev-parse refs/remotes/upstream/main)" = "$UPSTREAM_SHA"
+          test "$(git rev-parse "$PATCHED_SHA")" = "$PATCHED_SHA"
+          git merge-base --is-ancestor "$FORK_MAIN_SHA" "$UPSTREAM_SHA"
+          git merge-base --is-ancestor "$FORK_MAIN_SHA" "$PATCHED_SHA"
+
+          git switch --detach "$PATCHED_SHA"
+          python3 scripts/upstream_monitor.py prepare-candidate \
+            --repo . \
+            --upstream-ref "$UPSTREAM_SHA" \
+            --base-ref HEAD > candidate-result.json
+          candidate_status=$(jq -r '.status' candidate-result.json)
+          candidate_classification=$(jq -r '.classification' candidate-result.json)
+          test "$candidate_status" = clean
+          test "$candidate_classification" = "$EXPECTED_CLASSIFICATION"
+
+          candidate_branch="automation/upstream-${UPSTREAM_SHA:0:7}"
+          git branch "$candidate_branch" HEAD
+          git switch "$candidate_branch"
+          git push origin "refs/remotes/upstream/main:refs/heads/main"
+          git push origin "HEAD:refs/heads/$candidate_branch"
+
+          changed_paths=$(git diff --name-only "$PATCHED_SHA...HEAD")
+          commit_summary=$(git log --format='- %h %s' "$FORK_MAIN_SHA..$UPSTREAM_SHA" | head -50)
+          preserved_paths=$(jq -r '.preserved[]?' candidate-result.json)
+          cat > pr-body.md <<EOF
+          ## 上游更新候选
+
+          - upstream：kukuqi666/TVBoxOS-Mobile
+          - upstream SHA：$FORK_MAIN_SHA → $UPSTREAM_SHA
+          - candidate：$candidate_branch
+          - 风险分类：$candidate_classification
+          - candidate validation：已在独立 read-only job 完成；此 PR 不依赖 bot PR 的 approval-required workflow
+
+          ### 上游提交
+
+          $commit_summary
+
+          ### 候选变更文件
+
+          $changed_paths
+
+          ### 按 fork policy 保留
+
+          ${preserved_paths:-无}
+
+          下一步请把 PR 交给 ChatGPT/OC 复核，再决定是否 Merge 到 patched。U1 不自动合并 patched，也不执行签名或正式发布。
+          EOF
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base patched \
+            --head "$candidate_branch" \
+            --title "chore: upstream candidate ${UPSTREAM_SHA:0:7}" \
+            --body-file pr-body.md \
+            --reviewer slashinchi
+
+  notify:
+    name: Notify and fail closed
+    needs: [date_gate, probe, candidate_validation, write_candidate]
+    if: >-
+      always() &&
+      needs.date_gate.outputs.active == 'true' &&
+      (
+        needs.probe.result != 'success' ||
+        (needs.probe.outputs.state != 'no-change' &&
+         needs.probe.outputs.state != 'already-open' &&
+         needs.probe.outputs.state != 'fast-forward') ||
+        needs.candidate_validation.result == 'failure' ||
+        needs.candidate_validation.outputs.validation == 'fail' ||
+        needs.write_candidate.result == 'failure'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Create or update a deduplicated issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROBE_STATE: ${{ needs.probe.outputs.state }}
+          VALIDATION: ${{ needs.candidate_validation.outputs.validation }}
+          VALIDATION_RESULT: ${{ needs.candidate_validation.result }}
+          WRITE_RESULT: ${{ needs.write_candidate.result }}
+          UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          reason=probe-error
+          if [[ "$WRITE_RESULT" == "failure" ]]; then
+            reason=write-failure
+          elif [[ "$VALIDATION_RESULT" == "failure" || "$VALIDATION" == "fail" ]]; then
+            reason=candidate-validation-failure
+          elif [[ -n "$PROBE_STATE" ]]; then
+            reason="$PROBE_STATE"
+          fi
+          title="[upstream-monitor] $reason"
+          body=$(cat <<EOF
+          @slashinchi U1 upstream monitor 已 fail closed。
+
+          - reason：$reason
+          - upstream SHA：${UPSTREAM_SHA:-unknown}
+          - workflow run：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          - probe state：${PROBE_STATE:-unknown}
+
+          请把本 Issue 交给 ChatGPT/OC 复核；automation 不会自动合并 patched。
+          EOF
+          )
+          existing=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --limit 100 \
+            --json number,title | \
+            jq -r --arg title "$title" '.[] | select(.title == $title) | .number' | head -1)
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+            gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --add-assignee slashinchi || true
+          else
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --assignee slashinchi \
+              --body "$body"
+          fi
+          exit 1

@@ -12,3 +12,6 @@
 - GitHub default branch `patched` is the fork user-facing and normal development/PR base; this does not change D-001: `main` remains the upstream mirror only.
 - Upstream maintenance follows `upstream/main -> fork/main -> merge fork/patched`; do not use a direct GitHub Sync fork operation into `patched` as the normal path.
 - README cleanup removes human-facing promotion and upstream-personal content only; it never authorizes deleting inherited runtime or resource files.
+- U1 automation treats upstream content as unreviewed: candidate validation is read-only and has no signing secrets; only the minimum write job may fast-forward `main`, create a candidate branch, and open a PR.
+- U1 never auto-merges `patched`, approves a PR, touches `build.yml`, or enters signing, Environment, tag, Release, or update-metadata paths.
+- U1 candidate branches use `automation/upstream-<short-sha>`; never force-update an existing automation PR, and fail closed on non-fast-forward `main`, unsafe conflicts, or permission errors.
