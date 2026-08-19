@@ -97,7 +97,7 @@ def classify_paths(paths):
     return "unknown/high-risk"
 
 
-def candidate_policy(open_prs, upstream_sha, repository=None, candidate_oid=None):
+def candidate_policy(open_prs, upstream_sha, repository=None, candidate_oid=None, base_ref="patched"):
     """Mirror the workflow PR policy for deterministic fixture coverage."""
     exact = f"automation/upstream-{upstream_sha[:7]}"
     for item in open_prs:
@@ -106,13 +106,17 @@ def candidate_policy(open_prs, upstream_sha, repository=None, candidate_oid=None
             state = "OPEN"
             head_repository = repository
             head_oid = None
+            base_name = base_ref
         else:
             name = item.get("headRefName", "")
             state = item.get("state", "OPEN")
             head_repository = (item.get("headRepository") or {}).get("nameWithOwner")
             head_oid = item.get("headRefOid")
+            base_name = item.get("baseRefName", base_ref)
         if repository is not None and head_repository != repository:
             continue
+        if name == exact and state == "OPEN" and base_name != base_ref:
+            return "stale-open"
         if name == exact and state == "OPEN" and (candidate_oid is None or head_oid == candidate_oid):
             return "already-open"
         if name == exact and state == "OPEN":
@@ -257,6 +261,21 @@ class U1FixtureTests(unittest.TestCase):
                 candidate_oid="expected",
             ),
             "create",
+        )
+        self.assertEqual(
+            candidate_policy(
+                [{
+                    "headRefName": "automation/upstream-abcdef1",
+                    "state": "OPEN",
+                    "headRefOid": "expected",
+                    "headRepository": {"nameWithOwner": "slashinchi/TVBoxOS-Mobile"},
+                    "baseRefName": "main",
+                }],
+                "abcdef123456",
+                repository="slashinchi/TVBoxOS-Mobile",
+                candidate_oid="expected",
+            ),
+            "stale-open",
         )
 
     def test_workflow_keeps_candidate_and_write_permissions_separate(self):

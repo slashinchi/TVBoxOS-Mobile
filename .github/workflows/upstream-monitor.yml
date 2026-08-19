@@ -979,21 +979,70 @@ jobs:
           请把本 Issue 交给 ChatGPT/OC 复核；automation 不会自动合并 patched。
           EOF
           )
-          existing=$(gh issue list \
-            --repo "$GITHUB_REPOSITORY" \
-            --state open \
-            --limit 1000 \
-            --json number,title | \
-            jq -r --arg title "$title" 'map(select(.title == $title)) | .[0].number // empty')
+          list_open_issues() {
+            local issues attempt
+            for attempt in 1 2 3; do
+              if issues=$(timeout 30s gh issue list \
+                --repo "$GITHUB_REPOSITORY" \
+                --state open \
+                --limit 1000 \
+                --json number,title); then
+                printf '%s' "$issues"
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          comment_issue_with_retry() {
+            local number="$1"
+            local comment="$2"
+            local attempt
+            for attempt in 1 2 3; do
+              if timeout 30s gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$comment"; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          edit_issue_with_retry() {
+            local number="$1"
+            local attempt
+            for attempt in 1 2 3; do
+              if timeout 30s gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --add-assignee slashinchi; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          create_issue_with_retry() {
+            local issue_title="$1"
+            local issue_body="$2"
+            local attempt
+            for attempt in 1 2 3; do
+              if timeout 30s gh issue create \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "$issue_title" \
+                --assignee slashinchi \
+                --body "$issue_body"; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          existing=$(list_open_issues | jq -r --arg title "$title" 'map(select(.title == $title)) | .[0].number // empty')
           if [[ -n "$existing" ]]; then
-            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
-            gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --add-assignee slashinchi || true
+            comment_issue_with_retry "$existing" "$body"
+            edit_issue_with_retry "$existing"
           else
-            gh issue create \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$title" \
-              --assignee slashinchi \
-              --body "$body"
+            create_issue_with_retry "$title" "$body"
           fi
           exit 1
 
@@ -1030,11 +1079,48 @@ jobs:
           set -euo pipefail
           recovery_key="${UPSTREAM_SHA:0:7}"
           [[ -n "$recovery_key" ]] || recovery_key=global
-          open_issues=$(gh issue list \
-            --repo "$GITHUB_REPOSITORY" \
-            --state open \
-            --limit 1000 \
-            --json number,title)
+          list_open_issues() {
+            local issues attempt
+            for attempt in 1 2 3; do
+              if issues=$(timeout 30s gh issue list \
+                --repo "$GITHUB_REPOSITORY" \
+                --state open \
+                --limit 1000 \
+                --json number,title); then
+                printf '%s' "$issues"
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          comment_issue_with_retry() {
+            local number="$1"
+            local comment="$2"
+            local attempt
+            for attempt in 1 2 3; do
+              if timeout 30s gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$comment"; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          close_issue_with_retry() {
+            local number="$1"
+            local attempt
+            for attempt in 1 2 3; do
+              if timeout 30s gh issue close "$number" --repo "$GITHUB_REPOSITORY"; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          open_issues=$(list_open_issues)
           resolved_issue_numbers=$(jq -r --arg recovery_key "$recovery_key" '
             .[]
             | select(.title | startswith("[upstream-monitor] "))
@@ -1065,8 +1151,6 @@ jobs:
           ' <<<"$open_issues")
           while IFS= read -r number; do
             [[ -z "$number" ]] && continue
-            gh issue comment "$number" \
-              --repo "$GITHUB_REPOSITORY" \
-              --body "U1 已恢复；本次检查通过，自动关闭该去重 Issue。"
-            gh issue close "$number" --repo "$GITHUB_REPOSITORY"
+            comment_issue_with_retry "$number" "U1 已恢复；本次检查通过，自动关闭该去重 Issue。"
+            close_issue_with_retry "$number"
           done <<<"$resolved_issue_numbers"
