@@ -242,6 +242,14 @@ class U1FixtureTests(unittest.TestCase):
         self.assertIn("expected_tree", workflow)
         self.assertIn("CANDIDATE_DIFF_STAT_B64", workflow)
         self.assertIn("recovery_key", workflow)
+        self.assertIn("cache-disabled: true", workflow)
+        self.assertNotIn("cache: gradle", workflow)
+        self.assertIn("candidate-branch-missing-after-main", workflow)
+        self.assertIn("candidate-closed-or-merged", workflow)
+        self.assertIn("--state all", workflow)
+        self.assertIn("headRepository", workflow)
+        self.assertIn("headRefOid", workflow)
+        self.assertIn("gh pr view", workflow)
         write_block = workflow.split("  write_candidate:", 1)[1].split("\n  notify:", 1)[0]
         self.assertNotIn("gradle", write_block.lower())
 

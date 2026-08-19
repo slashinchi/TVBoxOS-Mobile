@@ -168,12 +168,19 @@ jobs:
             open_prs=$(gh pr list \
               --repo "$GITHUB_REPOSITORY" \
               --base patched \
-              --state open \
-              --limit 100 \
-              --json number,headRefName,headRefOid,url,title)
+              --state all \
+              --limit 1000 \
+              --json number,headRefName,headRefOid,headRepository,state,mergedAt,url,title)
             policy=$(jq -r \
               --arg exact "$exact_branch" \
-              'if any(.[]; .headRefName == $exact) then "already-open" elif any(.[]; (.headRefName | startswith("automation/upstream-"))) then "stale-open" else "create" end' \
+              --arg oid "$candidate_branch_oid" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              'def ours: (.headRepository.nameWithOwner // "") == $repository;
+               if any(.[]; ours and .headRefName == $exact and .state == "OPEN" and $oid != "" and .headRefOid == $oid) then "already-open"
+               elif any(.[]; ours and .headRefName == $exact and .state == "OPEN") then "stale-open"
+               elif any(.[]; ours and .headRefName == $exact and .state != "OPEN") then "closed-or-merged"
+               elif any(.[]; ours and .state == "OPEN" and (.headRefName | startswith("automation/upstream-"))) then "stale-open"
+               else "create" end' \
               <<<"$open_prs")
           fi
 
@@ -185,8 +192,12 @@ jobs:
             state=candidate-preview-error
           elif [[ "$preview_candidate_needed" == "false" ]]; then
             state=no-actionable-delta
+          elif [[ "$policy" == "closed-or-merged" ]]; then
+            state=candidate-closed-or-merged
           elif [[ "$candidate_branch_exists" == "true" && "$policy" == "create" ]]; then
             state=candidate-branch-no-pr
+          elif [[ "$fork_main_sha" == "$upstream_sha" && "$patched_contains_main" != "true" && "$candidate_branch_exists" != "true" && "$policy" == "create" ]]; then
+            state=candidate-branch-missing-after-main
           elif [[ "$fork_main_sha" == "$upstream_sha" && "$patched_contains_main" != "true" ]]; then
             state=$([[ "$policy" == "create" ]] && echo patched-behind-main || echo "$policy")
           elif [[ "$patched_contains_main" != "true" ]]; then
@@ -203,7 +214,7 @@ jobs:
   candidate_validation:
     name: Validate upstream candidate without write or signing access
     needs: [date_gate, probe]
-    if: needs.probe.result == 'success' && (needs.probe.outputs.state == 'fast-forward' || needs.probe.outputs.state == 'no-actionable-delta')
+    if: needs.probe.result == 'success' && (needs.probe.outputs.state == 'fast-forward' || needs.probe.outputs.state == 'no-actionable-delta' || needs.probe.outputs.state == 'candidate-branch-missing-after-main')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -286,7 +297,6 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
       - name: Set up Android SDK for candidate build
         if: steps.prepare.outputs.validation == 'pass' && steps.prepare.outputs.classification != 'docs-only'
@@ -299,6 +309,8 @@ jobs:
       - name: Set up Gradle for candidate build
         if: steps.prepare.outputs.validation == 'pass' && steps.prepare.outputs.classification != 'docs-only'
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: true
 
       - name: Build candidate with read-only job permissions
         if: steps.prepare.outputs.validation == 'pass' && steps.prepare.outputs.classification != 'docs-only'
@@ -313,7 +325,7 @@ jobs:
   write_candidate:
     name: Fast-forward main and open candidate PR
     needs: [probe, candidate_validation]
-    if: needs.probe.result == 'success' && (needs.probe.outputs.state == 'fast-forward' || needs.probe.outputs.state == 'no-actionable-delta') && needs.candidate_validation.result == 'success' && needs.candidate_validation.outputs.validation == 'pass'
+    if: needs.probe.result == 'success' && (needs.probe.outputs.state == 'fast-forward' || needs.probe.outputs.state == 'no-actionable-delta' || needs.probe.outputs.state == 'candidate-branch-missing-after-main') && needs.candidate_validation.result == 'success' && needs.candidate_validation.outputs.validation == 'pass'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -347,7 +359,7 @@ jobs:
           test "$(git rev-parse refs/remotes/upstream/main)" = "$UPSTREAM_SHA"
           test "$(git rev-parse "$PATCHED_SHA")" = "$PATCHED_SHA"
           git merge-base --is-ancestor "$FORK_MAIN_SHA" "$UPSTREAM_SHA"
-          if [[ "$PROBE_STATE" != "no-actionable-delta" ]]; then
+          if [[ "$PROBE_STATE" != "no-actionable-delta" && "$PROBE_STATE" != "candidate-branch-missing-after-main" ]]; then
             git merge-base --is-ancestor "$FORK_MAIN_SHA" "$PATCHED_SHA"
           fi
 
@@ -373,6 +385,7 @@ jobs:
           candidate_branch="automation/upstream-${UPSTREAM_SHA:0:7}"
           git branch "$candidate_branch" HEAD
           git switch "$candidate_branch"
+          expected_candidate_oid=$(git rev-parse HEAD)
 
           changed_paths=$(jq -r '.changed_paths[]?' "$result_file")
           candidate_diff_stat=$(git diff --stat "$PATCHED_SHA...HEAD")
@@ -414,13 +427,112 @@ jobs:
           EOF
           git push origin "refs/remotes/upstream/main:refs/heads/main"
           git push origin "HEAD:refs/heads/$candidate_branch"
+          git fetch --no-tags origin \
+            "+refs/heads/$candidate_branch:refs/remotes/origin/$candidate_branch"
+          actual_candidate_oid=$(git rev-parse "refs/remotes/origin/$candidate_branch")
+          test "$actual_candidate_oid" = "$expected_candidate_oid"
+          git merge-base --is-ancestor "$PATCHED_SHA" "$actual_candidate_oid"
+          expected_candidate_tree=$(git rev-parse "$expected_candidate_oid^{tree}")
+          actual_candidate_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
+          test "$actual_candidate_tree" = "$expected_candidate_tree"
+
+          find_open_candidate_pr() {
+            local prs
+            if ! prs=$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --base patched \
+              --head "$candidate_branch" \
+              --state open \
+              --limit 1000 \
+              --json number,url,headRefOid,headRepository); then
+              return 1
+            fi
+            jq -r \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg oid "$1" \
+              'map(select((.headRepository.nameWithOwner // "") == $repository and .headRefOid == $oid)) | .[0].url // empty' \
+              <<<"$prs"
+          }
+
+          close_unvalidated_candidate_prs() {
+            local prs
+            if ! prs=$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --base patched \
+              --head "$candidate_branch" \
+              --state open \
+              --limit 1000 \
+              --json number,headRefOid,headRepository); then
+              return 1
+            fi
+            while IFS= read -r number; do
+              [[ -z "$number" ]] && continue
+              gh pr close "$number" \
+                --repo "$GITHUB_REPOSITORY" \
+                --comment "U1 closed this PR because its head was not the validated candidate."
+            done < <(jq -r \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg oid "$1" \
+              '.[] | select((.headRepository.nameWithOwner // "") == $repository and .headRefOid != $oid) | .number' \
+              <<<"$prs")
+          }
+
+          pr_create_error="$RUNNER_TEMP/pr-create.error"
+          pr_create_output="$RUNNER_TEMP/pr-create.output"
+          set +e
           gh pr create \
             --repo "$GITHUB_REPOSITORY" \
             --base patched \
             --head "$candidate_branch" \
             --title "chore: upstream candidate ${UPSTREAM_SHA:0:7}" \
             --body-file "$RUNNER_TEMP/pr-body.md" \
-            --reviewer slashinchi
+            --reviewer slashinchi >"$pr_create_output" 2>"$pr_create_error"
+          pr_create_status=$?
+          set -e
+          pr_url=$(awk 'NF {last=$0} END {print last}' "$pr_create_output")
+          if [[ "$pr_create_status" -ne 0 || -z "$pr_url" ]]; then
+            recovered_pr_url=""
+            if recovered_pr_url=$(find_open_candidate_pr "$expected_candidate_oid"); then
+              :
+            else
+              recovered_pr_url=""
+            fi
+            if [[ -n "$recovered_pr_url" ]]; then
+              pr_url="$recovered_pr_url"
+            else
+              close_unvalidated_candidate_prs "$expected_candidate_oid" || true
+              cat "$pr_create_error"
+              exit 1
+            fi
+          fi
+
+          pr_view_error="$RUNNER_TEMP/pr-view.error"
+          set +e
+          pr_head_oid=$(gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid' 2>"$pr_view_error")
+          pr_view_status=$?
+          set -e
+          if [[ "$pr_view_status" -ne 0 ]]; then
+            recovered_pr_url=""
+            if recovered_pr_url=$(find_open_candidate_pr "$expected_candidate_oid"); then
+              :
+            else
+              recovered_pr_url=""
+            fi
+            if [[ -n "$recovered_pr_url" ]]; then
+              pr_url="$recovered_pr_url"
+              pr_head_oid="$expected_candidate_oid"
+            else
+              close_unvalidated_candidate_prs "$expected_candidate_oid" || true
+              cat "$pr_view_error"
+              exit 1
+            fi
+          fi
+          if [[ "$pr_head_oid" != "$expected_candidate_oid" ]]; then
+            gh pr close "$pr_url" --repo "$GITHUB_REPOSITORY" --comment "U1 closed this PR because its head changed after candidate validation." || true
+            close_unvalidated_candidate_prs "$expected_candidate_oid" || true
+            echo "Candidate branch changed while opening the PR."
+            exit 1
+          fi
 
   repair_candidate_pr:
     name: Recover existing candidate branch PR
@@ -471,22 +583,38 @@ jobs:
             --upstream-ref "$UPSTREAM_SHA" \
             --base-ref HEAD > "$expected_file"
           test "$(jq -r '.status' "$expected_file")" = clean
+          candidate_classification=$(jq -r '.classification' "$expected_file")
           expected_tree=$(git rev-parse HEAD^{tree})
           actual_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
           test "$actual_tree" = "$expected_tree"
           git push origin "refs/remotes/upstream/main:refs/heads/main"
+          git fetch --no-tags origin \
+            "+refs/heads/$candidate_branch:refs/remotes/origin/$candidate_branch"
+          actual_candidate_oid=$(git rev-parse "refs/remotes/origin/$candidate_branch")
+          test "$actual_candidate_oid" = "$CANDIDATE_BRANCH_OID"
+          git merge-base --is-ancestor "$PATCHED_SHA" "$actual_candidate_oid"
+          actual_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
+          test "$actual_tree" = "$expected_tree"
 
           changed_paths=$(git diff --name-only "$PATCHED_SHA...refs/remotes/origin/$candidate_branch")
           candidate_diff_stat=$(git diff --stat "$PATCHED_SHA...refs/remotes/origin/$candidate_branch")
           commit_summary=$(git log --format='- %h %s' "$FORK_MAIN_SHA..$UPSTREAM_SHA" | awk 'NR <= 50 {print}')
+          if [[ "$candidate_classification" == "docs-only" ]]; then
+            candidate_build_status="skipped: docs-only"
+          else
+            candidate_build_status="PASS: prior read-only validation"
+          fi
           cat > "$RUNNER_TEMP/recovery-pr-body.md" <<EOF
           ## 上游候选 PR 恢复
 
           - upstream：kukuqi666/TVBoxOS-Mobile
           - upstream SHA：$FORK_MAIN_SHA → $UPSTREAM_SHA
           - existing candidate：$candidate_branch
+          - candidate merge SHA：$CANDIDATE_BRANCH_OID
+          - 风险分类：$candidate_classification
           - recovery：复用已推送分支；不 force-update，不执行 candidate code
-          - candidate validation：此前 run 已完成；本次只恢复 PR 入口
+          - candidate validation：此前 run 已完成；本次重新校验 branch OID/tree；只恢复 PR 入口
+          - candidate build：$candidate_build_status
 
           ### 上游提交
 
@@ -502,13 +630,102 @@ jobs:
 
           请把 PR 交给 ChatGPT/OC 复核，再决定是否 Merge 到 patched。
           EOF
+          find_open_candidate_pr() {
+            local prs
+            if ! prs=$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --base patched \
+              --head "$candidate_branch" \
+              --state open \
+              --limit 1000 \
+              --json number,url,headRefOid,headRepository); then
+              return 1
+            fi
+            jq -r \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg oid "$1" \
+              'map(select((.headRepository.nameWithOwner // "") == $repository and .headRefOid == $oid)) | .[0].url // empty' \
+              <<<"$prs"
+          }
+
+          close_unvalidated_candidate_prs() {
+            local prs
+            if ! prs=$(gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --base patched \
+              --head "$candidate_branch" \
+              --state open \
+              --limit 1000 \
+              --json number,headRefOid,headRepository); then
+              return 1
+            fi
+            while IFS= read -r number; do
+              [[ -z "$number" ]] && continue
+              gh pr close "$number" \
+                --repo "$GITHUB_REPOSITORY" \
+                --comment "U1 closed this PR because its head was not the validated candidate."
+            done < <(jq -r \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg oid "$1" \
+              '.[] | select((.headRepository.nameWithOwner // "") == $repository and .headRefOid != $oid) | .number' \
+              <<<"$prs")
+          }
+
+          pr_create_error="$RUNNER_TEMP/recovery-pr-create.error"
+          pr_create_output="$RUNNER_TEMP/recovery-pr-create.output"
+          set +e
           gh pr create \
             --repo "$GITHUB_REPOSITORY" \
             --base patched \
             --head "$candidate_branch" \
             --title "chore: recover upstream candidate ${UPSTREAM_SHA:0:7}" \
             --body-file "$RUNNER_TEMP/recovery-pr-body.md" \
-            --reviewer slashinchi
+            --reviewer slashinchi >"$pr_create_output" 2>"$pr_create_error"
+          pr_create_status=$?
+          set -e
+          pr_url=$(awk 'NF {last=$0} END {print last}' "$pr_create_output")
+          if [[ "$pr_create_status" -ne 0 || -z "$pr_url" ]]; then
+            recovered_pr_url=""
+            if recovered_pr_url=$(find_open_candidate_pr "$CANDIDATE_BRANCH_OID"); then
+              :
+            else
+              recovered_pr_url=""
+            fi
+            if [[ -n "$recovered_pr_url" ]]; then
+              pr_url="$recovered_pr_url"
+            else
+              close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID" || true
+              cat "$pr_create_error"
+              exit 1
+            fi
+          fi
+          pr_view_error="$RUNNER_TEMP/recovery-pr-view.error"
+          set +e
+          pr_head_oid=$(gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid' 2>"$pr_view_error")
+          pr_view_status=$?
+          set -e
+          if [[ "$pr_view_status" -ne 0 ]]; then
+            recovered_pr_url=""
+            if recovered_pr_url=$(find_open_candidate_pr "$CANDIDATE_BRANCH_OID"); then
+              :
+            else
+              recovered_pr_url=""
+            fi
+            if [[ -n "$recovered_pr_url" ]]; then
+              pr_url="$recovered_pr_url"
+              pr_head_oid="$CANDIDATE_BRANCH_OID"
+            else
+              close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID" || true
+              cat "$pr_view_error"
+              exit 1
+            fi
+          fi
+          if [[ "$pr_head_oid" != "$CANDIDATE_BRANCH_OID" ]]; then
+            gh pr close "$pr_url" --repo "$GITHUB_REPOSITORY" --comment "U1 closed this PR because its head changed after recovery validation." || true
+            close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID" || true
+            echo "Candidate branch changed while recovering the PR."
+            exit 1
+          fi
 
   notify:
     name: Notify and fail closed
@@ -526,7 +743,8 @@ jobs:
              needs.probe.outputs.state != 'already-open' &&
              needs.probe.outputs.state != 'fast-forward' &&
              needs.probe.outputs.state != 'no-actionable-delta' &&
-             needs.probe.outputs.state != 'candidate-branch-no-pr') ||
+             needs.probe.outputs.state != 'candidate-branch-no-pr' &&
+             needs.probe.outputs.state != 'candidate-branch-missing-after-main') ||
             needs.candidate_validation.result == 'failure' ||
             needs.candidate_validation.outputs.validation == 'fail' ||
             needs.write_candidate.result == 'failure' ||
@@ -578,7 +796,7 @@ jobs:
             reason="$PROBE_STATE"
           fi
           issue_key="${UPSTREAM_SHA:0:7}"
-          [[ -n "$issue_key" ]] || issue_key=unknown
+          [[ -n "$issue_key" ]] || issue_key=global
           title="[upstream-monitor] $reason $issue_key"
           changed_paths="not available"
           if [[ -n "$CHANGED_PATHS_B64" ]]; then
@@ -633,7 +851,7 @@ jobs:
           existing=$(gh issue list \
             --repo "$GITHUB_REPOSITORY" \
             --state open \
-            --limit 100 \
+            --limit 1000 \
             --json number,title | \
             jq -r --arg title "$title" 'map(select(.title == $title)) | .[0].number // empty')
           if [[ -n "$existing" ]]; then
@@ -681,7 +899,7 @@ jobs:
           open_issues=$(gh issue list \
             --repo "$GITHUB_REPOSITORY" \
             --state open \
-            --limit 100 \
+            --limit 1000 \
             --json number,title)
           while IFS= read -r number; do
             [[ -z "$number" ]] && continue
@@ -694,7 +912,10 @@ jobs:
             | select(.title | startswith("[upstream-monitor] "))
             | (try (.title | capture("^\\[upstream-monitor\\] (?<reason>[^ ]+) (?<sha>[^ ]+)$")) catch null) as $parts
             | select($parts != null)
-            | select($parts.sha == $recovery_key or $parts.sha == "unknown")
+            | select(
+                $parts.sha == $recovery_key
+                or ($parts.sha == "global" and ($parts.reason == "fixture-tests-failure" or $parts.reason == "date-gate-failure" or $parts.reason == "probe-error"))
+              )
             | select([
                 "fixture-tests-failure",
                 "date-gate-failure",
@@ -706,6 +927,9 @@ jobs:
                 "write-failure",
                 "repair-failure",
                 "candidate-branch-no-pr",
+                "candidate-branch-missing-after-main",
+                "candidate-closed-or-merged",
+                "stale-open",
                 "patched-behind-main",
                 "no-actionable-delta"
               ] | index($parts.reason))
