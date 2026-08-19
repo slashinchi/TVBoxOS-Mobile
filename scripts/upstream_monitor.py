@@ -236,6 +236,12 @@ class U1FixtureTests(unittest.TestCase):
         self.assertIn("contents: write", workflow)
         self.assertIn("GITHUB_TOKEN: ''", workflow)
         self.assertNotIn("secrets.", workflow)
+        self.assertIn('"$PROBE_STATE" != "no-actionable-delta"', workflow)
+        self.assertIn("CANDIDATE_BRANCH_OID", workflow)
+        self.assertIn("actual_candidate_oid", workflow)
+        self.assertIn("expected_tree", workflow)
+        self.assertIn("CANDIDATE_DIFF_STAT_B64", workflow)
+        self.assertIn("recovery_key", workflow)
         write_block = workflow.split("  write_candidate:", 1)[1].split("\n  notify:", 1)[0]
         self.assertNotIn("gradle", write_block.lower())
 

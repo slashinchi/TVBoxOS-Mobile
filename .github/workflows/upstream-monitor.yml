@@ -91,6 +91,7 @@ jobs:
       upstream_sha: ${{ steps.probe.outputs.upstream_sha }}
       fork_main_sha: ${{ steps.probe.outputs.fork_main_sha }}
       patched_sha: ${{ steps.probe.outputs.patched_sha }}
+      candidate_branch_oid: ${{ steps.probe.outputs.candidate_branch_oid }}
       commit_summary_b64: ${{ steps.probe.outputs.commit_summary_b64 }}
       source_diff_stat_b64: ${{ steps.probe.outputs.source_diff_stat_b64 }}
     steps:
@@ -157,9 +158,11 @@ jobs:
 
           policy=none
           candidate_branch_exists=false
+          candidate_branch_oid=
           if [[ "$preview_candidate_needed" == "true" ]]; then
             exact_branch="automation/upstream-${upstream_sha:0:7}"
-            if git ls-remote --exit-code origin "refs/heads/$exact_branch" >/dev/null 2>&1; then
+            candidate_branch_oid=$(git ls-remote origin "refs/heads/$exact_branch" | awk 'NR == 1 {print $1}')
+            if [[ -n "$candidate_branch_oid" ]]; then
               candidate_branch_exists=true
             fi
             open_prs=$(gh pr list \
@@ -194,6 +197,7 @@ jobs:
             state=$([[ "$policy" == "create" ]] && echo fast-forward || echo "$policy")
           fi
           echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "candidate_branch_oid=$candidate_branch_oid" >> "$GITHUB_OUTPUT"
           echo "Probe state: $state"
 
   candidate_validation:
@@ -328,6 +332,7 @@ jobs:
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
           FORK_MAIN_SHA: ${{ needs.probe.outputs.fork_main_sha }}
           PATCHED_SHA: ${{ needs.probe.outputs.patched_sha }}
+          PROBE_STATE: ${{ needs.probe.outputs.state }}
           EXPECTED_CLASSIFICATION: ${{ needs.candidate_validation.outputs.classification }}
           EXPECTED_CANDIDATE_NEEDED: ${{ needs.candidate_validation.outputs.candidate_needed }}
           GH_TOKEN: ${{ github.token }}
@@ -342,7 +347,9 @@ jobs:
           test "$(git rev-parse refs/remotes/upstream/main)" = "$UPSTREAM_SHA"
           test "$(git rev-parse "$PATCHED_SHA")" = "$PATCHED_SHA"
           git merge-base --is-ancestor "$FORK_MAIN_SHA" "$UPSTREAM_SHA"
-          git merge-base --is-ancestor "$FORK_MAIN_SHA" "$PATCHED_SHA"
+          if [[ "$PROBE_STATE" != "no-actionable-delta" ]]; then
+            git merge-base --is-ancestor "$FORK_MAIN_SHA" "$PATCHED_SHA"
+          fi
 
           git switch --detach "$PATCHED_SHA"
           result_file="$RUNNER_TEMP/candidate-result.json"
@@ -437,6 +444,7 @@ jobs:
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
           FORK_MAIN_SHA: ${{ needs.probe.outputs.fork_main_sha }}
           PATCHED_SHA: ${{ needs.probe.outputs.patched_sha }}
+          CANDIDATE_BRANCH_OID: ${{ needs.probe.outputs.candidate_branch_oid }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -450,9 +458,23 @@ jobs:
           test "$(git rev-parse refs/remotes/upstream/main)" = "$UPSTREAM_SHA"
           git merge-base --is-ancestor "$FORK_MAIN_SHA" "$UPSTREAM_SHA"
           git ls-remote --exit-code origin "refs/heads/$candidate_branch" >/dev/null
-          git push origin "refs/remotes/upstream/main:refs/heads/main"
           git fetch --no-tags origin \
             "+refs/heads/$candidate_branch:refs/remotes/origin/$candidate_branch"
+          actual_candidate_oid=$(git rev-parse "refs/remotes/origin/$candidate_branch")
+          test "$actual_candidate_oid" = "$CANDIDATE_BRANCH_OID"
+          git merge-base --is-ancestor "$PATCHED_SHA" "$actual_candidate_oid"
+
+          git switch --detach "$PATCHED_SHA"
+          expected_file="$RUNNER_TEMP/expected-candidate.json"
+          python3 scripts/upstream_monitor.py prepare-candidate \
+            --repo . \
+            --upstream-ref "$UPSTREAM_SHA" \
+            --base-ref HEAD > "$expected_file"
+          test "$(jq -r '.status' "$expected_file")" = clean
+          expected_tree=$(git rev-parse HEAD^{tree})
+          actual_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
+          test "$actual_tree" = "$expected_tree"
+          git push origin "refs/remotes/upstream/main:refs/heads/main"
 
           changed_paths=$(git diff --name-only "$PATCHED_SHA...refs/remotes/origin/$candidate_branch")
           candidate_diff_stat=$(git diff --stat "$PATCHED_SHA...refs/remotes/origin/$candidate_branch")
@@ -536,6 +558,7 @@ jobs:
           CANDIDATE_SHA: ${{ needs.candidate_validation.outputs.candidate_sha }}
           CHANGED_PATHS_B64: ${{ needs.candidate_validation.outputs.changed_paths_b64 }}
           PRESERVED_PATHS_B64: ${{ needs.candidate_validation.outputs.preserved_paths_b64 }}
+          CANDIDATE_DIFF_STAT_B64: ${{ needs.candidate_validation.outputs.candidate_diff_stat_b64 }}
           COMMIT_SUMMARY_B64: ${{ needs.probe.outputs.commit_summary_b64 }}
           SOURCE_DIFF_STAT_B64: ${{ needs.probe.outputs.source_diff_stat_b64 }}
         run: |
@@ -554,7 +577,9 @@ jobs:
           elif [[ -n "$PROBE_STATE" ]]; then
             reason="$PROBE_STATE"
           fi
-          title="[upstream-monitor] $reason"
+          issue_key="${UPSTREAM_SHA:0:7}"
+          [[ -n "$issue_key" ]] || issue_key=unknown
+          title="[upstream-monitor] $reason $issue_key"
           changed_paths="not available"
           if [[ -n "$CHANGED_PATHS_B64" ]]; then
             changed_paths=$(printf '%s' "$CHANGED_PATHS_B64" | base64 --decode | tr '\0' ',')
@@ -570,6 +595,10 @@ jobs:
           source_diff_stat="not available"
           if [[ -n "$SOURCE_DIFF_STAT_B64" ]]; then
             source_diff_stat=$(printf '%s' "$SOURCE_DIFF_STAT_B64" | base64 --decode)
+          fi
+          candidate_diff_stat="not available (candidate not produced)"
+          if [[ -n "$CANDIDATE_DIFF_STAT_B64" ]]; then
+            candidate_diff_stat=$(printf '%s' "$CANDIDATE_DIFF_STAT_B64" | base64 --decode)
           fi
           if [[ "$CLASSIFICATION" == "docs-only" ]]; then
             candidate_build_status="skipped: docs-only"
@@ -589,6 +618,7 @@ jobs:
           - candidate build/validation：$candidate_build_status / ${VALIDATION:-unknown}
           - changed files：$changed_paths
           - source diff stat：$source_diff_stat
+          - candidate diff stat：$candidate_diff_stat
           - fork-owned preserved：$preserved_paths
           - workflow run：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
           - probe state：${PROBE_STATE:-unknown}
@@ -643,8 +673,11 @@ jobs:
       - name: Close resolved U1 automation issues
         env:
           GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
         run: |
           set -euo pipefail
+          recovery_key="${UPSTREAM_SHA:0:7}"
+          [[ -n "$recovery_key" ]] || recovery_key=unknown
           open_issues=$(gh issue list \
             --repo "$GITHUB_REPOSITORY" \
             --state open \
@@ -656,4 +689,25 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --body "U1 已恢复；本次检查通过，自动关闭该去重 Issue。"
             gh issue close "$number" --repo "$GITHUB_REPOSITORY"
-          done < <(jq -r '.[] | select(.title | startswith("[upstream-monitor]")) | .number' <<<"$open_issues")
+          done < <(jq -r --arg recovery_key "$recovery_key" '
+            .[]
+            | select(.title | startswith("[upstream-monitor] "))
+            | (try (.title | capture("^\\[upstream-monitor\\] (?<reason>[^ ]+) (?<sha>[^ ]+)$")) catch null) as $parts
+            | select($parts != null)
+            | select($parts.sha == $recovery_key or $parts.sha == "unknown")
+            | select([
+                "fixture-tests-failure",
+                "date-gate-failure",
+                "probe-error",
+                "candidate-preview-error",
+                "candidate-conflict",
+                "main-divergence",
+                "candidate-validation-failure",
+                "write-failure",
+                "repair-failure",
+                "candidate-branch-no-pr",
+                "patched-behind-main",
+                "no-actionable-delta"
+              ] | index($parts.reason))
+            | .number
+          ' <<<"$open_issues")
