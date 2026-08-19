@@ -91,6 +91,8 @@ jobs:
       upstream_sha: ${{ steps.probe.outputs.upstream_sha }}
       fork_main_sha: ${{ steps.probe.outputs.fork_main_sha }}
       patched_sha: ${{ steps.probe.outputs.patched_sha }}
+      commit_summary_b64: ${{ steps.probe.outputs.commit_summary_b64 }}
+      source_diff_stat_b64: ${{ steps.probe.outputs.source_diff_stat_b64 }}
     steps:
       - name: Check out trusted monitor code
         uses: actions/checkout@v5
@@ -116,6 +118,12 @@ jobs:
           echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
           echo "fork_main_sha=$fork_main_sha" >> "$GITHUB_OUTPUT"
           echo "patched_sha=$patched_sha" >> "$GITHUB_OUTPUT"
+          commit_summary=$(git log --format='- %h %s' "$fork_main_sha..$upstream_sha" 2>/dev/null | awk 'NR <= 50 {print}' || true)
+          source_diff_stat=$(git diff --stat "$fork_main_sha...$upstream_sha" 2>/dev/null || true)
+          commit_summary_b64=$(printf '%s' "$commit_summary" | base64 -w 0)
+          source_diff_stat_b64=$(printf '%s' "$source_diff_stat" | base64 -w 0)
+          echo "commit_summary_b64=$commit_summary_b64" >> "$GITHUB_OUTPUT"
+          echo "source_diff_stat_b64=$source_diff_stat_b64" >> "$GITHUB_OUTPUT"
 
           main_is_ancestor=false
           patched_contains_main=false
@@ -126,16 +134,40 @@ jobs:
             patched_contains_main=true
           fi
 
+          preview_status=not-run
+          preview_candidate_needed=unknown
+          if [[ "$main_is_ancestor" == "true" && ( "$fork_main_sha" != "$upstream_sha" || "$patched_contains_main" != "true" ) ]]; then
+            preview_file="$RUNNER_TEMP/candidate-preview.json"
+            set +e
+            python3 scripts/upstream_monitor.py prepare-candidate \
+              --repo . \
+              --upstream-ref "$upstream_sha" \
+              --base-ref "$patched_sha" > "$preview_file" 2> "$RUNNER_TEMP/candidate-preview.log"
+            preview_exit=$?
+            set -e
+            if jq -e . "$preview_file" >/dev/null 2>&1; then
+              preview_status=$(jq -r '.status' "$preview_file")
+              preview_candidate_needed=$(jq -r '.candidate_needed' "$preview_file")
+            else
+              preview_status=error
+              echo "Candidate preview failed (exit $preview_exit):"
+              cat "$RUNNER_TEMP/candidate-preview.log"
+            fi
+          fi
+
           policy=none
-          if [[ "$fork_main_sha" == "$upstream_sha" && "$patched_contains_main" != "true" ]] || \
-             [[ "$fork_main_sha" != "$upstream_sha" && "$patched_contains_main" == "true" ]]; then
+          candidate_branch_exists=false
+          if [[ "$preview_candidate_needed" == "true" ]]; then
+            exact_branch="automation/upstream-${upstream_sha:0:7}"
+            if git ls-remote --exit-code origin "refs/heads/$exact_branch" >/dev/null 2>&1; then
+              candidate_branch_exists=true
+            fi
             open_prs=$(gh pr list \
               --repo "$GITHUB_REPOSITORY" \
               --base patched \
               --state open \
               --limit 100 \
               --json number,headRefName,headRefOid,url,title)
-            exact_branch="automation/upstream-${upstream_sha:0:7}"
             policy=$(jq -r \
               --arg exact "$exact_branch" \
               'if any(.[]; .headRefName == $exact) then "already-open" elif any(.[]; (.headRefName | startswith("automation/upstream-"))) then "stale-open" else "create" end' \
@@ -144,6 +176,14 @@ jobs:
 
           if [[ "$main_is_ancestor" != "true" ]]; then
             state=main-divergence
+          elif [[ "$preview_status" == "conflict" ]]; then
+            state=candidate-conflict
+          elif [[ "$preview_status" == "error" ]]; then
+            state=candidate-preview-error
+          elif [[ "$preview_candidate_needed" == "false" ]]; then
+            state=no-actionable-delta
+          elif [[ "$candidate_branch_exists" == "true" && "$policy" == "create" ]]; then
+            state=candidate-branch-no-pr
           elif [[ "$fork_main_sha" == "$upstream_sha" && "$patched_contains_main" != "true" ]]; then
             state=$([[ "$policy" == "create" ]] && echo patched-behind-main || echo "$policy")
           elif [[ "$patched_contains_main" != "true" ]]; then
@@ -159,7 +199,7 @@ jobs:
   candidate_validation:
     name: Validate upstream candidate without write or signing access
     needs: [date_gate, probe]
-    if: needs.probe.result == 'success' && needs.probe.outputs.state == 'fast-forward'
+    if: needs.probe.result == 'success' && (needs.probe.outputs.state == 'fast-forward' || needs.probe.outputs.state == 'no-actionable-delta')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -171,6 +211,7 @@ jobs:
       candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
       changed_paths_b64: ${{ steps.prepare.outputs.changed_paths_b64 }}
       preserved_paths_b64: ${{ steps.prepare.outputs.preserved_paths_b64 }}
+      candidate_diff_stat_b64: ${{ steps.prepare.outputs.candidate_diff_stat_b64 }}
     steps:
       - name: Check out trusted monitor code
         uses: actions/checkout@v5
@@ -194,8 +235,10 @@ jobs:
             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
             echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
+            echo 'candidate_diff_stat_b64=' >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          base_sha=$(git rev-parse HEAD)
           result_file="$RUNNER_TEMP/candidate-result.json"
           error_file="$RUNNER_TEMP/candidate-error.log"
           python3 scripts/upstream_monitor.py prepare-candidate \
@@ -210,6 +253,7 @@ jobs:
             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
             echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
+            echo 'candidate_diff_stat_b64=' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           classification=$(jq -r '.classification' "$result_file")
@@ -218,11 +262,13 @@ jobs:
           candidate_sha=$(jq -r '.candidate_sha // empty' "$result_file")
           changed_paths_b64=$(jq -jr '.changed_paths | join("\u0000")' "$result_file" | base64 -w 0)
           preserved_paths_b64=$(jq -jr '.preserved | join("\u0000")' "$result_file" | base64 -w 0)
+          candidate_diff_stat_b64=$(git diff --stat "$base_sha...HEAD" | base64 -w 0)
           echo "classification=$classification" >> "$GITHUB_OUTPUT"
           echo "candidate_needed=$candidate_needed" >> "$GITHUB_OUTPUT"
           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
           echo "changed_paths_b64=$changed_paths_b64" >> "$GITHUB_OUTPUT"
           echo "preserved_paths_b64=$preserved_paths_b64" >> "$GITHUB_OUTPUT"
+          echo "candidate_diff_stat_b64=$candidate_diff_stat_b64" >> "$GITHUB_OUTPUT"
           if [[ "$prepare_status" -eq 0 && "$status" == "clean" ]]; then
             echo 'validation=pass' >> "$GITHUB_OUTPUT"
           else
@@ -263,7 +309,7 @@ jobs:
   write_candidate:
     name: Fast-forward main and open candidate PR
     needs: [probe, candidate_validation]
-    if: needs.probe.result == 'success' && needs.probe.outputs.state == 'fast-forward' && needs.candidate_validation.result == 'success' && needs.candidate_validation.outputs.validation == 'pass'
+    if: needs.probe.result == 'success' && (needs.probe.outputs.state == 'fast-forward' || needs.probe.outputs.state == 'no-actionable-delta') && needs.candidate_validation.result == 'success' && needs.candidate_validation.outputs.validation == 'pass'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -288,9 +334,11 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git fetch --no-tags origin +refs/heads/patched:refs/remotes/origin/patched
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
           test "$(git rev-parse refs/remotes/origin/main)" = "$FORK_MAIN_SHA"
+          test "$(git rev-parse refs/remotes/origin/patched)" = "$PATCHED_SHA"
           test "$(git rev-parse refs/remotes/upstream/main)" = "$UPSTREAM_SHA"
           test "$(git rev-parse "$PATCHED_SHA")" = "$PATCHED_SHA"
           git merge-base --is-ancestor "$FORK_MAIN_SHA" "$UPSTREAM_SHA"
@@ -320,6 +368,7 @@ jobs:
           git switch "$candidate_branch"
 
           changed_paths=$(jq -r '.changed_paths[]?' "$result_file")
+          candidate_diff_stat=$(git diff --stat "$PATCHED_SHA...HEAD")
           commit_summary=$(git log --format='- %h %s' "$FORK_MAIN_SHA..$UPSTREAM_SHA" | awk 'NR <= 50 {print}')
           preserved_paths=$(jq -r '.preserved[]?' "$result_file")
           if [[ "$candidate_classification" == "docs-only" ]]; then
@@ -346,6 +395,10 @@ jobs:
 
           $changed_paths
 
+          ### Candidate diff stat
+
+          $candidate_diff_stat
+
           ### 按 fork policy 保留
 
           ${preserved_paths:-无}
@@ -362,9 +415,82 @@ jobs:
             --body-file "$RUNNER_TEMP/pr-body.md" \
             --reviewer slashinchi
 
+  repair_candidate_pr:
+    name: Recover existing candidate branch PR
+    needs: [probe]
+    if: needs.probe.result == 'success' && needs.probe.outputs.state == 'candidate-branch-no-pr'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out trusted monitor code without executing candidate code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Reuse existing candidate branch without force update
+        env:
+          UPSTREAM_REPO: kukuqi666/TVBoxOS-Mobile
+          UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
+          FORK_MAIN_SHA: ${{ needs.probe.outputs.fork_main_sha }}
+          PATCHED_SHA: ${{ needs.probe.outputs.patched_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          candidate_branch="automation/upstream-${UPSTREAM_SHA:0:7}"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git fetch --no-tags origin +refs/heads/patched:refs/remotes/origin/patched
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+            +refs/heads/main:refs/remotes/upstream/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$FORK_MAIN_SHA"
+          test "$(git rev-parse refs/remotes/origin/patched)" = "$PATCHED_SHA"
+          test "$(git rev-parse refs/remotes/upstream/main)" = "$UPSTREAM_SHA"
+          git merge-base --is-ancestor "$FORK_MAIN_SHA" "$UPSTREAM_SHA"
+          git ls-remote --exit-code origin "refs/heads/$candidate_branch" >/dev/null
+          git push origin "refs/remotes/upstream/main:refs/heads/main"
+          git fetch --no-tags origin \
+            "+refs/heads/$candidate_branch:refs/remotes/origin/$candidate_branch"
+
+          changed_paths=$(git diff --name-only "$PATCHED_SHA...refs/remotes/origin/$candidate_branch")
+          candidate_diff_stat=$(git diff --stat "$PATCHED_SHA...refs/remotes/origin/$candidate_branch")
+          commit_summary=$(git log --format='- %h %s' "$FORK_MAIN_SHA..$UPSTREAM_SHA" | awk 'NR <= 50 {print}')
+          cat > "$RUNNER_TEMP/recovery-pr-body.md" <<EOF
+          ## 上游候选 PR 恢复
+
+          - upstream：kukuqi666/TVBoxOS-Mobile
+          - upstream SHA：$FORK_MAIN_SHA → $UPSTREAM_SHA
+          - existing candidate：$candidate_branch
+          - recovery：复用已推送分支；不 force-update，不执行 candidate code
+          - candidate validation：此前 run 已完成；本次只恢复 PR 入口
+
+          ### 上游提交
+
+          $commit_summary
+
+          ### Candidate diff stat
+
+          $candidate_diff_stat
+
+          ### 候选变更文件
+
+          $changed_paths
+
+          请把 PR 交给 ChatGPT/OC 复核，再决定是否 Merge 到 patched。
+          EOF
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base patched \
+            --head "$candidate_branch" \
+            --title "chore: recover upstream candidate ${UPSTREAM_SHA:0:7}" \
+            --body-file "$RUNNER_TEMP/recovery-pr-body.md" \
+            --reviewer slashinchi
+
   notify:
     name: Notify and fail closed
-    needs: [fixture_tests, date_gate, probe, candidate_validation, write_candidate]
+    needs: [fixture_tests, date_gate, probe, candidate_validation, write_candidate, repair_candidate_pr]
     if: >-
       always() &&
       (
@@ -376,10 +502,13 @@ jobs:
             needs.probe.result != 'success' ||
             (needs.probe.outputs.state != 'no-change' &&
              needs.probe.outputs.state != 'already-open' &&
-             needs.probe.outputs.state != 'fast-forward') ||
+             needs.probe.outputs.state != 'fast-forward' &&
+             needs.probe.outputs.state != 'no-actionable-delta' &&
+             needs.probe.outputs.state != 'candidate-branch-no-pr') ||
             needs.candidate_validation.result == 'failure' ||
             needs.candidate_validation.outputs.validation == 'fail' ||
-            needs.write_candidate.result == 'failure'
+            needs.write_candidate.result == 'failure' ||
+            needs.repair_candidate_pr.result == 'failure'
           )
         )
       )
@@ -399,6 +528,7 @@ jobs:
           VALIDATION: ${{ needs.candidate_validation.outputs.validation }}
           VALIDATION_RESULT: ${{ needs.candidate_validation.result }}
           WRITE_RESULT: ${{ needs.write_candidate.result }}
+          REPAIR_RESULT: ${{ needs.repair_candidate_pr.result }}
           FORK_MAIN_SHA: ${{ needs.probe.outputs.fork_main_sha }}
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
           PATCHED_SHA: ${{ needs.probe.outputs.patched_sha }}
@@ -406,6 +536,8 @@ jobs:
           CANDIDATE_SHA: ${{ needs.candidate_validation.outputs.candidate_sha }}
           CHANGED_PATHS_B64: ${{ needs.candidate_validation.outputs.changed_paths_b64 }}
           PRESERVED_PATHS_B64: ${{ needs.candidate_validation.outputs.preserved_paths_b64 }}
+          COMMIT_SUMMARY_B64: ${{ needs.probe.outputs.commit_summary_b64 }}
+          SOURCE_DIFF_STAT_B64: ${{ needs.probe.outputs.source_diff_stat_b64 }}
         run: |
           set -euo pipefail
           reason=probe-error
@@ -413,6 +545,8 @@ jobs:
             reason=fixture-tests-failure
           elif [[ "$DATE_GATE_RESULT" != "success" ]]; then
             reason=date-gate-failure
+          elif [[ "$REPAIR_RESULT" == "failure" ]]; then
+            reason=repair-failure
           elif [[ "$WRITE_RESULT" == "failure" ]]; then
             reason=write-failure
           elif [[ "$VALIDATION_RESULT" == "failure" || "$VALIDATION" == "fail" ]]; then
@@ -429,9 +563,17 @@ jobs:
           if [[ -n "$PRESERVED_PATHS_B64" ]]; then
             preserved_paths=$(printf '%s' "$PRESERVED_PATHS_B64" | base64 --decode | tr '\0' ',')
           fi
+          commit_summary="not available"
+          if [[ -n "$COMMIT_SUMMARY_B64" ]]; then
+            commit_summary=$(printf '%s' "$COMMIT_SUMMARY_B64" | base64 --decode)
+          fi
+          source_diff_stat="not available"
+          if [[ -n "$SOURCE_DIFF_STAT_B64" ]]; then
+            source_diff_stat=$(printf '%s' "$SOURCE_DIFF_STAT_B64" | base64 --decode)
+          fi
           if [[ "$CLASSIFICATION" == "docs-only" ]]; then
             candidate_build_status="skipped: docs-only"
-          elif [[ "$VALIDATION" == "pass" ]]; then
+          elif [[ "$VALIDATION_RESULT" == "success" && "$VALIDATION" == "pass" ]]; then
             candidate_build_status="PASS: assembleDebug"
           else
             candidate_build_status="not run / failed closed"
@@ -446,9 +588,14 @@ jobs:
           - risk classification：${CLASSIFICATION:-unknown/high-risk}
           - candidate build/validation：$candidate_build_status / ${VALIDATION:-unknown}
           - changed files：$changed_paths
+          - source diff stat：$source_diff_stat
           - fork-owned preserved：$preserved_paths
           - workflow run：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
           - probe state：${PROBE_STATE:-unknown}
+
+          ### Upstream commit summary
+
+          $commit_summary
 
           请把本 Issue 交给 ChatGPT/OC 复核；automation 不会自动合并 patched。
           EOF
@@ -470,3 +617,43 @@ jobs:
               --body "$body"
           fi
           exit 1
+
+  recover:
+    name: Close recovered automation issues
+    needs: [fixture_tests, date_gate, probe, candidate_validation, write_candidate, repair_candidate_pr, notify]
+    if: >-
+      always() &&
+      needs.fixture_tests.result == 'success' &&
+      needs.date_gate.result == 'success' &&
+      needs.date_gate.outputs.active == 'true' &&
+      needs.probe.result == 'success' &&
+      needs.notify.result != 'failure' &&
+      (
+        needs.probe.outputs.state == 'no-change' ||
+        needs.probe.outputs.state == 'no-actionable-delta' ||
+        needs.probe.outputs.state == 'already-open' ||
+        needs.repair_candidate_pr.result == 'success' ||
+        needs.write_candidate.result == 'success'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - name: Close resolved U1 automation issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          open_issues=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --limit 100 \
+            --json number,title)
+          while IFS= read -r number; do
+            [[ -z "$number" ]] && continue
+            gh issue comment "$number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body "U1 已恢复；本次检查通过，自动关闭该去重 Issue。"
+            gh issue close "$number" --repo "$GITHUB_REPOSITORY"
+          done < <(jq -r '.[] | select(.title | startswith("[upstream-monitor]")) | .number' <<<"$open_issues")

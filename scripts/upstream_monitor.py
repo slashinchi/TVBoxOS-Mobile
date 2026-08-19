@@ -79,7 +79,7 @@ def classify_paths(paths):
             return "docs-only"
         if path.startswith("docs/") and path.endswith((".md", ".markdown", ".txt", ".adoc", ".rst")):
             return "docs-only"
-        if path.endswith((".md", ".markdown")) and "/" not in path:
+        if path in {"CHANGELOG.md", "LICENSE.md", "NOTICE.md"}:
             return "docs-only"
         if path.startswith(("app/", "player/")) or path.endswith(
             (".java", ".kt", ".kts", ".xml", ".gradle")
@@ -167,7 +167,7 @@ def merge_candidate(repo, upstream_ref, base_ref):
 
     candidate_sha = _git(repo, "rev-parse", "HEAD")
     changed_paths = _git(repo, "diff", "--name-only", f"{base_sha}...HEAD").splitlines()
-    return CandidateResult("clean", candidate_sha, [], preserved, changed_paths, True)
+    return CandidateResult("clean", candidate_sha, [], preserved, changed_paths, bool(changed_paths))
 
 
 def _result_json(result):
@@ -206,6 +206,7 @@ class U1FixtureTests(unittest.TestCase):
 
     def test_classification_keeps_docs_only_narrow(self):
         self.assertEqual(classify_paths(["README.md", "docs/MIGRATION.md"]), "docs-only")
+        self.assertEqual(classify_paths(["AGENTS.md"]), "unknown/high-risk")
         self.assertEqual(classify_paths(["docs/release.sh"]), "unknown/high-risk")
         self.assertEqual(classify_paths(["docs/config.json"]), "unknown/high-risk")
         self.assertEqual(classify_paths(["app/src/main/AndroidManifest.xml"]), "runtime/high-risk")
@@ -229,7 +230,7 @@ class U1FixtureTests(unittest.TestCase):
         self.assertNotIn("actions/checkout@v4", workflow)
         self.assertIn("$RUNNER_TEMP/candidate-result.json", workflow)
         self.assertIn("fetch-depth: 0", workflow)
-        self.assertIn("needs: [fixture_tests, date_gate, probe, candidate_validation, write_candidate]", workflow)
+        self.assertIn("needs: [fixture_tests, date_gate, probe, candidate_validation, write_candidate, repair_candidate_pr]", workflow)
         self.assertIn("needs.fixture_tests.result", workflow)
         self.assertIn("contents: read", workflow)
         self.assertIn("contents: write", workflow)
@@ -272,6 +273,22 @@ class U1FixtureTests(unittest.TestCase):
             self.assertIn("docs.md", result.changed_paths)
             self.assertEqual((repo / "README.md").read_text(), "fork README\nbase footer\n")
             self.assertEqual((repo / "update.json").read_text(), '{"endpoint":"fork","version":1}\n')
+
+    def test_only_fork_owned_clean_change_needs_no_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._new_repo(Path(tmp))
+            _git(repo, "checkout", "-b", "patched")
+            (repo / "README.md").write_text("fork README\nbase footer\n")
+            self._commit(repo, "fork README")
+            _git(repo, "checkout", "-b", "upstream", "main")
+            (repo / "README.md").write_text("base README\nupstream footer\n")
+            self._commit(repo, "upstream README")
+            result = merge_candidate(repo, "upstream", "patched")
+            self.assertEqual(result.status, "clean")
+            self.assertFalse(result.candidate_needed)
+            self.assertEqual(result.changed_paths, [])
+            self.assertEqual(result.preserved, ["README.md"])
+            self.assertEqual((repo / "README.md").read_text(), "fork README\nbase footer\n")
 
     def test_candidate_merge_with_head_base_reports_upstream_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -336,6 +353,7 @@ class U1FixtureTests(unittest.TestCase):
             self.assertEqual(result.status, "clean")
             self.assertEqual(result.conflicts, [])
             self.assertEqual(result.preserved, ["README.md", "update.json"])
+            self.assertFalse(result.candidate_needed)
             self.assertEqual((repo / "README.md").read_text(), "fork README\n")
             self.assertEqual((repo / "update.json").read_text(), '{"fork":true}\n')
 
@@ -346,7 +364,7 @@ class U1FixtureTests(unittest.TestCase):
         _git(repo, "init", "-b", "main")
         _git(repo, "config", "user.email", "fixture@example.invalid")
         _git(repo, "config", "user.name", "U1 Fixture")
-        (repo / "README.md").write_text("base README\n")
+        (repo / "README.md").write_text("base README\nbase footer\n")
         (repo / "update.json").write_text('{"base":true}\n')
         (repo / "runtime.txt").write_text("base runtime\n")
         U1FixtureTests._commit(repo, "base")
