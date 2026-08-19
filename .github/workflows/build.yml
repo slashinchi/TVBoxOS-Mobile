@@ -390,10 +390,10 @@ jobs:
           git fetch origin patched
           git checkout -B patched origin/patched
           GITHUB_REPOSITORY="${{ github.repository }}" ./scripts/sync_release_metadata.sh --skip-version-check "$TAG_NAME"
-          if git diff --quiet -- update.json README.md; then exit 0; fi
+          if git diff --quiet -- update.json; then exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add update.json README.md
+          git add update.json
           git commit -m "chore: sync release metadata for ${TAG_NAME} [skip ci]"
           for attempt in 1 2 3; do
             if git push origin HEAD:patched; then exit 0; fi

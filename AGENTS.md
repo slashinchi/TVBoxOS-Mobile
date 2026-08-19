@@ -9,3 +9,6 @@
 - Documentation semantics: HANDOFF/current-state = rewrite holistically; ACTIVE-PLAN = living/current; FACTS = append-only timeline; DECISIONS = append or supersede.
 - Never store keystores, passwords, tokens, or other secrets in the repo or normal Drive docs.
 - Keep diffs minimal. Do not refactor unrelated code or expand scope without evidence.
+- GitHub default branch `patched` is the fork user-facing and normal development/PR base; this does not change D-001: `main` remains the upstream mirror only.
+- Upstream maintenance follows `upstream/main -> fork/main -> merge fork/patched`; do not use a direct GitHub Sync fork operation into `patched` as the normal path.
+- README cleanup removes human-facing promotion and upstream-personal content only; it never authorizes deleting inherited runtime or resource files.
