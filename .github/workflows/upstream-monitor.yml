@@ -1038,8 +1038,9 @@ jobs:
             fi
             if jq -e --arg marker "$marker" 'any(.[][]; (.body // "") | contains($marker))' <<<"$comments" >/dev/null; then
               return 0
+            else
+              marker_status=$?
             fi
-            marker_status=$?
             [[ "$marker_status" -eq 1 ]] && return 1
             return 2
           }
@@ -1194,8 +1195,9 @@ jobs:
             fi
             if jq -e --arg marker "$marker" 'any(.[][]; (.body // "") | contains($marker))' <<<"$comments" >/dev/null; then
               return 0
+            else
+              marker_status=$?
             fi
-            marker_status=$?
             [[ "$marker_status" -eq 1 ]] && return 1
             return 2
           }
