@@ -12,11 +12,18 @@
 
 ## Why this fork
 
-- 面向 Android 14+ 的兼容性与行为修复
+- 面向 Android 14 / targetSdk 34 的兼容性与行为修复
 - 稳定的 fork signing identity 与可持续覆盖升级路径
 - 动态 JAR / JS loader 兼容性维护
 - PIP、后台播放与生命周期稳定性修复
 - 可重复的 signed RC、Release 与 metadata 发布链
+
+## Compatibility
+
+- 构建安装下限：Android 7.0 / API 24；ABI：`arm64-v8a`。
+- `compileSdk` / `targetSdk`：34。
+- 已完成真机运行验证：OnePlus PHK110 / Android 14。
+- API24/API33 代表设备 smoke 为 Deferred（D-010）；不宣称所有旧系统、设备、ROM 或后续 Android 版本均已实测。
 
 ## Download
 
