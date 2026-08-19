@@ -156,6 +156,31 @@ jobs:
             fi
           fi
 
+          list_all_prs() {
+            local pages normalized attempt
+            for attempt in 1 2 3; do
+              if pages=$(timeout 30s gh api \
+                --paginate \
+                --slurp \
+                "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100"); then
+                if normalized=$(jq -c '[.[][] | {
+                  number,
+                  url: .html_url,
+                  state: (if .merged_at != null then "MERGED" elif .state == "open" then "OPEN" else "CLOSED" end),
+                  headRefName: .head.ref,
+                  headRefOid: .head.sha,
+                  headRepository: {nameWithOwner: (.head.repo.full_name // "")},
+                  baseRefName: .base.ref
+                }]' <<<"$pages"); then
+                  printf '%s' "$normalized"
+                  return 0
+                fi
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
           policy=none
           candidate_branch_exists=false
           candidate_branch_oid=
@@ -165,18 +190,13 @@ jobs:
             if [[ -n "$candidate_branch_oid" ]]; then
               candidate_branch_exists=true
             fi
-            open_prs=$(gh pr list \
-              --repo "$GITHUB_REPOSITORY" \
-              --base patched \
-              --state all \
-              --limit 1000 \
-              --json number,headRefName,headRefOid,headRepository,state,mergedAt,url,title)
+            open_prs=$(list_all_prs)
             policy=$(jq -r \
               --arg exact "$exact_branch" \
               --arg oid "$candidate_branch_oid" \
               --arg repository "$GITHUB_REPOSITORY" \
               'def ours: (.headRepository.nameWithOwner // "") == $repository;
-               if any(.[]; ours and .headRefName == $exact and .state == "OPEN" and $oid != "" and .headRefOid == $oid) then "already-open"
+               if any(.[]; ours and .headRefName == $exact and .baseRefName == "patched" and .state == "OPEN" and $oid != "" and .headRefOid == $oid) then "already-open"
                elif any(.[]; ours and .headRefName == $exact and .state == "OPEN") then "stale-open"
                elif any(.[]; ours and .headRefName == $exact and .state != "OPEN") then "closed-or-merged"
                elif any(.[]; ours and .state == "OPEN" and (.headRefName | startswith("automation/upstream-"))) then "stale-open"
@@ -436,58 +456,93 @@ jobs:
           actual_candidate_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
           test "$actual_candidate_tree" = "$expected_candidate_tree"
 
+          list_open_prs() {
+            local pages prs attempt
+            for attempt in 1 2 3; do
+              if pages=$(timeout 30s gh api \
+                --paginate \
+                --slurp \
+                "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100"); then
+                if prs=$(jq -c '[.[][] | {
+                  number,
+                  url: .html_url,
+                  state: "OPEN",
+                  headRefName: .head.ref,
+                  headRefOid: .head.sha,
+                  headRepository: {nameWithOwner: (.head.repo.full_name // "")},
+                  baseRefName: .base.ref
+                }]' <<<"$pages"); then
+                  printf '%s' "$prs"
+                  return 0
+                fi
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
           find_open_candidate_pr() {
             local prs
-            if ! prs=$(gh pr list \
-              --repo "$GITHUB_REPOSITORY" \
-              --base patched \
-              --head "$candidate_branch" \
-              --state open \
-              --limit 1000 \
-              --json number,url,headRefOid,headRepository); then
+            if ! prs=$(list_open_prs); then
               return 1
             fi
             jq -r \
               --arg repository "$GITHUB_REPOSITORY" \
+              --arg branch "$candidate_branch" \
               --arg oid "$1" \
-              'map(select((.headRepository.nameWithOwner // "") == $repository and .headRefOid == $oid)) | .[0].url // empty' \
+              'map(select(.state == "OPEN" and (.headRepository.nameWithOwner // "") == $repository and .headRefName == $branch and .baseRefName == "patched" and .headRefOid == $oid)) | .[0].url // empty' \
               <<<"$prs"
           }
 
+          close_pr_with_retry() {
+            local number="$1"
+            local attempt
+            for attempt in 1 2 3; do
+              if timeout 30s gh pr close "$number" \
+                --repo "$GITHUB_REPOSITORY" \
+                --comment "U1 closed this PR because its head was not the validated candidate."; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
           close_unvalidated_candidate_prs() {
-            local prs
-            if ! prs=$(gh pr list \
-              --repo "$GITHUB_REPOSITORY" \
-              --base patched \
-              --head "$candidate_branch" \
-              --state open \
-              --limit 1000 \
-              --json number,headRefOid,headRepository); then
+            local prs unvalidated_numbers number
+            if ! prs=$(list_open_prs); then
+              return 1
+            fi
+            if ! unvalidated_numbers=$(jq -r \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg branch "$candidate_branch" \
+              --arg oid "$1" \
+              '.[] | select(.state == "OPEN" and (.headRepository.nameWithOwner // "") == $repository and .headRefName == $branch and (.headRefOid != $oid or .baseRefName != "patched")) | .number' \
+              <<<"$prs"); then
               return 1
             fi
             while IFS= read -r number; do
               [[ -z "$number" ]] && continue
-              gh pr close "$number" \
-                --repo "$GITHUB_REPOSITORY" \
-                --comment "U1 closed this PR because its head was not the validated candidate."
-            done < <(jq -r \
-              --arg repository "$GITHUB_REPOSITORY" \
-              --arg oid "$1" \
-              '.[] | select((.headRepository.nameWithOwner // "") == $repository and .headRefOid != $oid) | .number' \
-              <<<"$prs")
+              close_pr_with_retry "$number"
+            done <<<"$unvalidated_numbers"
           }
 
           pr_create_error="$RUNNER_TEMP/pr-create.error"
           pr_create_output="$RUNNER_TEMP/pr-create.output"
           set +e
-          gh pr create \
-            --repo "$GITHUB_REPOSITORY" \
-            --base patched \
-            --head "$candidate_branch" \
-            --title "chore: upstream candidate ${UPSTREAM_SHA:0:7}" \
-            --body-file "$RUNNER_TEMP/pr-body.md" \
-            --reviewer slashinchi >"$pr_create_output" 2>"$pr_create_error"
-          pr_create_status=$?
+          pr_create_status=1
+          for attempt in 1 2 3; do
+            timeout 60s gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base patched \
+              --head "$candidate_branch" \
+              --title "chore: upstream candidate ${UPSTREAM_SHA:0:7}" \
+              --body-file "$RUNNER_TEMP/pr-body.md" \
+              --reviewer slashinchi >"$pr_create_output" 2>"$pr_create_error"
+            pr_create_status=$?
+            [[ "$pr_create_status" -eq 0 ]] && break
+            sleep $((attempt * 2))
+          done
           set -e
           pr_url=$(awk 'NF {last=$0} END {print last}' "$pr_create_output")
           if [[ "$pr_create_status" -ne 0 || -z "$pr_url" ]]; then
@@ -500,7 +555,7 @@ jobs:
             if [[ -n "$recovered_pr_url" ]]; then
               pr_url="$recovered_pr_url"
             else
-              close_unvalidated_candidate_prs "$expected_candidate_oid" || true
+              close_unvalidated_candidate_prs "$expected_candidate_oid"
               cat "$pr_create_error"
               exit 1
             fi
@@ -508,8 +563,13 @@ jobs:
 
           pr_view_error="$RUNNER_TEMP/pr-view.error"
           set +e
-          pr_head_oid=$(gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid' 2>"$pr_view_error")
-          pr_view_status=$?
+          pr_view_status=1
+          for attempt in 1 2 3; do
+            pr_view_json=$(timeout 30s gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json state,headRefName,headRefOid,headRepository,baseRefName 2>"$pr_view_error")
+            pr_view_status=$?
+            [[ "$pr_view_status" -eq 0 ]] && break
+            sleep $((attempt * 2))
+          done
           set -e
           if [[ "$pr_view_status" -ne 0 ]]; then
             recovered_pr_url=""
@@ -520,19 +580,33 @@ jobs:
             fi
             if [[ -n "$recovered_pr_url" ]]; then
               pr_url="$recovered_pr_url"
-              pr_head_oid="$expected_candidate_oid"
+              pr_view_json=$(jq -n \
+                --arg branch "$candidate_branch" \
+                --arg oid "$expected_candidate_oid" \
+                --arg repository "$GITHUB_REPOSITORY" \
+                '{state: "OPEN", headRefName: $branch, headRefOid: $oid, headRepository: {nameWithOwner: $repository}, baseRefName: "patched"}')
             else
-              close_unvalidated_candidate_prs "$expected_candidate_oid" || true
+              close_unvalidated_candidate_prs "$expected_candidate_oid"
               cat "$pr_view_error"
               exit 1
             fi
           fi
-          if [[ "$pr_head_oid" != "$expected_candidate_oid" ]]; then
-            gh pr close "$pr_url" --repo "$GITHUB_REPOSITORY" --comment "U1 closed this PR because its head changed after candidate validation." || true
-            close_unvalidated_candidate_prs "$expected_candidate_oid" || true
+          if ! jq -e 'type == "object"' <<<"$pr_view_json" >/dev/null; then
+            close_unvalidated_candidate_prs "$expected_candidate_oid"
+            echo "The PR view response was not a JSON object."
+            exit 1
+          fi
+          pr_state=$(jq -r '.state // empty' <<<"$pr_view_json")
+          pr_head_name=$(jq -r '.headRefName // empty' <<<"$pr_view_json")
+          pr_head_oid=$(jq -r '.headRefOid // empty' <<<"$pr_view_json")
+          pr_head_repository=$(jq -r '.headRepository.nameWithOwner // empty' <<<"$pr_view_json")
+          pr_base_name=$(jq -r '.baseRefName // empty' <<<"$pr_view_json")
+          if [[ "$pr_state" != "OPEN" || "$pr_head_name" != "$candidate_branch" || "$pr_head_oid" != "$expected_candidate_oid" || "$pr_head_repository" != "$GITHUB_REPOSITORY" || "$pr_base_name" != "patched" ]]; then
+            close_unvalidated_candidate_prs "$expected_candidate_oid"
             echo "Candidate branch changed while opening the PR."
             exit 1
           fi
+          close_unvalidated_candidate_prs "$expected_candidate_oid"
 
   repair_candidate_pr:
     name: Recover existing candidate branch PR
@@ -630,58 +704,93 @@ jobs:
 
           请把 PR 交给 ChatGPT/OC 复核，再决定是否 Merge 到 patched。
           EOF
+          list_open_prs() {
+            local pages prs attempt
+            for attempt in 1 2 3; do
+              if pages=$(timeout 30s gh api \
+                --paginate \
+                --slurp \
+                "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100"); then
+                if prs=$(jq -c '[.[][] | {
+                  number,
+                  url: .html_url,
+                  state: "OPEN",
+                  headRefName: .head.ref,
+                  headRefOid: .head.sha,
+                  headRepository: {nameWithOwner: (.head.repo.full_name // "")},
+                  baseRefName: .base.ref
+                }]' <<<"$pages"); then
+                  printf '%s' "$prs"
+                  return 0
+                fi
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
           find_open_candidate_pr() {
             local prs
-            if ! prs=$(gh pr list \
-              --repo "$GITHUB_REPOSITORY" \
-              --base patched \
-              --head "$candidate_branch" \
-              --state open \
-              --limit 1000 \
-              --json number,url,headRefOid,headRepository); then
+            if ! prs=$(list_open_prs); then
               return 1
             fi
             jq -r \
               --arg repository "$GITHUB_REPOSITORY" \
+              --arg branch "$candidate_branch" \
               --arg oid "$1" \
-              'map(select((.headRepository.nameWithOwner // "") == $repository and .headRefOid == $oid)) | .[0].url // empty' \
+              'map(select(.state == "OPEN" and (.headRepository.nameWithOwner // "") == $repository and .headRefName == $branch and .baseRefName == "patched" and .headRefOid == $oid)) | .[0].url // empty' \
               <<<"$prs"
           }
 
+          close_pr_with_retry() {
+            local number="$1"
+            local attempt
+            for attempt in 1 2 3; do
+              if timeout 30s gh pr close "$number" \
+                --repo "$GITHUB_REPOSITORY" \
+                --comment "U1 closed this PR because its head was not the validated candidate."; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
           close_unvalidated_candidate_prs() {
-            local prs
-            if ! prs=$(gh pr list \
-              --repo "$GITHUB_REPOSITORY" \
-              --base patched \
-              --head "$candidate_branch" \
-              --state open \
-              --limit 1000 \
-              --json number,headRefOid,headRepository); then
+            local prs unvalidated_numbers number
+            if ! prs=$(list_open_prs); then
+              return 1
+            fi
+            if ! unvalidated_numbers=$(jq -r \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg branch "$candidate_branch" \
+              --arg oid "$1" \
+              '.[] | select(.state == "OPEN" and (.headRepository.nameWithOwner // "") == $repository and .headRefName == $branch and (.headRefOid != $oid or .baseRefName != "patched")) | .number' \
+              <<<"$prs"); then
               return 1
             fi
             while IFS= read -r number; do
               [[ -z "$number" ]] && continue
-              gh pr close "$number" \
-                --repo "$GITHUB_REPOSITORY" \
-                --comment "U1 closed this PR because its head was not the validated candidate."
-            done < <(jq -r \
-              --arg repository "$GITHUB_REPOSITORY" \
-              --arg oid "$1" \
-              '.[] | select((.headRepository.nameWithOwner // "") == $repository and .headRefOid != $oid) | .number' \
-              <<<"$prs")
+              close_pr_with_retry "$number"
+            done <<<"$unvalidated_numbers"
           }
 
           pr_create_error="$RUNNER_TEMP/recovery-pr-create.error"
           pr_create_output="$RUNNER_TEMP/recovery-pr-create.output"
           set +e
-          gh pr create \
-            --repo "$GITHUB_REPOSITORY" \
-            --base patched \
-            --head "$candidate_branch" \
-            --title "chore: recover upstream candidate ${UPSTREAM_SHA:0:7}" \
-            --body-file "$RUNNER_TEMP/recovery-pr-body.md" \
-            --reviewer slashinchi >"$pr_create_output" 2>"$pr_create_error"
-          pr_create_status=$?
+          pr_create_status=1
+          for attempt in 1 2 3; do
+            timeout 60s gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base patched \
+              --head "$candidate_branch" \
+              --title "chore: recover upstream candidate ${UPSTREAM_SHA:0:7}" \
+              --body-file "$RUNNER_TEMP/recovery-pr-body.md" \
+              --reviewer slashinchi >"$pr_create_output" 2>"$pr_create_error"
+            pr_create_status=$?
+            [[ "$pr_create_status" -eq 0 ]] && break
+            sleep $((attempt * 2))
+          done
           set -e
           pr_url=$(awk 'NF {last=$0} END {print last}' "$pr_create_output")
           if [[ "$pr_create_status" -ne 0 || -z "$pr_url" ]]; then
@@ -694,15 +803,20 @@ jobs:
             if [[ -n "$recovered_pr_url" ]]; then
               pr_url="$recovered_pr_url"
             else
-              close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID" || true
+              close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID"
               cat "$pr_create_error"
               exit 1
             fi
           fi
           pr_view_error="$RUNNER_TEMP/recovery-pr-view.error"
           set +e
-          pr_head_oid=$(gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid' 2>"$pr_view_error")
-          pr_view_status=$?
+          pr_view_status=1
+          for attempt in 1 2 3; do
+            pr_view_json=$(timeout 30s gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json state,headRefName,headRefOid,headRepository,baseRefName 2>"$pr_view_error")
+            pr_view_status=$?
+            [[ "$pr_view_status" -eq 0 ]] && break
+            sleep $((attempt * 2))
+          done
           set -e
           if [[ "$pr_view_status" -ne 0 ]]; then
             recovered_pr_url=""
@@ -713,19 +827,33 @@ jobs:
             fi
             if [[ -n "$recovered_pr_url" ]]; then
               pr_url="$recovered_pr_url"
-              pr_head_oid="$CANDIDATE_BRANCH_OID"
+              pr_view_json=$(jq -n \
+                --arg branch "$candidate_branch" \
+                --arg oid "$CANDIDATE_BRANCH_OID" \
+                --arg repository "$GITHUB_REPOSITORY" \
+                '{state: "OPEN", headRefName: $branch, headRefOid: $oid, headRepository: {nameWithOwner: $repository}, baseRefName: "patched"}')
             else
-              close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID" || true
+              close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID"
               cat "$pr_view_error"
               exit 1
             fi
           fi
-          if [[ "$pr_head_oid" != "$CANDIDATE_BRANCH_OID" ]]; then
-            gh pr close "$pr_url" --repo "$GITHUB_REPOSITORY" --comment "U1 closed this PR because its head changed after recovery validation." || true
-            close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID" || true
+          if ! jq -e 'type == "object"' <<<"$pr_view_json" >/dev/null; then
+            close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID"
+            echo "The recovery PR view response was not a JSON object."
+            exit 1
+          fi
+          pr_state=$(jq -r '.state // empty' <<<"$pr_view_json")
+          pr_head_name=$(jq -r '.headRefName // empty' <<<"$pr_view_json")
+          pr_head_oid=$(jq -r '.headRefOid // empty' <<<"$pr_view_json")
+          pr_head_repository=$(jq -r '.headRepository.nameWithOwner // empty' <<<"$pr_view_json")
+          pr_base_name=$(jq -r '.baseRefName // empty' <<<"$pr_view_json")
+          if [[ "$pr_state" != "OPEN" || "$pr_head_name" != "$candidate_branch" || "$pr_head_oid" != "$CANDIDATE_BRANCH_OID" || "$pr_head_repository" != "$GITHUB_REPOSITORY" || "$pr_base_name" != "patched" ]]; then
+            close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID"
             echo "Candidate branch changed while recovering the PR."
             exit 1
           fi
+          close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID"
 
   notify:
     name: Notify and fail closed
@@ -745,10 +873,13 @@ jobs:
              needs.probe.outputs.state != 'no-actionable-delta' &&
              needs.probe.outputs.state != 'candidate-branch-no-pr' &&
              needs.probe.outputs.state != 'candidate-branch-missing-after-main') ||
-            needs.candidate_validation.result == 'failure' ||
-            needs.candidate_validation.outputs.validation == 'fail' ||
-            needs.write_candidate.result == 'failure' ||
-            needs.repair_candidate_pr.result == 'failure'
+             needs.candidate_validation.result == 'failure' ||
+             needs.candidate_validation.result == 'cancelled' ||
+             needs.candidate_validation.outputs.validation == 'fail' ||
+             needs.write_candidate.result == 'failure' ||
+             needs.write_candidate.result == 'cancelled' ||
+             needs.repair_candidate_pr.result == 'failure' ||
+             needs.repair_candidate_pr.result == 'cancelled'
           )
         )
       )
@@ -786,11 +917,11 @@ jobs:
             reason=fixture-tests-failure
           elif [[ "$DATE_GATE_RESULT" != "success" ]]; then
             reason=date-gate-failure
-          elif [[ "$REPAIR_RESULT" == "failure" ]]; then
+          elif [[ "$REPAIR_RESULT" == "failure" || "$REPAIR_RESULT" == "cancelled" ]]; then
             reason=repair-failure
-          elif [[ "$WRITE_RESULT" == "failure" ]]; then
+          elif [[ "$WRITE_RESULT" == "failure" || "$WRITE_RESULT" == "cancelled" ]]; then
             reason=write-failure
-          elif [[ "$VALIDATION_RESULT" == "failure" || "$VALIDATION" == "fail" ]]; then
+          elif [[ "$VALIDATION_RESULT" == "failure" || "$VALIDATION_RESULT" == "cancelled" || "$VALIDATION" == "fail" ]]; then
             reason=candidate-validation-failure
           elif [[ -n "$PROBE_STATE" ]]; then
             reason="$PROBE_STATE"
@@ -875,7 +1006,10 @@ jobs:
       needs.date_gate.result == 'success' &&
       needs.date_gate.outputs.active == 'true' &&
       needs.probe.result == 'success' &&
-      needs.notify.result != 'failure' &&
+      (needs.notify.result == 'success' || needs.notify.result == 'skipped') &&
+      needs.candidate_validation.result != 'cancelled' &&
+      needs.write_candidate.result != 'cancelled' &&
+      needs.repair_candidate_pr.result != 'cancelled' &&
       (
         needs.probe.outputs.state == 'no-change' ||
         needs.probe.outputs.state == 'no-actionable-delta' ||
@@ -895,19 +1029,13 @@ jobs:
         run: |
           set -euo pipefail
           recovery_key="${UPSTREAM_SHA:0:7}"
-          [[ -n "$recovery_key" ]] || recovery_key=unknown
+          [[ -n "$recovery_key" ]] || recovery_key=global
           open_issues=$(gh issue list \
             --repo "$GITHUB_REPOSITORY" \
             --state open \
             --limit 1000 \
             --json number,title)
-          while IFS= read -r number; do
-            [[ -z "$number" ]] && continue
-            gh issue comment "$number" \
-              --repo "$GITHUB_REPOSITORY" \
-              --body "U1 已恢复；本次检查通过，自动关闭该去重 Issue。"
-            gh issue close "$number" --repo "$GITHUB_REPOSITORY"
-          done < <(jq -r --arg recovery_key "$recovery_key" '
+          resolved_issue_numbers=$(jq -r --arg recovery_key "$recovery_key" '
             .[]
             | select(.title | startswith("[upstream-monitor] "))
             | (try (.title | capture("^\\[upstream-monitor\\] (?<reason>[^ ]+) (?<sha>[^ ]+)$")) catch null) as $parts
@@ -935,3 +1063,10 @@ jobs:
               ] | index($parts.reason))
             | .number
           ' <<<"$open_issues")
+          while IFS= read -r number; do
+            [[ -z "$number" ]] && continue
+            gh issue comment "$number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body "U1 已恢复；本次检查通过，自动关闭该去重 Issue。"
+            gh issue close "$number" --repo "$GITHUB_REPOSITORY"
+          done <<<"$resolved_issue_numbers"

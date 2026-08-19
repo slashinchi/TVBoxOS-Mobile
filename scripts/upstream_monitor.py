@@ -97,17 +97,30 @@ def classify_paths(paths):
     return "unknown/high-risk"
 
 
-def candidate_policy(open_prs, upstream_sha):
-    """Return the action for open automation PRs without replacing reviewed work."""
+def candidate_policy(open_prs, upstream_sha, repository=None, candidate_oid=None):
+    """Mirror the workflow PR policy for deterministic fixture coverage."""
     exact = f"automation/upstream-{upstream_sha[:7]}"
-    names = {
-        item if isinstance(item, str) else item.get("headRefName", "")
-        for item in open_prs
-    }
-    if exact in names:
-        return "already-open"
-    if any(name.startswith("automation/upstream-") for name in names):
-        return "stale-open"
+    for item in open_prs:
+        if isinstance(item, str):
+            name = item
+            state = "OPEN"
+            head_repository = repository
+            head_oid = None
+        else:
+            name = item.get("headRefName", "")
+            state = item.get("state", "OPEN")
+            head_repository = (item.get("headRepository") or {}).get("nameWithOwner")
+            head_oid = item.get("headRefOid")
+        if repository is not None and head_repository != repository:
+            continue
+        if name == exact and state == "OPEN" and (candidate_oid is None or head_oid == candidate_oid):
+            return "already-open"
+        if name == exact and state == "OPEN":
+            return "stale-open"
+        if name == exact and state != "OPEN":
+            return "closed-or-merged"
+        if name.startswith("automation/upstream-") and state == "OPEN":
+            return "stale-open"
     return "create"
 
 
@@ -219,6 +232,32 @@ class U1FixtureTests(unittest.TestCase):
         self.assertEqual(candidate_policy(exact, "abcdef123456"), "already-open")
         self.assertEqual(candidate_policy(stale, "abcdef123456"), "stale-open")
         self.assertEqual(candidate_policy([], "abcdef123456"), "create")
+        self.assertEqual(
+            candidate_policy(
+                [{
+                    "headRefName": "automation/upstream-abcdef1",
+                    "state": "CLOSED",
+                    "headRepository": {"nameWithOwner": "slashinchi/TVBoxOS-Mobile"},
+                }],
+                "abcdef123456",
+                repository="slashinchi/TVBoxOS-Mobile",
+            ),
+            "closed-or-merged",
+        )
+        self.assertEqual(
+            candidate_policy(
+                [{
+                    "headRefName": "automation/upstream-abcdef1",
+                    "state": "OPEN",
+                    "headRefOid": "other",
+                    "headRepository": {"nameWithOwner": "external/fork"},
+                }],
+                "abcdef123456",
+                repository="slashinchi/TVBoxOS-Mobile",
+                candidate_oid="expected",
+            ),
+            "create",
+        )
 
     def test_workflow_keeps_candidate_and_write_permissions_separate(self):
         workflow = (Path(__file__).parents[1] / ".github/workflows/upstream-monitor.yml").read_text()
@@ -246,9 +285,16 @@ class U1FixtureTests(unittest.TestCase):
         self.assertNotIn("cache: gradle", workflow)
         self.assertIn("candidate-branch-missing-after-main", workflow)
         self.assertIn("candidate-closed-or-merged", workflow)
-        self.assertIn("--state all", workflow)
+        self.assertIn("state=all&per_page=100", workflow)
         self.assertIn("headRepository", workflow)
         self.assertIn("headRefOid", workflow)
+        self.assertIn("baseRefName", workflow)
+        self.assertIn("--paginate", workflow)
+        self.assertIn("pulls?state=all&per_page=100", workflow)
+        self.assertIn("pulls?state=open&per_page=100", workflow)
+        self.assertIn("candidate_validation.result == 'cancelled'", workflow)
+        self.assertIn("needs.notify.result == 'success'", workflow)
+        self.assertIn("timeout 30s gh pr close", workflow)
         self.assertIn("gh pr view", workflow)
         write_block = workflow.split("  write_candidate:", 1)[1].split("\n  notify:", 1)[0]
         self.assertNotIn("gradle", write_block.lower())
