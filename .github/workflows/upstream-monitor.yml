@@ -167,6 +167,10 @@ jobs:
     outputs:
       validation: ${{ steps.prepare.outputs.validation }}
       classification: ${{ steps.prepare.outputs.classification }}
+      candidate_needed: ${{ steps.prepare.outputs.candidate_needed }}
+      candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
+      changed_paths_b64: ${{ steps.prepare.outputs.changed_paths_b64 }}
+      preserved_paths_b64: ${{ steps.prepare.outputs.preserved_paths_b64 }}
     steps:
       - name: Check out trusted monitor code
         uses: actions/checkout@v5
@@ -188,29 +192,43 @@ jobs:
             echo "Candidate upstream SHA changed during validation."
             echo 'validation=fail' >> "$GITHUB_OUTPUT"
             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+            echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
+            echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          result_file="$RUNNER_TEMP/candidate-result.json"
+          error_file="$RUNNER_TEMP/candidate-error.log"
           python3 scripts/upstream_monitor.py prepare-candidate \
             --repo . \
             --upstream-ref "$UPSTREAM_SHA" \
-            --base-ref HEAD > candidate-result.json 2> candidate-error.log
+            --base-ref HEAD > "$result_file" 2> "$error_file"
           prepare_status=$?
           set -e
-          if ! jq -e . candidate-result.json >/dev/null 2>&1; then
-            cat candidate-error.log
+          if ! jq -e . "$result_file" >/dev/null 2>&1; then
+            cat "$error_file"
             echo 'validation=fail' >> "$GITHUB_OUTPUT"
             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+            echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
+            echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          classification=$(jq -r '.classification' candidate-result.json)
-          status=$(jq -r '.status' candidate-result.json)
+          classification=$(jq -r '.classification' "$result_file")
+          status=$(jq -r '.status' "$result_file")
+          candidate_needed=$(jq -r '.candidate_needed' "$result_file")
+          candidate_sha=$(jq -r '.candidate_sha // empty' "$result_file")
+          changed_paths_b64=$(jq -jr '.changed_paths | join("\u0000")' "$result_file" | base64 -w 0)
+          preserved_paths_b64=$(jq -jr '.preserved | join("\u0000")' "$result_file" | base64 -w 0)
           echo "classification=$classification" >> "$GITHUB_OUTPUT"
+          echo "candidate_needed=$candidate_needed" >> "$GITHUB_OUTPUT"
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          echo "changed_paths_b64=$changed_paths_b64" >> "$GITHUB_OUTPUT"
+          echo "preserved_paths_b64=$preserved_paths_b64" >> "$GITHUB_OUTPUT"
           if [[ "$prepare_status" -eq 0 && "$status" == "clean" ]]; then
             echo 'validation=pass' >> "$GITHUB_OUTPUT"
           else
             echo 'validation=fail' >> "$GITHUB_OUTPUT"
           fi
-          cat candidate-result.json
+          cat "$result_file"
 
       - name: Set up JDK 17 for candidate build
         if: steps.prepare.outputs.validation == 'pass' && steps.prepare.outputs.classification != 'docs-only'
@@ -265,6 +283,7 @@ jobs:
           FORK_MAIN_SHA: ${{ needs.probe.outputs.fork_main_sha }}
           PATCHED_SHA: ${{ needs.probe.outputs.patched_sha }}
           EXPECTED_CLASSIFICATION: ${{ needs.candidate_validation.outputs.classification }}
+          EXPECTED_CANDIDATE_NEEDED: ${{ needs.candidate_validation.outputs.candidate_needed }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -278,32 +297,46 @@ jobs:
           git merge-base --is-ancestor "$FORK_MAIN_SHA" "$PATCHED_SHA"
 
           git switch --detach "$PATCHED_SHA"
+          result_file="$RUNNER_TEMP/candidate-result.json"
           python3 scripts/upstream_monitor.py prepare-candidate \
             --repo . \
             --upstream-ref "$UPSTREAM_SHA" \
-            --base-ref HEAD > candidate-result.json
-          candidate_status=$(jq -r '.status' candidate-result.json)
-          candidate_classification=$(jq -r '.classification' candidate-result.json)
+            --base-ref HEAD > "$result_file"
+          candidate_status=$(jq -r '.status' "$result_file")
+          candidate_classification=$(jq -r '.classification' "$result_file")
+          candidate_needed=$(jq -r '.candidate_needed' "$result_file")
           test "$candidate_status" = clean
           test "$candidate_classification" = "$EXPECTED_CLASSIFICATION"
+          test "$candidate_needed" = "$EXPECTED_CANDIDATE_NEEDED"
+
+          if [[ "$candidate_needed" != "true" ]]; then
+            git push origin "refs/remotes/upstream/main:refs/heads/main"
+            echo "Upstream is already integrated into patched; main fast-forwarded without opening an empty PR."
+            exit 0
+          fi
 
           candidate_branch="automation/upstream-${UPSTREAM_SHA:0:7}"
           git branch "$candidate_branch" HEAD
           git switch "$candidate_branch"
-          git push origin "refs/remotes/upstream/main:refs/heads/main"
-          git push origin "HEAD:refs/heads/$candidate_branch"
 
-          changed_paths=$(git diff --name-only "$PATCHED_SHA...HEAD")
-          commit_summary=$(git log --format='- %h %s' "$FORK_MAIN_SHA..$UPSTREAM_SHA" | head -50)
-          preserved_paths=$(jq -r '.preserved[]?' candidate-result.json)
-          cat > pr-body.md <<EOF
+          changed_paths=$(jq -r '.changed_paths[]?' "$result_file")
+          commit_summary=$(git log --format='- %h %s' "$FORK_MAIN_SHA..$UPSTREAM_SHA" | awk 'NR <= 50 {print}')
+          preserved_paths=$(jq -r '.preserved[]?' "$result_file")
+          if [[ "$candidate_classification" == "docs-only" ]]; then
+            candidate_build_status="skipped: docs-only"
+          else
+            candidate_build_status="PASS: assembleDebug"
+          fi
+          cat > "$RUNNER_TEMP/pr-body.md" <<EOF
           ## 上游更新候选
 
           - upstream：kukuqi666/TVBoxOS-Mobile
           - upstream SHA：$FORK_MAIN_SHA → $UPSTREAM_SHA
           - candidate：$candidate_branch
+          - candidate merge SHA：$(jq -r '.candidate_sha' "$result_file")
           - 风险分类：$candidate_classification
-          - candidate validation：已在独立 read-only job 完成；此 PR 不依赖 bot PR 的 approval-required workflow
+          - candidate validation：PASS（独立 read-only job；$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID）
+          - candidate build：$candidate_build_status
 
           ### 上游提交
 
@@ -319,28 +352,36 @@ jobs:
 
           下一步请把 PR 交给 ChatGPT/OC 复核，再决定是否 Merge 到 patched。U1 不自动合并 patched，也不执行签名或正式发布。
           EOF
+          git push origin "refs/remotes/upstream/main:refs/heads/main"
+          git push origin "HEAD:refs/heads/$candidate_branch"
           gh pr create \
             --repo "$GITHUB_REPOSITORY" \
             --base patched \
             --head "$candidate_branch" \
             --title "chore: upstream candidate ${UPSTREAM_SHA:0:7}" \
-            --body-file pr-body.md \
+            --body-file "$RUNNER_TEMP/pr-body.md" \
             --reviewer slashinchi
 
   notify:
     name: Notify and fail closed
-    needs: [date_gate, probe, candidate_validation, write_candidate]
+    needs: [fixture_tests, date_gate, probe, candidate_validation, write_candidate]
     if: >-
       always() &&
-      needs.date_gate.outputs.active == 'true' &&
       (
-        needs.probe.result != 'success' ||
-        (needs.probe.outputs.state != 'no-change' &&
-         needs.probe.outputs.state != 'already-open' &&
-         needs.probe.outputs.state != 'fast-forward') ||
-        needs.candidate_validation.result == 'failure' ||
-        needs.candidate_validation.outputs.validation == 'fail' ||
-        needs.write_candidate.result == 'failure'
+        needs.fixture_tests.result != 'success' ||
+        needs.date_gate.result != 'success' ||
+        (
+          needs.date_gate.outputs.active == 'true' &&
+          (
+            needs.probe.result != 'success' ||
+            (needs.probe.outputs.state != 'no-change' &&
+             needs.probe.outputs.state != 'already-open' &&
+             needs.probe.outputs.state != 'fast-forward') ||
+            needs.candidate_validation.result == 'failure' ||
+            needs.candidate_validation.outputs.validation == 'fail' ||
+            needs.write_candidate.result == 'failure'
+          )
+        )
       )
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -352,15 +393,27 @@ jobs:
       - name: Create or update a deduplicated issue
         env:
           GH_TOKEN: ${{ github.token }}
+          FIXTURE_RESULT: ${{ needs.fixture_tests.result }}
+          DATE_GATE_RESULT: ${{ needs.date_gate.result }}
           PROBE_STATE: ${{ needs.probe.outputs.state }}
           VALIDATION: ${{ needs.candidate_validation.outputs.validation }}
           VALIDATION_RESULT: ${{ needs.candidate_validation.result }}
           WRITE_RESULT: ${{ needs.write_candidate.result }}
+          FORK_MAIN_SHA: ${{ needs.probe.outputs.fork_main_sha }}
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
+          PATCHED_SHA: ${{ needs.probe.outputs.patched_sha }}
+          CLASSIFICATION: ${{ needs.candidate_validation.outputs.classification }}
+          CANDIDATE_SHA: ${{ needs.candidate_validation.outputs.candidate_sha }}
+          CHANGED_PATHS_B64: ${{ needs.candidate_validation.outputs.changed_paths_b64 }}
+          PRESERVED_PATHS_B64: ${{ needs.candidate_validation.outputs.preserved_paths_b64 }}
         run: |
           set -euo pipefail
           reason=probe-error
-          if [[ "$WRITE_RESULT" == "failure" ]]; then
+          if [[ "$FIXTURE_RESULT" != "success" ]]; then
+            reason=fixture-tests-failure
+          elif [[ "$DATE_GATE_RESULT" != "success" ]]; then
+            reason=date-gate-failure
+          elif [[ "$WRITE_RESULT" == "failure" ]]; then
             reason=write-failure
           elif [[ "$VALIDATION_RESULT" == "failure" || "$VALIDATION" == "fail" ]]; then
             reason=candidate-validation-failure
@@ -368,11 +421,32 @@ jobs:
             reason="$PROBE_STATE"
           fi
           title="[upstream-monitor] $reason"
+          changed_paths="not available"
+          if [[ -n "$CHANGED_PATHS_B64" ]]; then
+            changed_paths=$(printf '%s' "$CHANGED_PATHS_B64" | base64 --decode | tr '\0' ',')
+          fi
+          preserved_paths="none"
+          if [[ -n "$PRESERVED_PATHS_B64" ]]; then
+            preserved_paths=$(printf '%s' "$PRESERVED_PATHS_B64" | base64 --decode | tr '\0' ',')
+          fi
+          if [[ "$CLASSIFICATION" == "docs-only" ]]; then
+            candidate_build_status="skipped: docs-only"
+          elif [[ "$VALIDATION" == "pass" ]]; then
+            candidate_build_status="PASS: assembleDebug"
+          else
+            candidate_build_status="not run / failed closed"
+          fi
           body=$(cat <<EOF
           @slashinchi U1 upstream monitor 已 fail closed。
 
           - reason：$reason
-          - upstream SHA：${UPSTREAM_SHA:-unknown}
+          - upstream SHA：${FORK_MAIN_SHA:-unknown} → ${UPSTREAM_SHA:-unknown}
+          - patched SHA：${PATCHED_SHA:-unknown}
+          - candidate SHA：${CANDIDATE_SHA:-none}
+          - risk classification：${CLASSIFICATION:-unknown/high-risk}
+          - candidate build/validation：$candidate_build_status / ${VALIDATION:-unknown}
+          - changed files：$changed_paths
+          - fork-owned preserved：$preserved_paths
           - workflow run：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
           - probe state：${PROBE_STATE:-unknown}
 
@@ -384,7 +458,7 @@ jobs:
             --state open \
             --limit 100 \
             --json number,title | \
-            jq -r --arg title "$title" '.[] | select(.title == $title) | .number' | head -1)
+            jq -r --arg title "$title" 'map(select(.title == $title)) | .[0].number // empty')
           if [[ -n "$existing" ]]; then
             gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
             gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --add-assignee slashinchi || true

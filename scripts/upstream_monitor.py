@@ -25,6 +25,7 @@ class CandidateResult:
     conflicts: List[str]
     preserved: List[str]
     changed_paths: List[str]
+    candidate_needed: bool
 
 
 def _run_git(repo, *args, check=True):
@@ -74,7 +75,9 @@ def classify_paths(paths):
             "gradlew.bat",
         }:
             return "build/release-sensitive"
-        if path == "README.md" or path.startswith("docs/"):
+        if path == "README.md":
+            return "docs-only"
+        if path.startswith("docs/") and path.endswith((".md", ".markdown", ".txt", ".adoc", ".rst")):
             return "docs-only"
         if path.endswith((".md", ".markdown")) and "/" not in path:
             return "docs-only"
@@ -114,6 +117,15 @@ def merge_candidate(repo, upstream_ref, base_ref):
         raise ValueError("candidate workspace must be clean")
 
     base_sha = _git(repo, "rev-parse", base_ref)
+    if _run_git(repo, "merge-base", "--is-ancestor", upstream_ref, base_sha, check=False).returncode == 0:
+        return CandidateResult("clean", base_sha, [], [], [], False)
+
+    upstream_changed_paths = _git(
+        repo, "diff", "--name-only", f"{base_sha}...{upstream_ref}"
+    ).splitlines()
+    owned_upstream_changes = sorted(
+        path for path in FORK_OWNED_PATHS if path in upstream_changed_paths
+    )
     _git(repo, "config", "user.name", "tvbox-upstream-monitor")
     _git(repo, "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
     _git(repo, "-c", "core.hooksPath=/dev/null", "checkout", "--detach", base_sha)
@@ -129,22 +141,33 @@ def merge_candidate(repo, upstream_ref, base_ref):
     )
     if merge.returncode == 0:
         conflicts = []
-        preserved = []
+        preserved = owned_upstream_changes
     else:
         conflicts = _git(repo, "diff", "--name-only", "--diff-filter=U").splitlines()
-        preserved = sorted(path for path in conflicts if path in FORK_OWNED_PATHS)
+        preserved = sorted(
+            set(owned_upstream_changes) | {path for path in conflicts if path in FORK_OWNED_PATHS}
+        )
         unsafe = sorted(path for path in conflicts if path not in FORK_OWNED_PATHS)
         if unsafe:
             _run_git(repo, "-c", "core.hooksPath=/dev/null", "merge", "--abort")
-            return CandidateResult("conflict", None, unsafe, preserved, [])
-        for path in preserved:
-            _git(repo, "-c", "core.hooksPath=/dev/null", "checkout", "--ours", "--", path)
-            _git(repo, "-c", "core.hooksPath=/dev/null", "add", "--", path)
+            return CandidateResult("conflict", None, unsafe, preserved, [], True)
+
+    for path in preserved:
+        if _run_git(repo, "cat-file", "-e", f"{base_sha}:{path}", check=False).returncode == 0:
+            _git(repo, "-c", "core.hooksPath=/dev/null", "checkout", base_sha, "--", path)
+        else:
+            _run_git(repo, "-c", "core.hooksPath=/dev/null", "rm", "-f", "--", path, check=False)
+        _git(repo, "-c", "core.hooksPath=/dev/null", "add", "-A", "--", path)
+
+    if merge.returncode == 0:
+        if _run_git(repo, "diff", "--cached", "--quiet", check=False).returncode != 0:
+            _git(repo, "-c", "core.hooksPath=/dev/null", "commit", "--amend", "--no-edit")
+    else:
         _git(repo, "-c", "core.hooksPath=/dev/null", "commit", "--no-edit")
 
     candidate_sha = _git(repo, "rev-parse", "HEAD")
     changed_paths = _git(repo, "diff", "--name-only", f"{base_sha}...HEAD").splitlines()
-    return CandidateResult("clean", candidate_sha, [], preserved, changed_paths)
+    return CandidateResult("clean", candidate_sha, [], preserved, changed_paths, True)
 
 
 def _result_json(result):
@@ -154,6 +177,7 @@ def _result_json(result):
         "conflicts": result.conflicts,
         "preserved": result.preserved,
         "changed_paths": result.changed_paths,
+        "candidate_needed": result.candidate_needed,
         "classification": classify_paths(result.changed_paths or result.conflicts),
     }
 
@@ -182,6 +206,8 @@ class U1FixtureTests(unittest.TestCase):
 
     def test_classification_keeps_docs_only_narrow(self):
         self.assertEqual(classify_paths(["README.md", "docs/MIGRATION.md"]), "docs-only")
+        self.assertEqual(classify_paths(["docs/release.sh"]), "unknown/high-risk")
+        self.assertEqual(classify_paths(["docs/config.json"]), "unknown/high-risk")
         self.assertEqual(classify_paths(["app/src/main/AndroidManifest.xml"]), "runtime/high-risk")
         self.assertEqual(classify_paths([".github/workflows/other.yml"]), "build/release-sensitive")
         self.assertEqual(classify_paths(["website/index.html"]), "unknown/high-risk")
@@ -201,6 +227,10 @@ class U1FixtureTests(unittest.TestCase):
         self.assertIn("force_check", workflow)
         self.assertIn("actions/checkout@v5", workflow)
         self.assertNotIn("actions/checkout@v4", workflow)
+        self.assertIn("$RUNNER_TEMP/candidate-result.json", workflow)
+        self.assertIn("fetch-depth: 0", workflow)
+        self.assertIn("needs: [fixture_tests, date_gate, probe, candidate_validation, write_candidate]", workflow)
+        self.assertIn("needs.fixture_tests.result", workflow)
         self.assertIn("contents: read", workflow)
         self.assertIn("contents: write", workflow)
         self.assertIn("GITHUB_TOKEN: ''", workflow)
@@ -223,6 +253,26 @@ class U1FixtureTests(unittest.TestCase):
             self.assertEqual(result.preserved, [])
             self.assertIn("docs.md", result.changed_paths)
 
+    def test_fork_owned_changes_are_preserved_without_merge_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._new_repo(Path(tmp))
+            _git(repo, "checkout", "-b", "patched")
+            (repo / "README.md").write_text("fork README\nbase footer\n")
+            (repo / "update.json").write_text('{"endpoint":"fork","version":1}\n')
+            self._commit(repo, "fork identity")
+            _git(repo, "checkout", "-b", "upstream", "main")
+            (repo / "README.md").write_text("base README\nupstream footer\n")
+            (repo / "update.json").write_text('{"endpoint":"base","version":2}\n')
+            (repo / "docs.md").write_text("upstream docs\n")
+            self._commit(repo, "upstream docs and identity")
+            result = merge_candidate(repo, "upstream", "patched")
+            self.assertTrue(result.candidate_needed)
+            self.assertEqual(result.status, "clean")
+            self.assertEqual(result.preserved, ["README.md", "update.json"])
+            self.assertIn("docs.md", result.changed_paths)
+            self.assertEqual((repo / "README.md").read_text(), "fork README\nbase footer\n")
+            self.assertEqual((repo / "update.json").read_text(), '{"endpoint":"fork","version":1}\n')
+
     def test_candidate_merge_with_head_base_reports_upstream_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = self._new_repo(Path(tmp))
@@ -236,6 +286,21 @@ class U1FixtureTests(unittest.TestCase):
             result = merge_candidate(repo, "upstream", "HEAD")
             self.assertEqual(result.status, "clean")
             self.assertIn("docs.md", result.changed_paths)
+
+    def test_already_integrated_upstream_does_not_need_a_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._new_repo(Path(tmp))
+            _git(repo, "checkout", "-b", "patched")
+            (repo / "fork.txt").write_text("fork\n")
+            self._commit(repo, "fork patch")
+            _git(repo, "checkout", "-b", "upstream", "main")
+            (repo / "docs.md").write_text("upstream docs\n")
+            self._commit(repo, "upstream docs")
+            _git(repo, "checkout", "patched")
+            _git(repo, "merge", "--no-ff", "--no-edit", "upstream")
+            result = merge_candidate(repo, "upstream", "HEAD")
+            self.assertFalse(result.candidate_needed)
+            self.assertEqual(result.changed_paths, [])
 
     def test_fork_owned_files_are_preserved_but_other_conflict_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
