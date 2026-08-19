@@ -199,6 +199,8 @@ class U1FixtureTests(unittest.TestCase):
         self.assertIn("cron: '22 12 * * *'", workflow)
         self.assertIn("cron: '22 22 * * *'", workflow)
         self.assertIn("force_check", workflow)
+        self.assertIn("actions/checkout@v5", workflow)
+        self.assertNotIn("actions/checkout@v4", workflow)
         self.assertIn("contents: read", workflow)
         self.assertIn("contents: write", workflow)
         self.assertIn("GITHUB_TOKEN: ''", workflow)
