@@ -1,0 +1,378 @@
+import subprocess
+import tempfile
+import unittest
+from datetime import date
+import re
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts.upstream_monitor import (
+    _git,
+    candidate_branch_name,
+    candidate_policy,
+    classify_paths,
+    create_issue_with_reconcile,
+    issue_marker,
+    is_check_day,
+    marker_status,
+    merge_candidate,
+    normalize_issues,
+    normalize_pull_requests,
+    notification_reason,
+    recoverable_issue_numbers,
+    run_gh,
+    sync_state,
+    tree_matches,
+)
+
+
+ROOT = Path(__file__).parents[2]
+WORKFLOW = ROOT / ".github/workflows/upstream-monitor.yml"
+
+
+class U1aContractTests(unittest.TestCase):
+    def test_calendar_gate_and_sync_states_remain_fail_closed(self):
+        self.assertTrue(is_check_day(date(2026, 8, 20)))
+        self.assertFalse(is_check_day(date(2026, 8, 21)))
+        self.assertTrue(is_check_day(date(2027, 1, 1)))
+        self.assertEqual(sync_state("same", "same", True, True), "no-change")
+        self.assertEqual(sync_state("old", "new", True, True), "fast-forward")
+        self.assertEqual(sync_state("old", "new", False, True), "main-divergence")
+        self.assertEqual(sync_state("same", "same", True, False), "patched-behind-main")
+
+    def test_risk_classification_stays_narrow(self):
+        self.assertEqual(classify_paths(["README.md", "docs/MIGRATION.md"]), "docs-only")
+        self.assertEqual(classify_paths(["AGENTS.md"]), "unknown/high-risk")
+        self.assertEqual(classify_paths(["docs/release.sh"]), "unknown/high-risk")
+        self.assertEqual(classify_paths(["app/src/main/AndroidManifest.xml"]), "runtime/high-risk")
+        self.assertEqual(classify_paths([".github/workflows/other.yml"]), "build/release-sensitive")
+
+    def test_candidate_identity_uses_full_upstream_sha(self):
+        upstream_sha = "a" * 40
+        self.assertEqual(
+            candidate_branch_name(upstream_sha),
+            f"automation/upstream-{upstream_sha}",
+        )
+        self.assertEqual(candidate_policy([], upstream_sha), "create")
+        self.assertEqual(
+            candidate_policy(
+                [{
+                    "headRefName": f"automation/upstream-{upstream_sha}",
+                    "state": "OPEN",
+                    "headRefOid": "candidate",
+                    "headRepository": {"nameWithOwner": "fork/repo"},
+                    "baseRefName": "patched",
+                }],
+                upstream_sha,
+                repository="fork/repo",
+                candidate_oid="candidate",
+            ),
+            "already-open",
+        )
+
+    def test_candidate_result_exposes_validated_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._new_repo(Path(tmp))
+            _git(repo, "checkout", "-b", "patched")
+            (repo / "fork.txt").write_text("fork\n")
+            self._commit(repo, "fork patch")
+            _git(repo, "checkout", "-b", "upstream", "main")
+            (repo / "docs.md").write_text("upstream docs\n")
+            self._commit(repo, "upstream docs")
+
+            result = merge_candidate(repo, "upstream", "patched")
+
+            self.assertEqual(result.status, "clean")
+            self.assertEqual(result.validated_tree, _git(repo, "rev-parse", "HEAD^{tree}"))
+
+    def test_fork_owned_paths_are_preserved_while_upstream_code_is_retained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._new_repo(Path(tmp))
+            _git(repo, "checkout", "-b", "patched")
+            (repo / "README.md").write_text("fork README\nbase footer\n")
+            (repo / "update.json").write_text('{"endpoint":"fork"}\n')
+            self._commit(repo, "fork identity")
+            _git(repo, "checkout", "-b", "upstream", "main")
+            (repo / "README.md").write_text("base README\nupstream footer\n")
+            (repo / "update.json").write_text('{"endpoint":"base"}\n')
+            (repo / "docs.md").write_text("upstream docs\n")
+            self._commit(repo, "upstream docs")
+
+            result = merge_candidate(repo, "upstream", "patched")
+
+            self.assertTrue(result.candidate_needed)
+            self.assertEqual(result.preserved, ["README.md", "update.json"])
+            self.assertIn("docs.md", result.changed_paths)
+            self.assertEqual((repo / "README.md").read_text(), "fork README\nbase footer\n")
+            self.assertEqual((repo / "update.json").read_text(), '{"endpoint":"fork"}\n')
+
+    def test_only_fork_owned_changes_do_not_need_a_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._new_repo(Path(tmp))
+            _git(repo, "checkout", "-b", "patched")
+            (repo / "README.md").write_text("fork README\nbase footer\n")
+            self._commit(repo, "fork README")
+            _git(repo, "checkout", "-b", "upstream", "main")
+            (repo / "README.md").write_text("base README\nupstream footer\n")
+            self._commit(repo, "upstream README")
+
+            result = merge_candidate(repo, "upstream", "patched")
+
+            self.assertFalse(result.candidate_needed)
+            self.assertEqual(result.changed_paths, [])
+            self.assertEqual(result.preserved, ["README.md"])
+
+    def test_unsafe_conflict_fails_closed_but_owned_conflict_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._new_repo(Path(tmp))
+            _git(repo, "checkout", "-b", "patched")
+            (repo / "README.md").write_text("fork README\n")
+            (repo / "runtime.txt").write_text("fork runtime\n")
+            self._commit(repo, "fork changes")
+            _git(repo, "checkout", "-b", "upstream", "main")
+            (repo / "README.md").write_text("upstream README\n")
+            (repo / "runtime.txt").write_text("upstream runtime\n")
+            self._commit(repo, "upstream changes")
+
+            result = merge_candidate(repo, "upstream", "patched")
+
+            self.assertEqual(result.status, "conflict")
+            self.assertEqual(result.conflicts, ["runtime.txt"])
+            self.assertEqual(result.preserved, ["README.md"])
+            self.assertEqual(_git(repo, "status", "--porcelain"), "")
+
+    def test_already_integrated_upstream_has_no_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._new_repo(Path(tmp))
+            _git(repo, "checkout", "-b", "patched")
+            (repo / "fork.txt").write_text("fork\n")
+            self._commit(repo, "fork patch")
+            _git(repo, "checkout", "-b", "upstream", "main")
+            (repo / "docs.md").write_text("upstream docs\n")
+            self._commit(repo, "upstream docs")
+            _git(repo, "checkout", "patched")
+            _git(repo, "merge", "--no-ff", "--no-edit", "upstream")
+
+            result = merge_candidate(repo, "upstream", "HEAD")
+
+            self.assertFalse(result.candidate_needed)
+            self.assertEqual(result.changed_paths, [])
+
+    def test_paginated_pull_request_normalization_preserves_identity_fields(self):
+        pages = [[{
+            "number": 7,
+            "html_url": "https://example.invalid/pr/7",
+            "state": "open",
+            "head": {"ref": "automation/upstream-x", "sha": "candidate", "repo": {"full_name": "fork/repo"}},
+            "base": {"ref": "patched"},
+        }], []]
+
+        normalized = normalize_pull_requests(pages)
+
+        self.assertEqual(normalized[0]["state"], "OPEN")
+        self.assertEqual(normalized[0]["headRepository"]["nameWithOwner"], "fork/repo")
+        self.assertEqual(normalized[0]["baseRefName"], "patched")
+
+    def test_paginated_issue_normalization_excludes_pull_requests(self):
+        pages = [[
+            {"number": 1, "title": "issue", "body": "body", "state": "open", "html_url": "issue-url"},
+            {"number": 2, "title": "pr", "body": "", "state": "open", "pull_request": {}, "html_url": "pr-url"},
+        ], [{"number": 3, "title": "closed", "body": None, "state": "closed"}]]
+
+        normalized = normalize_issues(pages)
+
+        self.assertEqual([issue["number"] for issue in normalized], [1, 3])
+        self.assertEqual(normalized[1]["body"], "")
+
+    def test_issue_create_reconciles_full_marker_after_ambiguous_create(self):
+        marker = issue_marker("no-actionable-delta", "d" * 40)
+        with patch("scripts.upstream_monitor.run_gh", side_effect=RuntimeError("timeout")):
+            with patch(
+                "scripts.upstream_monitor.list_issues",
+                return_value=[{"number": 12, "title": "old", "body": marker}],
+            ):
+                self.assertEqual(
+                    create_issue_with_reconcile("fork/repo", "new title", marker + "\nbody"),
+                    "12",
+                )
+
+    def test_workflow_makes_date_gate_the_first_lightweight_job(self):
+        workflow = WORKFLOW.read_text()
+        date_start = workflow.index("  date_gate:")
+        fixture_start = workflow.index("  fixture_tests:")
+        date_block = workflow[date_start:workflow.index("  probe:", date_start)]
+        fixture_block = workflow[fixture_start:workflow.index("  probe:", fixture_start)]
+        probe_block = workflow[workflow.index("  probe:"):workflow.index("  candidate_validation:")]
+
+        self.assertLess(date_start, fixture_start)
+        self.assertNotIn("needs: fixture_tests", date_block)
+        self.assertIn("needs: date_gate", fixture_block)
+        self.assertIn("fetch-depth: 1", date_block)
+        self.assertIn("sparse-checkout:", date_block)
+        self.assertIn("anchor:", date_block)
+        self.assertIn("forced:", date_block)
+        self.assertIn("timezone:", date_block)
+        self.assertIn("needs: [date_gate, fixture_tests]", probe_block)
+
+    def test_recover_retains_minimal_write_capability_for_main_push(self):
+        workflow = WORKFLOW.read_text()
+        recover = workflow[workflow.index("  recover:"):]
+        notify = workflow[workflow.index("  notify:"):workflow.index("  recover:")]
+        self.assertIn("contents: write", recover)
+        self.assertIn("persist-credentials: true", recover)
+        self.assertIn("contents: read", notify)
+        self.assertIn("persist-credentials: false", notify)
+
+    def test_workflow_binds_validated_tree_before_pr_creation(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn("validated_tree", workflow)
+        self.assertIn("VALIDATED_TREE", workflow)
+        self.assertIn("validated-tree-mismatch", workflow)
+        self.assertIn("candidate tree", workflow)
+        self.assertIn("candidate-tree:", workflow)
+
+    def test_candidate_jobs_continue_using_a_trusted_helper_copy(self):
+        workflow = WORKFLOW.read_text()
+        for job in (
+            "  probe:",
+            "  candidate_validation:",
+            "  write_candidate:",
+            "  repair_candidate_pr:",
+            "  notify:",
+            "  recover:",
+        ):
+            start = workflow.index(job)
+            match = re.search(r"\n  [A-Za-z0-9_-]+:", workflow[start + len(job):])
+            next_job = -1 if match is None else start + len(job) + match.start()
+            block = workflow[start:] if next_job == -1 else workflow[start:next_job]
+            self.assertIn('cp scripts/upstream_monitor.py "$trusted_helper"', block, job)
+            self.assertIn('python3 "$trusted_helper"', block, job)
+
+    def test_tree_mismatch_and_no_actionable_reason_are_executable_contracts(self):
+        self.assertTrue(tree_matches("tree", "tree"))
+        self.assertFalse(tree_matches("tree-a", "tree-b"))
+        self.assertEqual(
+            notification_reason(
+                fixture_result="success",
+                date_gate_result="success",
+                probe_state="no-actionable-delta",
+                validation="pass",
+                validation_result="success",
+                write_result="success",
+                repair_result="skipped",
+            ),
+            "no-actionable-delta",
+        )
+        self.assertEqual(
+            notification_reason(
+                fixture_result="skipped",
+                date_gate_result="failure",
+                probe_state="",
+                validation="",
+                validation_result="skipped",
+                write_result="skipped",
+                repair_result="skipped",
+            ),
+            "date-gate-failure",
+        )
+
+    def test_workflow_consolidates_github_api_plumbing_in_helper(self):
+        workflow = WORKFLOW.read_text()
+        self.assertNotIn("list_open_prs()", workflow)
+        self.assertNotIn("list_all_prs()", workflow)
+        self.assertNotIn("list_open_issues()", workflow)
+        self.assertNotIn("list_issue_comments()", workflow)
+        self.assertNotIn("issue_has_marker()", workflow)
+        self.assertNotIn("create_issue_with_reconcile()", workflow)
+        self.assertIn('"$trusted_helper" list-prs', workflow)
+        self.assertIn('"$trusted_helper" list-issues', workflow)
+        self.assertIn('"$trusted_helper" create-pr', workflow)
+        self.assertIn('"$trusted_helper" issue-comment', workflow)
+        self.assertIn('"$trusted_helper" issue-close', workflow)
+        self.assertIn('"$trusted_helper" find-issue', workflow)
+
+    def test_no_actionable_updates_have_information_notification_path(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn("information-only", workflow)
+        self.assertIn("upstream 已更新", workflow)
+        self.assertIn("main 已同步", workflow)
+        self.assertIn("无需 Merge/发版", workflow)
+        self.assertIn("no-actionable-delta", workflow)
+
+    def test_issue_markers_use_full_upstream_identity(self):
+        upstream_sha = "b" * 40
+        marker = issue_marker("no-actionable-delta", upstream_sha)
+        self.assertEqual(marker, f"<!-- tvbox-upstream-monitor:no-actionable-delta:{upstream_sha} -->")
+        self.assertEqual(marker_status("body " + marker, [], marker), 0)
+        self.assertEqual(marker_status("body", [{"body": marker}], marker), 0)
+        self.assertEqual(marker_status("body", [], marker), 1)
+
+    def test_issue_write_reconcile_checks_after_each_ambiguous_attempt(self):
+        from scripts.upstream_monitor import comment_issue_idempotent
+
+        with patch("scripts.upstream_monitor.remote_issue_marker_status", side_effect=[1, 0]) as marker:
+            with patch("scripts.upstream_monitor.run_gh", side_effect=RuntimeError("timeout")) as run:
+                comment_issue_idempotent("fork/repo", 7, "body", "marker")
+
+        self.assertEqual(marker.call_count, 2)
+        self.assertEqual(run.call_count, 1)
+
+    def test_recovery_matches_full_sha_marker_not_short_title(self):
+        upstream_sha = "c" * 40
+        marker = issue_marker("candidate-conflict", upstream_sha)
+        issues = [
+            {
+                "number": 41,
+                "title": "[upstream-monitor] candidate-conflict cccccccccccc",
+                "body": marker,
+            },
+            {
+                "number": 42,
+                "title": "[upstream-monitor] candidate-conflict ccccccc",
+                "body": "<!-- tvbox-upstream-monitor:candidate-conflict:ccccccc -->",
+            },
+        ]
+        self.assertEqual(recoverable_issue_numbers(issues, upstream_sha), [41])
+
+        global_marker = issue_marker("probe-error", "global")
+        self.assertEqual(
+            recoverable_issue_numbers(
+                [{
+                    "number": 43,
+                    "title": "[upstream-monitor] probe-error global",
+                    "body": global_marker,
+                }],
+                upstream_sha,
+            ),
+            [43],
+        )
+
+    def test_gh_runner_uses_argument_list_without_shell_interpolation(self):
+        completed = subprocess.CompletedProcess(["gh"], 0, stdout="[]", stderr="")
+        with patch("scripts.upstream_monitor.subprocess.run", return_value=completed) as run:
+            self.assertEqual(run_gh(["api", "repos/fork/repo/issues"]), "[]")
+
+        command = run.call_args.args[0]
+        self.assertEqual(command, ["gh", "api", "repos/fork/repo/issues"])
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    @staticmethod
+    def _new_repo(parent):
+        repo = parent / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-b", "main")
+        _git(repo, "config", "user.email", "fixture@example.invalid")
+        _git(repo, "config", "user.name", "U1 Fixture")
+        (repo / "README.md").write_text("base README\n")
+        (repo / "update.json").write_text('{"base":true}\n')
+        U1aContractTests._commit(repo, "base")
+        return repo
+
+    @staticmethod
+    def _commit(repo, message):
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-m", message)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

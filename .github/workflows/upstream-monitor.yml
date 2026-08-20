@@ -25,8 +25,57 @@ env:
   TZ: Asia/Shanghai
 
 jobs:
+  date_gate:
+    name: Check schedule gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      active: ${{ steps.gate.outputs.active }}
+      local_date: ${{ steps.gate.outputs.local_date }}
+      anchor: ${{ steps.gate.outputs.anchor }}
+      forced: ${{ steps.gate.outputs.forced }}
+      timezone: ${{ steps.gate.outputs.timezone }}
+    steps:
+      - name: Check out trusted monitor code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          sparse-checkout: scripts/upstream_monitor.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - id: gate
+        name: Apply strict every-two-days gate
+        env:
+          FORCE_CHECK: ${{ inputs.force_check || false }}
+        run: |
+          set -euo pipefail
+          local_date=$(TZ=Asia/Shanghai date +%F)
+          args=(date-gate --date "$local_date")
+          if [[ "$FORCE_CHECK" == "true" ]]; then
+            args+=(--force-check)
+          fi
+           result=$(python3 scripts/upstream_monitor.py "${args[@]}")
+           active=$(jq -r '.active' <<<"$result")
+           anchor=$(jq -r '.anchor' <<<"$result")
+           forced=$(jq -r '.forced' <<<"$result")
+           timezone=$(jq -r '.timezone' <<<"$result")
+           echo "local_date=$local_date" >> "$GITHUB_OUTPUT"
+           echo "active=$active" >> "$GITHUB_OUTPUT"
+           echo "anchor=$anchor" >> "$GITHUB_OUTPUT"
+           echo "forced=$forced" >> "$GITHUB_OUTPUT"
+           echo "timezone=$timezone" >> "$GITHUB_OUTPUT"
+          if [[ "$active" != "true" ]]; then
+            echo "Off-day: no upstream repository check will run."
+          fi
+
   fixture_tests:
     name: U1 fixture tests
+    needs: date_gate
+    if: needs.date_gate.outputs.active == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -41,46 +90,10 @@ jobs:
       - name: Run deterministic fixtures
         run: python3 scripts/upstream_monitor.py fixture-test
 
-  date_gate:
-    name: Check schedule gate
-    needs: fixture_tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    outputs:
-      active: ${{ steps.gate.outputs.active }}
-      local_date: ${{ steps.gate.outputs.local_date }}
-    steps:
-      - name: Check out trusted monitor code
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - id: gate
-        name: Apply strict every-two-days gate
-        env:
-          FORCE_CHECK: ${{ inputs.force_check || false }}
-        run: |
-          set -euo pipefail
-          local_date=$(TZ=Asia/Shanghai date +%F)
-          args=(date-gate --date "$local_date")
-          if [[ "$FORCE_CHECK" == "true" ]]; then
-            args+=(--force-check)
-          fi
-          result=$(python3 scripts/upstream_monitor.py "${args[@]}")
-          active=$(jq -r '.active' <<<"$result")
-          echo "local_date=$local_date" >> "$GITHUB_OUTPUT"
-          echo "active=$active" >> "$GITHUB_OUTPUT"
-          if [[ "$active" != "true" ]]; then
-            echo "Off-day: no upstream repository check will run."
-          fi
-
   probe:
     name: Probe upstream and repository state
-    needs: date_gate
-    if: needs.date_gate.outputs.active == 'true'
+    needs: [date_gate, fixture_tests]
+    if: needs.date_gate.outputs.active == 'true' && needs.fixture_tests.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -109,7 +122,9 @@ jobs:
           UPSTREAM_REPO: kukuqi666/TVBoxOS-Mobile
         run: |
           set -euo pipefail
-          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+           trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
+           cp scripts/upstream_monitor.py "$trusted_helper"
+           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
 
@@ -140,7 +155,7 @@ jobs:
           if [[ "$main_is_ancestor" == "true" && ( "$fork_main_sha" != "$upstream_sha" || "$patched_contains_main" != "true" ) ]]; then
             preview_file="$RUNNER_TEMP/candidate-preview.json"
             set +e
-            python3 scripts/upstream_monitor.py prepare-candidate \
+             python3 "$trusted_helper" prepare-candidate \
               --repo . \
               --upstream-ref "$upstream_sha" \
               --base-ref "$patched_sha" > "$preview_file" 2> "$RUNNER_TEMP/candidate-preview.log"
@@ -156,53 +171,24 @@ jobs:
             fi
           fi
 
-          list_all_prs() {
-            local pages normalized attempt
-            for attempt in 1 2 3; do
-              if pages=$(timeout 30s gh api \
-                --paginate \
-                --slurp \
-                "repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100"); then
-                if normalized=$(jq -c '[.[][] | {
-                  number,
-                  url: .html_url,
-                  state: (if .merged_at != null then "MERGED" elif .state == "open" then "OPEN" else "CLOSED" end),
-                  headRefName: .head.ref,
-                  headRefOid: .head.sha,
-                  headRepository: {nameWithOwner: (.head.repo.full_name // "")},
-                  baseRefName: .base.ref
-                }]' <<<"$pages"); then
-                  printf '%s' "$normalized"
-                  return 0
-                fi
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
-          }
-
-          policy=none
-          candidate_branch_exists=false
-          candidate_branch_oid=
-          if [[ "$preview_candidate_needed" == "true" ]]; then
-            exact_branch="automation/upstream-${upstream_sha:0:7}"
-            candidate_branch_oid=$(git ls-remote origin "refs/heads/$exact_branch" | awk 'NR == 1 {print $1}')
-            if [[ -n "$candidate_branch_oid" ]]; then
-              candidate_branch_exists=true
-            fi
-            open_prs=$(list_all_prs)
-            policy=$(jq -r \
-              --arg exact "$exact_branch" \
-              --arg oid "$candidate_branch_oid" \
-              --arg repository "$GITHUB_REPOSITORY" \
-              'def ours: (.headRepository.nameWithOwner // "") == $repository;
-               if any(.[]; ours and .headRefName == $exact and .baseRefName == "patched" and .state == "OPEN" and $oid != "" and .headRefOid == $oid) then "already-open"
-               elif any(.[]; ours and .headRefName == $exact and .state == "OPEN") then "stale-open"
-               elif any(.[]; ours and .headRefName == $exact and .state != "OPEN") then "closed-or-merged"
-               elif any(.[]; ours and .state == "OPEN" and (.headRefName | startswith("automation/upstream-"))) then "stale-open"
-               else "create" end' \
-              <<<"$open_prs")
-          fi
+           policy=none
+           candidate_branch_exists=false
+           candidate_branch_oid=
+           if [[ "$preview_candidate_needed" == "true" ]]; then
+             exact_branch=$(python3 "$trusted_helper" candidate-branch --upstream-sha "$upstream_sha")
+             candidate_branch_oid=$(git ls-remote origin "refs/heads/$exact_branch" | awk 'NR == 1 {print $1}')
+             if [[ -n "$candidate_branch_oid" ]]; then
+               candidate_branch_exists=true
+             fi
+             open_prs=$(python3 "$trusted_helper" list-prs \
+               --repo "$GITHUB_REPOSITORY" \
+               --state all)
+             policy=$(python3 "$trusted_helper" candidate-policy \
+               --upstream-sha "$upstream_sha" \
+               --repository "$GITHUB_REPOSITORY" \
+               --candidate-oid "$candidate_branch_oid" \
+               --base-ref patched <<<"$open_prs")
+           fi
 
           if [[ "$main_is_ancestor" != "true" ]]; then
             state=main-divergence
@@ -244,6 +230,7 @@ jobs:
       classification: ${{ steps.prepare.outputs.classification }}
       candidate_needed: ${{ steps.prepare.outputs.candidate_needed }}
       candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
+      validated_tree: ${{ steps.prepare.outputs.validated_tree }}
       changed_paths_b64: ${{ steps.prepare.outputs.changed_paths_b64 }}
       preserved_paths_b64: ${{ steps.prepare.outputs.preserved_paths_b64 }}
       candidate_diff_stat_b64: ${{ steps.prepare.outputs.candidate_diff_stat_b64 }}
@@ -262,7 +249,9 @@ jobs:
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
         run: |
           set +e
-          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+           trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
+           cp scripts/upstream_monitor.py "$trusted_helper"
+           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
           if [[ "$(git rev-parse refs/remotes/upstream/main)" != "$UPSTREAM_SHA" ]]; then
             echo "Candidate upstream SHA changed during validation."
@@ -270,13 +259,14 @@ jobs:
             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
             echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
+            echo 'validated_tree=' >> "$GITHUB_OUTPUT"
             echo 'candidate_diff_stat_b64=' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           base_sha=$(git rev-parse HEAD)
           result_file="$RUNNER_TEMP/candidate-result.json"
           error_file="$RUNNER_TEMP/candidate-error.log"
-          python3 scripts/upstream_monitor.py prepare-candidate \
+           python3 "$trusted_helper" prepare-candidate \
             --repo . \
             --upstream-ref "$UPSTREAM_SHA" \
             --base-ref HEAD > "$result_file" 2> "$error_file"
@@ -288,19 +278,22 @@ jobs:
             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
             echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
+            echo 'validated_tree=' >> "$GITHUB_OUTPUT"
             echo 'candidate_diff_stat_b64=' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           classification=$(jq -r '.classification' "$result_file")
           status=$(jq -r '.status' "$result_file")
-          candidate_needed=$(jq -r '.candidate_needed' "$result_file")
-          candidate_sha=$(jq -r '.candidate_sha // empty' "$result_file")
+           candidate_needed=$(jq -r '.candidate_needed' "$result_file")
+           candidate_sha=$(jq -r '.candidate_sha // empty' "$result_file")
+           validated_tree=$(jq -r '.validated_tree // empty' "$result_file")
           changed_paths_b64=$(jq -jr '.changed_paths | join("\u0000")' "$result_file" | base64 -w 0)
           preserved_paths_b64=$(jq -jr '.preserved | join("\u0000")' "$result_file" | base64 -w 0)
           candidate_diff_stat_b64=$(git diff --stat "$base_sha...HEAD" | base64 -w 0)
           echo "classification=$classification" >> "$GITHUB_OUTPUT"
-          echo "candidate_needed=$candidate_needed" >> "$GITHUB_OUTPUT"
-          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+           echo "candidate_needed=$candidate_needed" >> "$GITHUB_OUTPUT"
+           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+           echo "validated_tree=$validated_tree" >> "$GITHUB_OUTPUT"
           echo "changed_paths_b64=$changed_paths_b64" >> "$GITHUB_OUTPUT"
           echo "preserved_paths_b64=$preserved_paths_b64" >> "$GITHUB_OUTPUT"
           echo "candidate_diff_stat_b64=$candidate_diff_stat_b64" >> "$GITHUB_OUTPUT"
@@ -351,6 +344,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      failure_reason: ${{ steps.write.outputs.failure_reason }}
     steps:
       - name: Check out patched without executing candidate code
         uses: actions/checkout@v5
@@ -358,7 +353,8 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Fast-forward main and create candidate branch
+      - id: write
+        name: Fast-forward main and create candidate branch
         env:
           UPSTREAM_REPO: kukuqi666/TVBoxOS-Mobile
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
@@ -367,10 +363,13 @@ jobs:
           PROBE_STATE: ${{ needs.probe.outputs.state }}
           EXPECTED_CLASSIFICATION: ${{ needs.candidate_validation.outputs.classification }}
           EXPECTED_CANDIDATE_NEEDED: ${{ needs.candidate_validation.outputs.candidate_needed }}
+          VALIDATED_TREE: ${{ needs.candidate_validation.outputs.validated_tree }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+           trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
+           cp scripts/upstream_monitor.py "$trusted_helper"
+           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git fetch --no-tags origin +refs/heads/patched:refs/remotes/origin/patched
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
@@ -385,7 +384,7 @@ jobs:
 
           git switch --detach "$PATCHED_SHA"
           result_file="$RUNNER_TEMP/candidate-result.json"
-          python3 scripts/upstream_monitor.py prepare-candidate \
+           python3 "$trusted_helper" prepare-candidate \
             --repo . \
             --upstream-ref "$UPSTREAM_SHA" \
             --base-ref HEAD > "$result_file"
@@ -402,10 +401,16 @@ jobs:
             exit 0
           fi
 
-          candidate_branch="automation/upstream-${UPSTREAM_SHA:0:7}"
-          git branch "$candidate_branch" HEAD
-          git switch "$candidate_branch"
-          expected_candidate_oid=$(git rev-parse HEAD)
+            candidate_branch=$(python3 "$trusted_helper" candidate-branch --upstream-sha "$UPSTREAM_SHA")
+           git branch "$candidate_branch" HEAD
+           git switch "$candidate_branch"
+           expected_candidate_oid=$(git rev-parse HEAD)
+           actual_candidate_tree=$(git rev-parse HEAD^{tree})
+            if ! python3 "$trusted_helper" tree-check --actual "$actual_candidate_tree" --expected "$VALIDATED_TREE"; then
+             echo 'failure_reason=validated-tree-mismatch' >> "$GITHUB_OUTPUT"
+             echo "Validated tree mismatch before candidate push: $actual_candidate_tree != $VALIDATED_TREE"
+             exit 1
+           fi
 
           changed_paths=$(jq -r '.changed_paths[]?' "$result_file")
           candidate_diff_stat=$(git diff --stat "$PATCHED_SHA...HEAD")
@@ -422,7 +427,9 @@ jobs:
           - upstream：kukuqi666/TVBoxOS-Mobile
           - upstream SHA：$FORK_MAIN_SHA → $UPSTREAM_SHA
           - candidate：$candidate_branch
-          - candidate merge SHA：$(jq -r '.candidate_sha' "$result_file")
+           - candidate merge SHA：$(jq -r '.candidate_sha' "$result_file")
+           - candidate tree：${VALIDATED_TREE:0:12}
+           <!-- tvbox-upstream-candidate-tree:$VALIDATED_TREE -->
           - 风险分类：$candidate_classification
           - candidate validation：PASS（独立 read-only job；$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID）
           - candidate build：$candidate_build_status
@@ -445,168 +452,28 @@ jobs:
 
           下一步请把 PR 交给 ChatGPT/OC 复核，再决定是否 Merge 到 patched。U1 不自动合并 patched，也不执行签名或正式发布。
           EOF
-          git push origin "refs/remotes/upstream/main:refs/heads/main"
-          git push origin "HEAD:refs/heads/$candidate_branch"
+           git push origin "refs/remotes/upstream/main:refs/heads/main"
+           git push origin "HEAD:refs/heads/$candidate_branch"
           git fetch --no-tags origin \
             "+refs/heads/$candidate_branch:refs/remotes/origin/$candidate_branch"
           actual_candidate_oid=$(git rev-parse "refs/remotes/origin/$candidate_branch")
           test "$actual_candidate_oid" = "$expected_candidate_oid"
           git merge-base --is-ancestor "$PATCHED_SHA" "$actual_candidate_oid"
-          expected_candidate_tree=$(git rev-parse "$expected_candidate_oid^{tree}")
-          actual_candidate_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
-          test "$actual_candidate_tree" = "$expected_candidate_tree"
-
-          list_open_prs() {
-            local pages prs attempt
-            for attempt in 1 2 3; do
-              if pages=$(timeout 30s gh api \
-                --paginate \
-                --slurp \
-                "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100"); then
-                if prs=$(jq -c '[.[][] | {
-                  number,
-                  url: .html_url,
-                  state: "OPEN",
-                  headRefName: .head.ref,
-                  headRefOid: .head.sha,
-                  headRepository: {nameWithOwner: (.head.repo.full_name // "")},
-                  baseRefName: .base.ref
-                }]' <<<"$pages"); then
-                  printf '%s' "$prs"
-                  return 0
-                fi
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
-          }
-
-          find_open_candidate_pr() {
-            local prs
-            if ! prs=$(list_open_prs); then
-              return 1
-            fi
-            jq -r \
-              --arg repository "$GITHUB_REPOSITORY" \
-              --arg branch "$candidate_branch" \
-              --arg oid "$1" \
-              'map(select(.state == "OPEN" and (.headRepository.nameWithOwner // "") == $repository and .headRefName == $branch and .baseRefName == "patched" and .headRefOid == $oid)) | .[0].url // empty' \
-              <<<"$prs"
-          }
-
-          close_pr_with_retry() {
-            local number="$1"
-            local attempt
-            for attempt in 1 2 3; do
-              if timeout 30s gh pr close "$number" \
-                --repo "$GITHUB_REPOSITORY" \
-                --comment "U1 closed this PR because its head was not the validated candidate."; then
-                return 0
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
-          }
-
-          close_unvalidated_candidate_prs() {
-            local prs unvalidated_numbers number
-            if ! prs=$(list_open_prs); then
-              return 1
-            fi
-            if ! unvalidated_numbers=$(jq -r \
-              --arg repository "$GITHUB_REPOSITORY" \
-              --arg branch "$candidate_branch" \
-              --arg oid "$1" \
-              '.[] | select(.state == "OPEN" and (.headRepository.nameWithOwner // "") == $repository and .headRefName == $branch and (.headRefOid != $oid or .baseRefName != "patched")) | .number' \
-              <<<"$prs"); then
-              return 1
-            fi
-            while IFS= read -r number; do
-              [[ -z "$number" ]] && continue
-              close_pr_with_retry "$number"
-            done <<<"$unvalidated_numbers"
-          }
-
-          pr_create_error="$RUNNER_TEMP/pr-create.error"
-          pr_create_output="$RUNNER_TEMP/pr-create.output"
-          set +e
-          pr_create_status=1
-          for attempt in 1 2 3; do
-            timeout 60s gh pr create \
-              --repo "$GITHUB_REPOSITORY" \
-              --base patched \
-              --head "$candidate_branch" \
-              --title "chore: upstream candidate ${UPSTREAM_SHA:0:7}" \
-              --body-file "$RUNNER_TEMP/pr-body.md" \
-              --reviewer slashinchi >"$pr_create_output" 2>"$pr_create_error"
-            pr_create_status=$?
-            [[ "$pr_create_status" -eq 0 ]] && break
-            sleep $((attempt * 2))
-          done
-          set -e
-          pr_url=$(awk 'NF {last=$0} END {print last}' "$pr_create_output")
-          if [[ "$pr_create_status" -ne 0 || -z "$pr_url" ]]; then
-            recovered_pr_url=""
-            if recovered_pr_url=$(find_open_candidate_pr "$expected_candidate_oid"); then
-              :
-            else
-              recovered_pr_url=""
-            fi
-            if [[ -n "$recovered_pr_url" ]]; then
-              pr_url="$recovered_pr_url"
-            else
-              close_unvalidated_candidate_prs "$expected_candidate_oid"
-              cat "$pr_create_error"
-              exit 1
-            fi
-          fi
-
-          pr_view_error="$RUNNER_TEMP/pr-view.error"
-          set +e
-          pr_view_status=1
-          for attempt in 1 2 3; do
-            pr_view_json=$(timeout 30s gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json state,headRefName,headRefOid,headRepository,baseRefName 2>"$pr_view_error")
-            pr_view_status=$?
-            [[ "$pr_view_status" -eq 0 ]] && break
-            sleep $((attempt * 2))
-          done
-          set -e
-          if [[ "$pr_view_status" -ne 0 ]]; then
-            recovered_pr_url=""
-            if recovered_pr_url=$(find_open_candidate_pr "$expected_candidate_oid"); then
-              :
-            else
-              recovered_pr_url=""
-            fi
-            if [[ -n "$recovered_pr_url" ]]; then
-              pr_url="$recovered_pr_url"
-              pr_view_json=$(jq -n \
-                --arg branch "$candidate_branch" \
-                --arg oid "$expected_candidate_oid" \
-                --arg repository "$GITHUB_REPOSITORY" \
-                '{state: "OPEN", headRefName: $branch, headRefOid: $oid, headRepository: {nameWithOwner: $repository}, baseRefName: "patched"}')
-            else
-              close_unvalidated_candidate_prs "$expected_candidate_oid"
-              cat "$pr_view_error"
-              exit 1
-            fi
-          fi
-          if ! jq -e 'type == "object"' <<<"$pr_view_json" >/dev/null; then
-            close_unvalidated_candidate_prs "$expected_candidate_oid"
-            echo "The PR view response was not a JSON object."
-            exit 1
-          fi
-          pr_state=$(jq -r '.state // empty' <<<"$pr_view_json")
-          pr_head_name=$(jq -r '.headRefName // empty' <<<"$pr_view_json")
-          pr_head_oid=$(jq -r '.headRefOid // empty' <<<"$pr_view_json")
-          pr_head_repository=$(jq -r '.headRepository.nameWithOwner // empty' <<<"$pr_view_json")
-          pr_base_name=$(jq -r '.baseRefName // empty' <<<"$pr_view_json")
-          if [[ "$pr_state" != "OPEN" || "$pr_head_name" != "$candidate_branch" || "$pr_head_oid" != "$expected_candidate_oid" || "$pr_head_repository" != "$GITHUB_REPOSITORY" || "$pr_base_name" != "patched" ]]; then
-            close_unvalidated_candidate_prs "$expected_candidate_oid"
-            echo "Candidate branch changed while opening the PR."
-            exit 1
-          fi
-          close_unvalidated_candidate_prs "$expected_candidate_oid"
+           expected_candidate_tree="$VALIDATED_TREE"
+           actual_candidate_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
+            if ! python3 "$trusted_helper" tree-check --actual "$actual_candidate_tree" --expected "$expected_candidate_tree"; then
+             echo 'failure_reason=validated-tree-mismatch' >> "$GITHUB_OUTPUT"
+             echo "Validated tree mismatch after candidate push: $actual_candidate_tree != $expected_candidate_tree"
+             exit 1
+           fi
+            python3 "$trusted_helper" create-pr \
+             --repo "$GITHUB_REPOSITORY" \
+             --base patched \
+             --head "$candidate_branch" \
+             --title "chore: upstream candidate ${UPSTREAM_SHA:0:12}" \
+             --body-file "$RUNNER_TEMP/pr-body.md" \
+             --expected-oid "$expected_candidate_oid" \
+             --reviewer slashinchi
 
   repair_candidate_pr:
     name: Recover existing candidate branch PR
@@ -617,6 +484,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      failure_reason: ${{ steps.recover.outputs.failure_reason }}
     steps:
       - name: Check out trusted monitor code without executing candidate code
         uses: actions/checkout@v5
@@ -624,7 +493,8 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Reuse existing candidate branch without force update
+      - id: recover
+        name: Reuse existing candidate branch without force update
         env:
           UPSTREAM_REPO: kukuqi666/TVBoxOS-Mobile
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
@@ -634,7 +504,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          candidate_branch="automation/upstream-${UPSTREAM_SHA:0:7}"
+          trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
+          cp scripts/upstream_monitor.py "$trusted_helper"
+          candidate_branch=$(python3 "$trusted_helper" candidate-branch --upstream-sha "$UPSTREAM_SHA")
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git fetch --no-tags origin +refs/heads/patched:refs/remotes/origin/patched
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
@@ -652,23 +524,32 @@ jobs:
 
           git switch --detach "$PATCHED_SHA"
           expected_file="$RUNNER_TEMP/expected-candidate.json"
-          python3 scripts/upstream_monitor.py prepare-candidate \
-            --repo . \
-            --upstream-ref "$UPSTREAM_SHA" \
-            --base-ref HEAD > "$expected_file"
-          test "$(jq -r '.status' "$expected_file")" = clean
-          candidate_classification=$(jq -r '.classification' "$expected_file")
-          expected_tree=$(git rev-parse HEAD^{tree})
-          actual_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
-          test "$actual_tree" = "$expected_tree"
+           python3 "$trusted_helper" prepare-candidate \
+             --repo . \
+             --upstream-ref "$UPSTREAM_SHA" \
+             --base-ref HEAD > "$expected_file"
+           test "$(jq -r '.status' "$expected_file")" = clean
+           candidate_classification=$(jq -r '.classification' "$expected_file")
+           expected_tree=$(jq -r '.validated_tree // empty' "$expected_file")
+           test -n "$expected_tree"
+           actual_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
+           if ! python3 "$trusted_helper" tree-check --actual "$actual_tree" --expected "$expected_tree"; then
+             echo 'failure_reason=validated-tree-mismatch' >> "$GITHUB_OUTPUT"
+             echo "Validated tree mismatch during recovery: $actual_tree != $expected_tree"
+             exit 1
+           fi
           git push origin "refs/remotes/upstream/main:refs/heads/main"
           git fetch --no-tags origin \
             "+refs/heads/$candidate_branch:refs/remotes/origin/$candidate_branch"
-          actual_candidate_oid=$(git rev-parse "refs/remotes/origin/$candidate_branch")
-          test "$actual_candidate_oid" = "$CANDIDATE_BRANCH_OID"
-          git merge-base --is-ancestor "$PATCHED_SHA" "$actual_candidate_oid"
-          actual_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
-          test "$actual_tree" = "$expected_tree"
+           actual_candidate_oid=$(git rev-parse "refs/remotes/origin/$candidate_branch")
+           test "$actual_candidate_oid" = "$CANDIDATE_BRANCH_OID"
+           git merge-base --is-ancestor "$PATCHED_SHA" "$actual_candidate_oid"
+           actual_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
+           if ! python3 "$trusted_helper" tree-check --actual "$actual_tree" --expected "$expected_tree"; then
+             echo 'failure_reason=validated-tree-mismatch' >> "$GITHUB_OUTPUT"
+             echo "Validated tree changed during recovery: $actual_tree != $expected_tree"
+             exit 1
+           fi
 
           changed_paths=$(git diff --name-only "$PATCHED_SHA...refs/remotes/origin/$candidate_branch")
           candidate_diff_stat=$(git diff --stat "$PATCHED_SHA...refs/remotes/origin/$candidate_branch")
@@ -684,7 +565,9 @@ jobs:
           - upstream：kukuqi666/TVBoxOS-Mobile
           - upstream SHA：$FORK_MAIN_SHA → $UPSTREAM_SHA
           - existing candidate：$candidate_branch
-          - candidate merge SHA：$CANDIDATE_BRANCH_OID
+           - candidate merge SHA：$CANDIDATE_BRANCH_OID
+           - candidate tree：${expected_tree:0:12}
+           <!-- tvbox-upstream-candidate-tree:$expected_tree -->
           - 风险分类：$candidate_classification
           - recovery：复用已推送分支；不 force-update，不执行 candidate code
           - candidate validation：此前 run 已完成；本次重新校验 branch OID/tree；只恢复 PR 入口
@@ -704,168 +587,26 @@ jobs:
 
           请把 PR 交给 ChatGPT/OC 复核，再决定是否 Merge 到 patched。
           EOF
-          list_open_prs() {
-            local pages prs attempt
-            for attempt in 1 2 3; do
-              if pages=$(timeout 30s gh api \
-                --paginate \
-                --slurp \
-                "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100"); then
-                if prs=$(jq -c '[.[][] | {
-                  number,
-                  url: .html_url,
-                  state: "OPEN",
-                  headRefName: .head.ref,
-                  headRefOid: .head.sha,
-                  headRepository: {nameWithOwner: (.head.repo.full_name // "")},
-                  baseRefName: .base.ref
-                }]' <<<"$pages"); then
-                  printf '%s' "$prs"
-                  return 0
-                fi
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
-          }
-
-          find_open_candidate_pr() {
-            local prs
-            if ! prs=$(list_open_prs); then
-              return 1
-            fi
-            jq -r \
-              --arg repository "$GITHUB_REPOSITORY" \
-              --arg branch "$candidate_branch" \
-              --arg oid "$1" \
-              'map(select(.state == "OPEN" and (.headRepository.nameWithOwner // "") == $repository and .headRefName == $branch and .baseRefName == "patched" and .headRefOid == $oid)) | .[0].url // empty' \
-              <<<"$prs"
-          }
-
-          close_pr_with_retry() {
-            local number="$1"
-            local attempt
-            for attempt in 1 2 3; do
-              if timeout 30s gh pr close "$number" \
-                --repo "$GITHUB_REPOSITORY" \
-                --comment "U1 closed this PR because its head was not the validated candidate."; then
-                return 0
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
-          }
-
-          close_unvalidated_candidate_prs() {
-            local prs unvalidated_numbers number
-            if ! prs=$(list_open_prs); then
-              return 1
-            fi
-            if ! unvalidated_numbers=$(jq -r \
-              --arg repository "$GITHUB_REPOSITORY" \
-              --arg branch "$candidate_branch" \
-              --arg oid "$1" \
-              '.[] | select(.state == "OPEN" and (.headRepository.nameWithOwner // "") == $repository and .headRefName == $branch and (.headRefOid != $oid or .baseRefName != "patched")) | .number' \
-              <<<"$prs"); then
-              return 1
-            fi
-            while IFS= read -r number; do
-              [[ -z "$number" ]] && continue
-              close_pr_with_retry "$number"
-            done <<<"$unvalidated_numbers"
-          }
-
-          pr_create_error="$RUNNER_TEMP/recovery-pr-create.error"
-          pr_create_output="$RUNNER_TEMP/recovery-pr-create.output"
-          set +e
-          pr_create_status=1
-          for attempt in 1 2 3; do
-            timeout 60s gh pr create \
-              --repo "$GITHUB_REPOSITORY" \
-              --base patched \
-              --head "$candidate_branch" \
-              --title "chore: recover upstream candidate ${UPSTREAM_SHA:0:7}" \
-              --body-file "$RUNNER_TEMP/recovery-pr-body.md" \
-              --reviewer slashinchi >"$pr_create_output" 2>"$pr_create_error"
-            pr_create_status=$?
-            [[ "$pr_create_status" -eq 0 ]] && break
-            sleep $((attempt * 2))
-          done
-          set -e
-          pr_url=$(awk 'NF {last=$0} END {print last}' "$pr_create_output")
-          if [[ "$pr_create_status" -ne 0 || -z "$pr_url" ]]; then
-            recovered_pr_url=""
-            if recovered_pr_url=$(find_open_candidate_pr "$CANDIDATE_BRANCH_OID"); then
-              :
-            else
-              recovered_pr_url=""
-            fi
-            if [[ -n "$recovered_pr_url" ]]; then
-              pr_url="$recovered_pr_url"
-            else
-              close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID"
-              cat "$pr_create_error"
-              exit 1
-            fi
-          fi
-          pr_view_error="$RUNNER_TEMP/recovery-pr-view.error"
-          set +e
-          pr_view_status=1
-          for attempt in 1 2 3; do
-            pr_view_json=$(timeout 30s gh pr view "$pr_url" --repo "$GITHUB_REPOSITORY" --json state,headRefName,headRefOid,headRepository,baseRefName 2>"$pr_view_error")
-            pr_view_status=$?
-            [[ "$pr_view_status" -eq 0 ]] && break
-            sleep $((attempt * 2))
-          done
-          set -e
-          if [[ "$pr_view_status" -ne 0 ]]; then
-            recovered_pr_url=""
-            if recovered_pr_url=$(find_open_candidate_pr "$CANDIDATE_BRANCH_OID"); then
-              :
-            else
-              recovered_pr_url=""
-            fi
-            if [[ -n "$recovered_pr_url" ]]; then
-              pr_url="$recovered_pr_url"
-              pr_view_json=$(jq -n \
-                --arg branch "$candidate_branch" \
-                --arg oid "$CANDIDATE_BRANCH_OID" \
-                --arg repository "$GITHUB_REPOSITORY" \
-                '{state: "OPEN", headRefName: $branch, headRefOid: $oid, headRepository: {nameWithOwner: $repository}, baseRefName: "patched"}')
-            else
-              close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID"
-              cat "$pr_view_error"
-              exit 1
-            fi
-          fi
-          if ! jq -e 'type == "object"' <<<"$pr_view_json" >/dev/null; then
-            close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID"
-            echo "The recovery PR view response was not a JSON object."
-            exit 1
-          fi
-          pr_state=$(jq -r '.state // empty' <<<"$pr_view_json")
-          pr_head_name=$(jq -r '.headRefName // empty' <<<"$pr_view_json")
-          pr_head_oid=$(jq -r '.headRefOid // empty' <<<"$pr_view_json")
-          pr_head_repository=$(jq -r '.headRepository.nameWithOwner // empty' <<<"$pr_view_json")
-          pr_base_name=$(jq -r '.baseRefName // empty' <<<"$pr_view_json")
-          if [[ "$pr_state" != "OPEN" || "$pr_head_name" != "$candidate_branch" || "$pr_head_oid" != "$CANDIDATE_BRANCH_OID" || "$pr_head_repository" != "$GITHUB_REPOSITORY" || "$pr_base_name" != "patched" ]]; then
-            close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID"
-            echo "Candidate branch changed while recovering the PR."
-            exit 1
-          fi
-          close_unvalidated_candidate_prs "$CANDIDATE_BRANCH_OID"
+            python3 "$trusted_helper" create-pr \
+             --repo "$GITHUB_REPOSITORY" \
+             --base patched \
+             --head "$candidate_branch" \
+             --title "chore: recover upstream candidate ${UPSTREAM_SHA:0:12}" \
+             --body-file "$RUNNER_TEMP/recovery-pr-body.md" \
+             --expected-oid "$CANDIDATE_BRANCH_OID" \
+             --reviewer slashinchi
 
   notify:
     name: Notify and fail closed
-    needs: [fixture_tests, date_gate, probe, candidate_validation, write_candidate, repair_candidate_pr]
+    needs: [date_gate, fixture_tests, probe, candidate_validation, write_candidate, repair_candidate_pr]
     if: >-
       always() &&
       (
-        needs.fixture_tests.result != 'success' ||
         needs.date_gate.result != 'success' ||
         (
           needs.date_gate.outputs.active == 'true' &&
           (
+            needs.fixture_tests.result != 'success' ||
             needs.probe.result != 'success' ||
             (needs.probe.outputs.state != 'no-change' &&
              needs.probe.outputs.state != 'already-open' &&
@@ -879,7 +620,8 @@ jobs:
              needs.write_candidate.result == 'failure' ||
              needs.write_candidate.result == 'cancelled' ||
              needs.repair_candidate_pr.result == 'failure' ||
-             needs.repair_candidate_pr.result == 'cancelled'
+             needs.repair_candidate_pr.result == 'cancelled' ||
+             (needs.probe.outputs.state == 'no-actionable-delta' && needs.write_candidate.result == 'success')
           )
         )
       )
@@ -890,6 +632,12 @@ jobs:
       issues: write
       pull-requests: read
     steps:
+      - name: Check out trusted monitor code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
       - name: Create or update a deduplicated issue
         env:
           GH_TOKEN: ${{ github.token }}
@@ -899,12 +647,15 @@ jobs:
           VALIDATION: ${{ needs.candidate_validation.outputs.validation }}
           VALIDATION_RESULT: ${{ needs.candidate_validation.result }}
           WRITE_RESULT: ${{ needs.write_candidate.result }}
+          WRITE_FAILURE_REASON: ${{ needs.write_candidate.outputs.failure_reason }}
           REPAIR_RESULT: ${{ needs.repair_candidate_pr.result }}
+          REPAIR_FAILURE_REASON: ${{ needs.repair_candidate_pr.outputs.failure_reason }}
           FORK_MAIN_SHA: ${{ needs.probe.outputs.fork_main_sha }}
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
           PATCHED_SHA: ${{ needs.probe.outputs.patched_sha }}
           CLASSIFICATION: ${{ needs.candidate_validation.outputs.classification }}
           CANDIDATE_SHA: ${{ needs.candidate_validation.outputs.candidate_sha }}
+          VALIDATED_TREE: ${{ needs.candidate_validation.outputs.validated_tree }}
           CHANGED_PATHS_B64: ${{ needs.candidate_validation.outputs.changed_paths_b64 }}
           PRESERVED_PATHS_B64: ${{ needs.candidate_validation.outputs.preserved_paths_b64 }}
           CANDIDATE_DIFF_STAT_B64: ${{ needs.candidate_validation.outputs.candidate_diff_stat_b64 }}
@@ -912,23 +663,22 @@ jobs:
           SOURCE_DIFF_STAT_B64: ${{ needs.probe.outputs.source_diff_stat_b64 }}
         run: |
           set -euo pipefail
-          reason=probe-error
-          if [[ "$FIXTURE_RESULT" != "success" ]]; then
-            reason=fixture-tests-failure
-          elif [[ "$DATE_GATE_RESULT" != "success" ]]; then
-            reason=date-gate-failure
-          elif [[ "$REPAIR_RESULT" == "failure" || "$REPAIR_RESULT" == "cancelled" ]]; then
-            reason=repair-failure
-          elif [[ "$WRITE_RESULT" == "failure" || "$WRITE_RESULT" == "cancelled" ]]; then
-            reason=write-failure
-          elif [[ "$VALIDATION_RESULT" == "failure" || "$VALIDATION_RESULT" == "cancelled" || "$VALIDATION" == "fail" ]]; then
-            reason=candidate-validation-failure
-          elif [[ -n "$PROBE_STATE" ]]; then
-            reason="$PROBE_STATE"
-          fi
-          issue_key="${UPSTREAM_SHA:0:7}"
-          [[ -n "$issue_key" ]] || issue_key=global
-          title="[upstream-monitor] $reason $issue_key"
+           trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
+           cp scripts/upstream_monitor.py "$trusted_helper"
+           reason=$(python3 "$trusted_helper" notification-reason \
+             --fixture-result "$FIXTURE_RESULT" \
+             --date-gate-result "$DATE_GATE_RESULT" \
+             --probe-state "$PROBE_STATE" \
+             --validation "$VALIDATION" \
+             --validation-result "$VALIDATION_RESULT" \
+             --write-result "$WRITE_RESULT" \
+             --write-failure-reason "$WRITE_FAILURE_REASON" \
+             --repair-result "$REPAIR_RESULT" \
+             --repair-failure-reason "$REPAIR_FAILURE_REASON")
+           issue_key="${UPSTREAM_SHA:-global}"
+           [[ -n "$issue_key" ]] || issue_key=global
+           display_key="${issue_key:0:12}"
+           title="[upstream-monitor] $reason $display_key"
           changed_paths="not available"
           if [[ -n "$CHANGED_PATHS_B64" ]]; then
             changed_paths=$(printf '%s' "$CHANGED_PATHS_B64" | base64 --decode | tr '\0' ',')
@@ -956,154 +706,76 @@ jobs:
           else
             candidate_build_status="not run / failed closed"
           fi
-          comment_marker="<!-- tvbox-upstream-monitor:$reason:$issue_key -->"
-          body=$(cat <<EOF
-          $comment_marker
-          @slashinchi U1 upstream monitor 已 fail closed。
+           comment_marker="<!-- tvbox-upstream-monitor:$reason:$issue_key -->"
+           if [[ "$reason" == "no-actionable-delta" ]]; then
+             body=$(cat <<EOF
+           $comment_marker
+           @slashinchi upstream 已更新，main 已同步；这是 information-only 通知，fork candidate 为空，无需 Merge/发版。
 
-          - reason：$reason
-          - upstream SHA：${FORK_MAIN_SHA:-unknown} → ${UPSTREAM_SHA:-unknown}
-          - patched SHA：${PATCHED_SHA:-unknown}
-          - candidate SHA：${CANDIDATE_SHA:-none}
-          - risk classification：${CLASSIFICATION:-unknown/high-risk}
-          - candidate build/validation：$candidate_build_status / ${VALIDATION:-unknown}
-          - changed files：$changed_paths
-          - source diff stat：$source_diff_stat
-          - candidate diff stat：$candidate_diff_stat
-          - fork-owned preserved：$preserved_paths
-          - workflow run：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
-          - probe state：${PROBE_STATE:-unknown}
-
-          ### Upstream commit summary
-
-          $commit_summary
-
-          请把本 Issue 交给 ChatGPT/OC 复核；automation 不会自动合并 patched。
+           - upstream full SHA：${UPSTREAM_SHA:-unknown}
+           - source diff stat：$source_diff_stat
+           - fork-owned preserved：$preserved_paths
+           - candidate：none（仅 fork-owned 文件变化）
+           - signed RC / Release：not run
+           - workflow run：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
           EOF
-          )
-          list_open_issues() {
-            local issues attempt
-            for attempt in 1 2 3; do
-              if issues=$(timeout 30s gh issue list \
-                --repo "$GITHUB_REPOSITORY" \
-                --state open \
-                --limit 1000 \
-                --json number,title); then
-                printf '%s' "$issues"
-                return 0
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
-          }
+             )
+           else
+             body=$(cat <<EOF
+           $comment_marker
+           @slashinchi U1 upstream monitor 已 fail closed。
 
-          list_issue_comments() {
-            local number="$1"
-            local comments attempt
-            for attempt in 1 2 3; do
-              if comments=$(timeout 30s gh api \
-                --paginate \
-                --slurp \
-                "repos/$GITHUB_REPOSITORY/issues/$number/comments?per_page=100"); then
-                printf '%s' "$comments"
-                return 0
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
-          }
+           - reason：$reason
+           - upstream full SHA：${UPSTREAM_SHA:-unknown}
+           - fork main SHA：${FORK_MAIN_SHA:-unknown}
+           - patched SHA：${PATCHED_SHA:-unknown}
+           - candidate SHA：${CANDIDATE_SHA:-none}
+           - validated tree：${VALIDATED_TREE:-none}
+           - risk classification：${CLASSIFICATION:-unknown/high-risk}
+           - candidate build/validation：$candidate_build_status / ${VALIDATION:-unknown}
+           - changed files：$changed_paths
+           - source diff stat：$source_diff_stat
+           - candidate diff stat：$candidate_diff_stat
+           - fork-owned preserved：$preserved_paths
+           - workflow run：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+           - probe state：${PROBE_STATE:-unknown}
 
-          issue_has_marker() {
-            local number="$1"
-            local marker="$2"
-            local issue_data issue_body comments attempt marker_status
-            issue_data=""
-            for attempt in 1 2 3; do
-              if issue_data=$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/issues/$number"); then
-                break
-              fi
-              sleep $((attempt * 2))
-            done
-            if [[ -z "$issue_data" ]]; then
-              return 2
-            fi
-            if ! issue_body=$(jq -r '.body // ""' <<<"$issue_data"); then
-              return 2
-            fi
-            if [[ "$issue_body" == *"$marker"* ]]; then
-              return 0
-            fi
-            if ! comments=$(list_issue_comments "$number"); then
-              return 2
-            fi
-            if jq -e --arg marker "$marker" 'any(.[][]; (.body // "") | contains($marker))' <<<"$comments" >/dev/null; then
-              return 0
-            else
-              marker_status=$?
-            fi
-            [[ "$marker_status" -eq 1 ]] && return 1
-            return 2
-          }
+           ### Upstream commit summary
 
-          comment_issue_idempotent() {
-            local number="$1"
-            local comment="$2"
-            local marker="$3"
-            local marker_status
-            if issue_has_marker "$number" "$marker"; then
-              return 0
-            else
-              marker_status=$?
-            fi
-            [[ "$marker_status" -eq 1 ]] || return "$marker_status"
-            if timeout 30s gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$comment"; then
-              return 0
-            fi
-            if issue_has_marker "$number" "$marker"; then
-              return 0
-            fi
-            marker_status=$?
-            [[ "$marker_status" -eq 1 ]] || return "$marker_status"
-            return 1
-          }
+           $commit_summary
 
-          edit_issue_with_retry() {
-            local number="$1"
-            local attempt
-            for attempt in 1 2 3; do
-              if timeout 30s gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --add-assignee slashinchi; then
-                return 0
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
-          }
-
-          create_issue_with_reconcile() {
-            local issue_title="$1"
-            local issue_body="$2"
-            if timeout 30s gh issue create \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$issue_title" \
-              --assignee slashinchi \
-              --body "$issue_body"; then
-              return 0
-            fi
-            local existing_after_failure
-            if ! existing_after_failure=$(list_open_issues | jq -r --arg title "$issue_title" 'map(select(.title == $title)) | .[0].number // empty'); then
-              return 1
-            fi
-            [[ -n "$existing_after_failure" ]]
-          }
-
-          existing=$(list_open_issues | jq -r --arg title "$title" 'map(select(.title == $title)) | .[0].number // empty')
-          if [[ -n "$existing" ]]; then
-            comment_issue_idempotent "$existing" "$body" "$comment_marker"
-            edit_issue_with_retry "$existing"
-          else
-            create_issue_with_reconcile "$title" "$body"
-          fi
-          exit 1
+           请把本 Issue 交给 ChatGPT/OC 复核；automation 不会自动合并 patched。
+          EOF
+             )
+           fi
+           issue_body_file="$RUNNER_TEMP/upstream-monitor-issue.md"
+           printf '%s' "$body" > "$issue_body_file"
+           existing_issue=$(python3 "$trusted_helper" find-issue \
+             --repo "$GITHUB_REPOSITORY" \
+             --marker "$comment_marker" \
+             --state all)
+           existing=$(jq -r '.number // empty' <<<"${existing_issue:-{}}")
+           if [[ -n "$existing" ]]; then
+             python3 "$trusted_helper" issue-comment \
+               --repo "$GITHUB_REPOSITORY" \
+               --number "$existing" \
+               --body-file "$issue_body_file" \
+               --marker "$comment_marker"
+             python3 "$trusted_helper" issue-edit \
+               --repo "$GITHUB_REPOSITORY" \
+               --number "$existing" \
+               --assignee slashinchi
+           else
+             python3 "$trusted_helper" issue-create \
+               --repo "$GITHUB_REPOSITORY" \
+               --title "$title" \
+               --body-file "$issue_body_file" \
+               --assignee slashinchi
+           fi
+           if [[ "$reason" == "no-actionable-delta" ]]; then
+             exit 0
+           fi
+           exit 1
 
   recover:
     name: Close recovered automation issues
@@ -1128,149 +800,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      contents: write
       issues: write
     steps:
+      - name: Check out trusted monitor code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: true
+
       - name: Close resolved U1 automation issues
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
         run: |
           set -euo pipefail
-          recovery_key="${UPSTREAM_SHA:0:7}"
-          [[ -n "$recovery_key" ]] || recovery_key=global
-          list_open_issues() {
-            local issues attempt
-            for attempt in 1 2 3; do
-              if issues=$(timeout 30s gh issue list \
-                --repo "$GITHUB_REPOSITORY" \
-                --state open \
-                --limit 1000 \
-                --json number,title); then
-                printf '%s' "$issues"
-                return 0
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
-          }
-
-          list_issue_comments() {
-            local number="$1"
-            local comments attempt
-            for attempt in 1 2 3; do
-              if comments=$(timeout 30s gh api \
-                --paginate \
-                --slurp \
-                "repos/$GITHUB_REPOSITORY/issues/$number/comments?per_page=100"); then
-                printf '%s' "$comments"
-                return 0
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
-          }
-
-          issue_has_marker() {
-            local number="$1"
-            local marker="$2"
-            local issue_data issue_body comments attempt marker_status
-            issue_data=""
-            for attempt in 1 2 3; do
-              if issue_data=$(timeout 30s gh api "repos/$GITHUB_REPOSITORY/issues/$number"); then
-                break
-              fi
-              sleep $((attempt * 2))
-            done
-            if [[ -z "$issue_data" ]]; then
-              return 2
-            fi
-            if ! issue_body=$(jq -r '.body // ""' <<<"$issue_data"); then
-              return 2
-            fi
-            if [[ "$issue_body" == *"$marker"* ]]; then
-              return 0
-            fi
-            if ! comments=$(list_issue_comments "$number"); then
-              return 2
-            fi
-            if jq -e --arg marker "$marker" 'any(.[][]; (.body // "") | contains($marker))' <<<"$comments" >/dev/null; then
-              return 0
-            else
-              marker_status=$?
-            fi
-            [[ "$marker_status" -eq 1 ]] && return 1
-            return 2
-          }
-
-          comment_issue_idempotent() {
-            local number="$1"
-            local comment="$2"
-            local marker="$3"
-            local marker_status
-            if issue_has_marker "$number" "$marker"; then
-              return 0
-            else
-              marker_status=$?
-            fi
-            [[ "$marker_status" -eq 1 ]] || return "$marker_status"
-            if timeout 30s gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$comment"; then
-              return 0
-            fi
-            if issue_has_marker "$number" "$marker"; then
-              return 0
-            fi
-            marker_status=$?
-            [[ "$marker_status" -eq 1 ]] || return "$marker_status"
-            return 1
-          }
-
-          close_issue_with_retry() {
-            local number="$1"
-            local attempt
-            for attempt in 1 2 3; do
-              if timeout 30s gh issue close "$number" --repo "$GITHUB_REPOSITORY"; then
-                return 0
-              fi
-              sleep $((attempt * 2))
-            done
-            return 1
-          }
-
-          open_issues=$(list_open_issues)
-          resolved_issue_numbers=$(jq -r --arg recovery_key "$recovery_key" '
-            .[]
-            | select(.title | startswith("[upstream-monitor] "))
-            | (try (.title | capture("^\\[upstream-monitor\\] (?<reason>[^ ]+) (?<sha>[^ ]+)$")) catch null) as $parts
-            | select($parts != null)
-            | select(
-                $parts.sha == $recovery_key
-                or ($parts.sha == "global" and ($parts.reason == "fixture-tests-failure" or $parts.reason == "date-gate-failure" or $parts.reason == "probe-error"))
-              )
-            | select([
-                "fixture-tests-failure",
-                "date-gate-failure",
-                "probe-error",
-                "candidate-preview-error",
-                "candidate-conflict",
-                "main-divergence",
-                "candidate-validation-failure",
-                "write-failure",
-                "repair-failure",
-                "candidate-branch-no-pr",
-                "candidate-branch-missing-after-main",
-                "candidate-closed-or-merged",
-                "stale-open",
-                "patched-behind-main",
-                "no-actionable-delta"
-              ] | index($parts.reason))
-            | .number
-          ' <<<"$open_issues")
-          while IFS= read -r number; do
-            [[ -z "$number" ]] && continue
-            recovery_marker="<!-- tvbox-upstream-recovery:$number -->"
-            comment_issue_idempotent "$number" \
-              "$recovery_marker
-              U1 已恢复；本次检查通过，自动关闭该去重 Issue。" \
-              "$recovery_marker"
-            close_issue_with_retry "$number"
-          done <<<"$resolved_issue_numbers"
+           trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
+           cp scripts/upstream_monitor.py "$trusted_helper"
+           recovery_key="${UPSTREAM_SHA:-global}"
+           [[ -n "$recovery_key" ]] || recovery_key=global
+           open_issues=$(python3 "$trusted_helper" list-issues --repo "$GITHUB_REPOSITORY" --state open)
+           resolved_issue_numbers=$(python3 "$trusted_helper" recoverable-issues \
+             --recovery-key "$recovery_key" <<<"$open_issues" | jq -r '.[]')
+           while IFS= read -r number; do
+             [[ -z "$number" ]] && continue
+             recovery_marker=$(python3 "$trusted_helper" recovery-marker --number "$number")
+             recovery_body_file="$RUNNER_TEMP/recovery-comment-$number.md"
+             printf '%s\nU1 已恢复；本次检查通过，自动关闭该去重 Issue。\n' \
+               "$recovery_marker" > "$recovery_body_file"
+             python3 "$trusted_helper" issue-comment \
+               --repo "$GITHUB_REPOSITORY" \
+               --number "$number" \
+               --body-file "$recovery_body_file" \
+               --marker "$recovery_marker"
+             python3 "$trusted_helper" issue-close \
+               --repo "$GITHUB_REPOSITORY" \
+               --number "$number"
+           done <<<"$resolved_issue_numbers"

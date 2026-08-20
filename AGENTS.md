@@ -14,4 +14,5 @@
 - README cleanup removes human-facing promotion and upstream-personal content only; it never authorizes deleting inherited runtime or resource files.
 - U1 automation treats upstream content as unreviewed: candidate validation is read-only and has no signing secrets; only the minimum write job may fast-forward `main`, create a candidate branch, and open a PR.
 - U1 never auto-merges `patched`, approves a PR, touches `build.yml`, or enters signing, Environment, tag, Release, or update-metadata paths.
-- U1 candidate branches use `automation/upstream-<short-sha>`; never force-update an existing automation PR, and fail closed on non-fast-forward `main`, unsafe conflicts, or permission errors.
+- U1 candidate branches use `automation/upstream-<full-40-char-sha>`; human-facing titles may shorten the SHA, but PR/Issue bodies and markers retain the full upstream identity. Never force-update an existing automation PR, and fail closed on non-fast-forward `main`, unsafe conflicts, or permission errors.
+- U1 candidate validation records the full validated Git tree; write/recovery paths must compare the actual candidate branch tree to it before opening a PR. GitHub API pagination/retry/reconcile plumbing stays in the trusted Python helper and uses argv-only subprocess calls.
