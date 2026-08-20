@@ -2,7 +2,7 @@
 """U1 upstream monitor helper and its deterministic fixture tests."""
 
 import argparse
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from dataclasses import dataclass
 import json
 import os
@@ -17,6 +17,11 @@ from zoneinfo import ZoneInfo
 
 
 ANCHOR_DATE = date(2026, 8, 20)
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+SCHEDULE_TIMES = {
+    "22 12 * * *": (12, 22),
+    "22 22 * * *": (22, 22),
+}
 FORK_OWNED_PATHS = {"README.md", "update.json"}
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 AUTOMATION_REASONS = {
@@ -493,8 +498,33 @@ def is_check_day(day, anchor=ANCHOR_DATE):
     return delta >= 0 and delta % 2 == 0
 
 
-def sync_state(main_sha, upstream_sha, main_is_ancestor, patched_contains_main):
+def scheduled_occurrence(schedule, now):
+    """Return the latest supported cron occurrence at or before runner time."""
+    try:
+        hour, minute = SCHEDULE_TIMES[schedule]
+    except KeyError as exc:
+        raise ValueError(f"unsupported schedule: {schedule!r}") from exc
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=SHANGHAI_TZ)
+    now = now.astimezone(SHANGHAI_TZ)
+    occurrence = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if occurrence > now:
+        occurrence -= timedelta(days=1)
+    return occurrence
+
+
+def sync_state(
+    main_sha,
+    upstream_sha,
+    main_is_ancestor,
+    patched_contains_main,
+    candidate_needed=False,
+):
     """Classify the safe action before any remote write is attempted."""
+    if main_sha == upstream_sha and not candidate_needed:
+        return "no-change"
+    if not patched_contains_main and main_is_ancestor and candidate_needed:
+        return "actionable-main-ahead"
     if not patched_contains_main:
         return "patched-behind-main"
     if main_sha == upstream_sha:
@@ -502,6 +532,54 @@ def sync_state(main_sha, upstream_sha, main_is_ancestor, patched_contains_main):
     if main_is_ancestor:
         return "fast-forward"
     return "main-divergence"
+
+
+def classify_probe_state(
+    main_sha,
+    upstream_sha,
+    main_is_ancestor,
+    patched_contains_main,
+    preview_status,
+    preview_candidate_needed,
+    candidate_branch_exists,
+    policy,
+):
+    """Classify the probe result without performing any remote write."""
+    if main_is_ancestor != "true":
+        return "main-divergence"
+    if preview_status == "conflict":
+        return "candidate-conflict"
+    if preview_status == "error":
+        return "candidate-preview-error"
+    if main_sha == upstream_sha and preview_candidate_needed == "false":
+        return "no-change"
+    if preview_candidate_needed == "false":
+        return "no-actionable-delta"
+    if policy == "closed-or-merged":
+        return "candidate-closed-or-merged"
+    if candidate_branch_exists == "true" and policy == "create":
+        return "candidate-branch-no-pr"
+    if (
+        main_sha == upstream_sha
+        and patched_contains_main != "true"
+        and candidate_branch_exists != "true"
+        and policy == "create"
+    ):
+        return "candidate-branch-missing-after-main"
+    if (
+        main_is_ancestor == "true"
+        and patched_contains_main != "true"
+        and preview_candidate_needed == "true"
+        and policy == "create"
+    ):
+        return "actionable-main-ahead"
+    if main_sha == upstream_sha and patched_contains_main != "true":
+        return "patched-behind-main" if policy == "create" else policy
+    if patched_contains_main != "true":
+        return "patched-behind-main"
+    if main_sha == upstream_sha:
+        return "no-change"
+    return "fast-forward" if policy == "create" else policy
 
 
 def classify_paths(paths):
@@ -689,7 +767,19 @@ def main(argv=None):
 
     date_parser = subparsers.add_parser("date-gate")
     date_parser.add_argument("--date")
+    date_parser.add_argument("--schedule")
+    date_parser.add_argument("--now")
     date_parser.add_argument("--force-check", action="store_true")
+
+    probe_state_parser = subparsers.add_parser("probe-state")
+    probe_state_parser.add_argument("--main-sha", required=True)
+    probe_state_parser.add_argument("--upstream-sha", required=True)
+    probe_state_parser.add_argument("--main-is-ancestor", required=True)
+    probe_state_parser.add_argument("--patched-contains-main", required=True)
+    probe_state_parser.add_argument("--preview-status", required=True)
+    probe_state_parser.add_argument("--preview-candidate-needed", required=True)
+    probe_state_parser.add_argument("--candidate-branch-exists", required=True)
+    probe_state_parser.add_argument("--policy", required=True)
 
     fixture_parser = subparsers.add_parser("fixture-test")
     fixture_parser.set_defaults(_fixture=True)
@@ -781,10 +871,24 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     if args.command == "date-gate":
-        if args.date:
+        occurrence = None
+        runner_now = None
+        if args.schedule is not None:
+            runner_now = (
+                datetime.fromisoformat(args.now.replace("Z", "+00:00"))
+                if args.now
+                else datetime.now(SHANGHAI_TZ)
+            )
+            if runner_now.tzinfo is None:
+                runner_now = runner_now.replace(tzinfo=SHANGHAI_TZ)
+            runner_now = runner_now.astimezone(SHANGHAI_TZ)
+            occurrence = scheduled_occurrence(args.schedule, runner_now)
+            local_date = occurrence.date()
+        elif args.date:
             local_date = date.fromisoformat(args.date)
         else:
-            local_date = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            runner_now = datetime.now(SHANGHAI_TZ)
+            local_date = runner_now.date()
         active = args.force_check or is_check_day(local_date)
         print(
             json.dumps(
@@ -793,9 +897,26 @@ def main(argv=None):
                     "anchor": ANCHOR_DATE.isoformat(),
                     "date": local_date.isoformat(),
                     "forced": args.force_check,
+                    "occurrence": occurrence.isoformat() if occurrence else None,
+                    "runner_date": runner_now.date().isoformat() if runner_now else local_date.isoformat(),
+                    "schedule": args.schedule,
                     "timezone": "Asia/Shanghai",
                 },
                 ensure_ascii=False,
+            )
+        )
+        return 0
+    if args.command == "probe-state":
+        print(
+            classify_probe_state(
+                args.main_sha,
+                args.upstream_sha,
+                args.main_is_ancestor,
+                args.patched_contains_main,
+                args.preview_status,
+                args.preview_candidate_needed,
+                args.candidate_branch_exists,
+                args.policy,
             )
         )
         return 0

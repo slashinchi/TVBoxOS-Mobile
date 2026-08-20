@@ -1,19 +1,22 @@
 import subprocess
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 import re
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from scripts.upstream_monitor import (
     _git,
     candidate_branch_name,
     candidate_policy,
+    classify_probe_state,
     classify_paths,
     create_issue_with_reconcile,
     issue_marker,
     is_check_day,
+    main,
     marker_status,
     merge_candidate,
     normalize_issues,
@@ -21,6 +24,7 @@ from scripts.upstream_monitor import (
     notification_reason,
     recoverable_issue_numbers,
     run_gh,
+    scheduled_occurrence,
     sync_state,
     tree_matches,
 )
@@ -35,10 +39,49 @@ class U1aContractTests(unittest.TestCase):
         self.assertTrue(is_check_day(date(2026, 8, 20)))
         self.assertFalse(is_check_day(date(2026, 8, 21)))
         self.assertTrue(is_check_day(date(2027, 1, 1)))
+        shanghai = ZoneInfo("Asia/Shanghai")
+        self.assertEqual(
+            scheduled_occurrence(
+                "22 12 * * *", datetime(2026, 8, 20, 12, 54, tzinfo=shanghai)
+            ).isoformat(),
+            "2026-08-20T12:22:00+08:00",
+        )
+        self.assertEqual(
+            scheduled_occurrence(
+                "22 22 * * *", datetime(2026, 8, 21, 0, 5, tzinfo=shanghai)
+            ).isoformat(),
+            "2026-08-20T22:22:00+08:00",
+        )
+        with self.assertRaises(ValueError):
+            scheduled_occurrence("", datetime(2026, 8, 20, 12, 54, tzinfo=shanghai))
+        with self.assertRaises(ValueError):
+            main(["date-gate", "--schedule", "", "--now", "2026-08-20T12:54:00+08:00"])
         self.assertEqual(sync_state("same", "same", True, True), "no-change")
         self.assertEqual(sync_state("old", "new", True, True), "fast-forward")
         self.assertEqual(sync_state("old", "new", False, True), "main-divergence")
-        self.assertEqual(sync_state("same", "same", True, False), "patched-behind-main")
+        self.assertEqual(sync_state("same", "same", True, False), "no-change")
+        self.assertEqual(
+            sync_state("old", "new", True, False, candidate_needed=True),
+            "actionable-main-ahead",
+        )
+        self.assertEqual(
+            classify_probe_state(
+                "old", "new", "true", "false", "clean", "false", "false", "none"
+            ),
+            "no-actionable-delta",
+        )
+        self.assertEqual(
+            classify_probe_state(
+                "old", "old", "true", "false", "clean", "false", "false", "none"
+            ),
+            "no-change",
+        )
+        self.assertEqual(
+            classify_probe_state(
+                "old", "new", "true", "false", "clean", "true", "false", "create"
+            ),
+            "actionable-main-ahead",
+        )
 
     def test_risk_classification_stays_narrow(self):
         self.assertEqual(classify_paths(["README.md", "docs/MIGRATION.md"]), "docs-only")
@@ -214,14 +257,31 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("timezone:", date_block)
         self.assertIn("needs: [date_gate, fixture_tests]", probe_block)
 
-    def test_recover_retains_minimal_write_capability_for_main_push(self):
+    def test_recover_is_read_only_after_write_paths_finish(self):
         workflow = WORKFLOW.read_text()
         recover = workflow[workflow.index("  recover:"):]
         notify = workflow[workflow.index("  notify:"):workflow.index("  recover:")]
-        self.assertIn("contents: write", recover)
-        self.assertIn("persist-credentials: true", recover)
+        self.assertIn("contents: read", recover)
+        self.assertNotIn("contents: write", recover)
+        self.assertIn("persist-credentials: false", recover)
+        self.assertNotIn("persist-credentials: true", recover)
         self.assertIn("contents: read", notify)
         self.assertIn("persist-credentials: false", notify)
+
+    def test_schedule_gate_uses_event_cron_and_runner_time(self):
+        workflow = WORKFLOW.read_text()
+        date_gate = workflow[workflow.index("  date_gate:"):workflow.index("  fixture_tests:")]
+        self.assertIn("github.event.schedule", date_gate)
+        self.assertIn("github.event_name", date_gate)
+        self.assertIn("--schedule", date_gate)
+        self.assertIn("--now", date_gate)
+
+    def test_no_actionable_recheck_is_stable_and_main_ahead_is_actionable(self):
+        workflow = WORKFLOW.read_text()
+        probe = workflow[workflow.index("  probe:"):workflow.index("  candidate_validation:")]
+        self.assertIn('"$trusted_helper" probe-state', probe)
+        self.assertIn("--preview-candidate-needed", probe)
+        self.assertIn("needs.probe.outputs.state == 'actionable-main-ahead'", workflow)
 
     def test_workflow_binds_validated_tree_before_pr_creation(self):
         workflow = WORKFLOW.read_text()

@@ -37,6 +37,7 @@ jobs:
       anchor: ${{ steps.gate.outputs.anchor }}
       forced: ${{ steps.gate.outputs.forced }}
       timezone: ${{ steps.gate.outputs.timezone }}
+      occurrence: ${{ steps.gate.outputs.occurrence }}
     steps:
       - name: Check out trusted monitor code
         uses: actions/checkout@v5
@@ -51,23 +52,34 @@ jobs:
         name: Apply strict every-two-days gate
         env:
           FORCE_CHECK: ${{ inputs.force_check || false }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule || '' }}
         run: |
           set -euo pipefail
           local_date=$(TZ=Asia/Shanghai date +%F)
-          args=(date-gate --date "$local_date")
+          args=(date-gate)
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            runner_now=$(TZ=Asia/Shanghai date --iso-8601=seconds)
+            args+=(--schedule "$EVENT_SCHEDULE" --now "$runner_now")
+          else
+            args+=(--date "$local_date")
+          fi
           if [[ "$FORCE_CHECK" == "true" ]]; then
             args+=(--force-check)
           fi
-           result=$(python3 scripts/upstream_monitor.py "${args[@]}")
-           active=$(jq -r '.active' <<<"$result")
-           anchor=$(jq -r '.anchor' <<<"$result")
-           forced=$(jq -r '.forced' <<<"$result")
-           timezone=$(jq -r '.timezone' <<<"$result")
-           echo "local_date=$local_date" >> "$GITHUB_OUTPUT"
-           echo "active=$active" >> "$GITHUB_OUTPUT"
-           echo "anchor=$anchor" >> "$GITHUB_OUTPUT"
-           echo "forced=$forced" >> "$GITHUB_OUTPUT"
-           echo "timezone=$timezone" >> "$GITHUB_OUTPUT"
+          result=$(python3 scripts/upstream_monitor.py "${args[@]}")
+          active=$(jq -r '.active' <<<"$result")
+          anchor=$(jq -r '.anchor' <<<"$result")
+          gate_date=$(jq -r '.date' <<<"$result")
+          forced=$(jq -r '.forced' <<<"$result")
+          occurrence=$(jq -r '.occurrence // empty' <<<"$result")
+          timezone=$(jq -r '.timezone' <<<"$result")
+          echo "local_date=$gate_date" >> "$GITHUB_OUTPUT"
+          echo "active=$active" >> "$GITHUB_OUTPUT"
+          echo "anchor=$anchor" >> "$GITHUB_OUTPUT"
+          echo "forced=$forced" >> "$GITHUB_OUTPUT"
+          echo "occurrence=$occurrence" >> "$GITHUB_OUTPUT"
+          echo "timezone=$timezone" >> "$GITHUB_OUTPUT"
           if [[ "$active" != "true" ]]; then
             echo "Off-day: no upstream repository check will run."
           fi
@@ -190,29 +202,15 @@ jobs:
                --base-ref patched <<<"$open_prs")
            fi
 
-          if [[ "$main_is_ancestor" != "true" ]]; then
-            state=main-divergence
-          elif [[ "$preview_status" == "conflict" ]]; then
-            state=candidate-conflict
-          elif [[ "$preview_status" == "error" ]]; then
-            state=candidate-preview-error
-          elif [[ "$preview_candidate_needed" == "false" ]]; then
-            state=no-actionable-delta
-          elif [[ "$policy" == "closed-or-merged" ]]; then
-            state=candidate-closed-or-merged
-          elif [[ "$candidate_branch_exists" == "true" && "$policy" == "create" ]]; then
-            state=candidate-branch-no-pr
-          elif [[ "$fork_main_sha" == "$upstream_sha" && "$patched_contains_main" != "true" && "$candidate_branch_exists" != "true" && "$policy" == "create" ]]; then
-            state=candidate-branch-missing-after-main
-          elif [[ "$fork_main_sha" == "$upstream_sha" && "$patched_contains_main" != "true" ]]; then
-            state=$([[ "$policy" == "create" ]] && echo patched-behind-main || echo "$policy")
-          elif [[ "$patched_contains_main" != "true" ]]; then
-            state=patched-behind-main
-          elif [[ "$fork_main_sha" == "$upstream_sha" ]]; then
-            state=no-change
-          else
-            state=$([[ "$policy" == "create" ]] && echo fast-forward || echo "$policy")
-          fi
+          state=$(python3 "$trusted_helper" probe-state \
+            --main-sha "$fork_main_sha" \
+            --upstream-sha "$upstream_sha" \
+            --main-is-ancestor "$main_is_ancestor" \
+            --patched-contains-main "$patched_contains_main" \
+            --preview-status "$preview_status" \
+            --preview-candidate-needed "$preview_candidate_needed" \
+            --candidate-branch-exists "$candidate_branch_exists" \
+            --policy "$policy")
           echo "state=$state" >> "$GITHUB_OUTPUT"
           echo "candidate_branch_oid=$candidate_branch_oid" >> "$GITHUB_OUTPUT"
           echo "Probe state: $state"
@@ -220,7 +218,7 @@ jobs:
   candidate_validation:
     name: Validate upstream candidate without write or signing access
     needs: [date_gate, probe]
-    if: needs.probe.result == 'success' && (needs.probe.outputs.state == 'fast-forward' || needs.probe.outputs.state == 'no-actionable-delta' || needs.probe.outputs.state == 'candidate-branch-missing-after-main')
+    if: needs.probe.result == 'success' && (needs.probe.outputs.state == 'fast-forward' || needs.probe.outputs.state == 'actionable-main-ahead' || needs.probe.outputs.state == 'no-actionable-delta' || needs.probe.outputs.state == 'candidate-branch-missing-after-main')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -338,7 +336,7 @@ jobs:
   write_candidate:
     name: Fast-forward main and open candidate PR
     needs: [probe, candidate_validation]
-    if: needs.probe.result == 'success' && (needs.probe.outputs.state == 'fast-forward' || needs.probe.outputs.state == 'no-actionable-delta' || needs.probe.outputs.state == 'candidate-branch-missing-after-main') && needs.candidate_validation.result == 'success' && needs.candidate_validation.outputs.validation == 'pass'
+    if: needs.probe.result == 'success' && (needs.probe.outputs.state == 'fast-forward' || needs.probe.outputs.state == 'actionable-main-ahead' || needs.probe.outputs.state == 'no-actionable-delta' || needs.probe.outputs.state == 'candidate-branch-missing-after-main') && needs.candidate_validation.result == 'success' && needs.candidate_validation.outputs.validation == 'pass'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -378,7 +376,7 @@ jobs:
           test "$(git rev-parse refs/remotes/upstream/main)" = "$UPSTREAM_SHA"
           test "$(git rev-parse "$PATCHED_SHA")" = "$PATCHED_SHA"
           git merge-base --is-ancestor "$FORK_MAIN_SHA" "$UPSTREAM_SHA"
-          if [[ "$PROBE_STATE" != "no-actionable-delta" && "$PROBE_STATE" != "candidate-branch-missing-after-main" ]]; then
+          if [[ "$PROBE_STATE" != "no-actionable-delta" && "$PROBE_STATE" != "actionable-main-ahead" && "$PROBE_STATE" != "candidate-branch-missing-after-main" ]]; then
             git merge-base --is-ancestor "$FORK_MAIN_SHA" "$PATCHED_SHA"
           fi
 
@@ -611,6 +609,7 @@ jobs:
             (needs.probe.outputs.state != 'no-change' &&
              needs.probe.outputs.state != 'already-open' &&
              needs.probe.outputs.state != 'fast-forward' &&
+             needs.probe.outputs.state != 'actionable-main-ahead' &&
              needs.probe.outputs.state != 'no-actionable-delta' &&
              needs.probe.outputs.state != 'candidate-branch-no-pr' &&
              needs.probe.outputs.state != 'candidate-branch-missing-after-main') ||
@@ -800,14 +799,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
       issues: write
     steps:
       - name: Check out trusted monitor code
         uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Close resolved U1 automation issues
         env:
