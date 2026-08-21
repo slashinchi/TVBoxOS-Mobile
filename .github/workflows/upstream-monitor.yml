@@ -302,7 +302,7 @@ jobs:
       - name: Write idempotent coverage marker
         env:
           GH_TOKEN: ${{ github.token }}
-          CONTROL_ISSUE_NUMBER: ${{ vars.TVBOX_AUTOMATION_CONTROL_ISSUE_NUMBER }}
+          COVERAGE_ISSUE_NUMBER: ${{ vars.TVBOX_AUTOMATION_COVERAGE_ISSUE_NUMBER || '0' }}
           OCCURRENCE: ${{ needs.date_gate.outputs.occurrence }}
           PROBE_STATE: ${{ needs.probe.outputs.state }}
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
@@ -322,7 +322,7 @@ jobs:
           test -n "$marker"
           python3 "$trusted_helper" issue-comment \
             --repo "$GITHUB_REPOSITORY" \
-            --number "$CONTROL_ISSUE_NUMBER" \
+            --number "$COVERAGE_ISSUE_NUMBER" \
             --body-file "$body_file" \
             --marker "$marker"
 

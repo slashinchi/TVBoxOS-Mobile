@@ -183,6 +183,9 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("needs.event_gate.outputs.accepted", date_block)
         self.assertLess(date_start, coverage_start)
         self.assertIn("coverage-body", workflow)
+        coverage_block = workflow[coverage_start:workflow.index("  candidate_validation:")]
+        self.assertIn("COVERAGE_ISSUE_NUMBER", coverage_block)
+        self.assertNotIn("--number \"$CONTROL_ISSUE_NUMBER\"", coverage_block)
         notify_block = workflow[notify_start:workflow.index("  recover:")]
         self.assertIn("needs.event_gate.outputs.accepted == 'true'", notify_block)
 
