@@ -98,3 +98,4 @@ lint/tmp/
 /app/release/
 /.idea/
 *.jks
+.worktrees/
