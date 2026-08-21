@@ -14,6 +14,9 @@ from scripts.upstream_monitor import (
     classify_probe_state,
     classify_paths,
     create_issue_with_reconcile,
+    coverage_body,
+    coverage_marker,
+    event_gate,
     issue_marker,
     is_check_day,
     main,
@@ -82,6 +85,106 @@ class U1aContractTests(unittest.TestCase):
             ),
             "actionable-main-ahead",
         )
+
+    def test_u1c_event_gate_accepts_exact_watchdog_request(self):
+        shanghai = ZoneInfo("Asia/Shanghai")
+        event = {
+            "action": "created",
+            "issue": {"number": 2, "locked": True},
+            "comment": {
+                "user": {"login": "slashinchi"},
+                "body": (
+                    "<!-- TVBOX_UPSTREAM_WATCHDOG_V1 REQUEST -->\n"
+                    "version=1\n"
+                    "scheduled_for=2026-08-20T22:22:00+08:00\n"
+                    "source=private-control-reconciliation"
+                ),
+            },
+        }
+
+        result = event_gate(
+            event,
+            "issue_comment",
+            2,
+            datetime(2026, 8, 21, 0, 5, tzinfo=shanghai),
+        )
+
+        self.assertEqual(result["accepted"], "true")
+        self.assertEqual(result["request"], "true")
+        self.assertEqual(result["occurrence"], "2026-08-20T22:22:00+08:00")
+
+    def test_u1c_event_gate_rejects_replay_shaped_invalid_comments(self):
+        shanghai = ZoneInfo("Asia/Shanghai")
+        base = {
+            "action": "created",
+            "issue": {"number": 2, "locked": True},
+            "comment": {
+                "user": {"login": "slashinchi"},
+                "body": (
+                    "<!-- TVBOX_UPSTREAM_WATCHDOG_V1 REQUEST -->\n"
+                    "version=1\n"
+                    "scheduled_for=2026-08-20T22:22:00+08:00\n"
+                    "source=private-control-reconciliation"
+                ),
+            },
+        }
+        now = datetime(2026, 8, 21, 0, 5, tzinfo=shanghai)
+
+        for mutation in (
+            {"issue": {"number": 2, "locked": False}},
+            {"issue": {"number": 2, "locked": True, "pull_request": {}}},
+            {"comment": {"user": {"login": "attacker"}}},
+            {"issue": {"number": 3, "locked": True}},
+        ):
+            event = {**base, **mutation}
+            result = event_gate(event, "issue_comment", 2, now)
+            self.assertEqual(result["accepted"], "false")
+            self.assertNotEqual(result["reason"], "")
+
+    def test_u1c_event_gate_accepts_natural_schedule_and_dispatch(self):
+        shanghai = ZoneInfo("Asia/Shanghai")
+        schedule = event_gate(
+            {"schedule": "22 12 * * *"},
+            "schedule",
+            2,
+            datetime(2026, 8, 20, 12, 54, tzinfo=shanghai),
+        )
+        dispatch = event_gate({}, "workflow_dispatch", 2, datetime(2026, 8, 20, 12, 54, tzinfo=shanghai))
+
+        self.assertEqual(schedule["accepted"], "true")
+        self.assertEqual(schedule["request"], "false")
+        self.assertEqual(schedule["occurrence"], "2026-08-20T12:22:00+08:00")
+        self.assertEqual(dispatch["accepted"], "true")
+
+    def test_u1c_coverage_marker_binds_full_occurrence(self):
+        occurrence = "2026-08-20T22:22:00+08:00"
+        marker = coverage_marker(occurrence)
+        body = coverage_body(occurrence, "run-123", "no-change", "a" * 40, "b" * 40)
+
+        self.assertEqual(marker, f"<!-- TVBOX_UPSTREAM_COVERED_V1:{occurrence} -->")
+        self.assertIn(marker, body)
+        self.assertIn("run_id=run-123", body)
+
+    def test_u1c_event_gate_precedes_all_business_jobs(self):
+        workflow = WORKFLOW.read_text()
+        event_start = workflow.index("  event_gate:")
+        date_start = workflow.index("  date_gate:")
+        notify_start = workflow.index("  notify:")
+        coverage_start = workflow.index("  coverage:")
+
+        self.assertLess(event_start, date_start)
+        self.assertIn("issue_comment:", workflow)
+        self.assertIn("types: [created]", workflow)
+        event_block = workflow[event_start:date_start]
+        self.assertIn("issues: read", event_block)
+        self.assertIn("event-gate", event_block)
+        date_block = workflow[date_start:workflow.index("  fixture_tests:")]
+        self.assertIn("needs: event_gate", date_block)
+        self.assertIn("needs.event_gate.outputs.accepted", date_block)
+        self.assertLess(date_start, coverage_start)
+        self.assertIn("coverage-body", workflow)
+        notify_block = workflow[notify_start:workflow.index("  recover:")]
+        self.assertIn("needs.event_gate.outputs.accepted == 'true'", notify_block)
 
     def test_risk_classification_stays_narrow(self):
         self.assertEqual(classify_paths(["README.md", "docs/MIGRATION.md"]), "docs-only")

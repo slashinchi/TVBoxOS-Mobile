@@ -79,6 +79,96 @@ def recovery_marker(issue_number):
     return f"<!-- tvbox-upstream-recovery:{issue_number} -->"
 
 
+WATCHDOG_REQUEST_MARKER = "<!-- TVBOX_UPSTREAM_WATCHDOG_V1 REQUEST -->"
+WATCHDOG_COVERAGE_PREFIX = "<!-- TVBOX_UPSTREAM_COVERED_V1:"
+
+
+def _occurrence_key(value):
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=SHANGHAI_TZ)
+    return value.astimezone(SHANGHAI_TZ).isoformat(timespec="seconds")
+
+
+def coverage_marker(occurrence):
+    return f"{WATCHDOG_COVERAGE_PREFIX}{_occurrence_key(occurrence)} -->"
+
+
+def coverage_body(occurrence, run_id, probe_state, upstream_sha, fork_main_sha):
+    key = _occurrence_key(occurrence)
+    return "\n".join(
+        (
+            coverage_marker(key),
+            "version=1",
+            f"scheduled_for={key}",
+            f"run_id={run_id}",
+            f"probe_state={probe_state}",
+            f"upstream_sha={upstream_sha}",
+            f"fork_main_sha={fork_main_sha}",
+        )
+    )
+
+
+def _reject_event(reason):
+    return {"accepted": "false", "request": "false", "occurrence": "", "reason": reason}
+
+
+def event_gate(event, event_name, control_issue_number, now):
+    """Validate the event before any existing monitor job can run."""
+    now = now.astimezone(SHANGHAI_TZ) if now.tzinfo else now.replace(tzinfo=SHANGHAI_TZ)
+    if event_name == "schedule":
+        try:
+            occurrence = scheduled_occurrence(event.get("schedule", ""), now)
+        except ValueError:
+            return _reject_event("unsupported-schedule")
+        return {
+            "accepted": "true",
+            "request": "false",
+            "occurrence": occurrence.isoformat(),
+            "reason": "natural-schedule",
+        }
+    if event_name == "workflow_dispatch":
+        return {"accepted": "true", "request": "false", "occurrence": "", "reason": "workflow-dispatch"}
+    if event_name != "issue_comment" or event.get("action") != "created":
+        return _reject_event("unsupported-event")
+
+    issue = event.get("issue") or {}
+    if issue.get("number") != control_issue_number:
+        return _reject_event("unexpected-issue")
+    if "pull_request" in issue or not issue.get("locked"):
+        return _reject_event("issue-not-locked-normal-issue")
+
+    comment = event.get("comment") or {}
+    if ((comment.get("user") or {}).get("login")) != "slashinchi":
+        return _reject_event("unexpected-comment-actor")
+    lines = (comment.get("body") or "").strip().splitlines()
+    if len(lines) != 4 or lines[0] != WATCHDOG_REQUEST_MARKER or lines[1] != "version=1" or lines[3] != "source=private-control-reconciliation":
+        return _reject_event("invalid-request-format")
+    if not lines[2].startswith("scheduled_for="):
+        return _reject_event("missing-occurrence")
+    try:
+        occurrence = datetime.fromisoformat(lines[2].split("=", 1)[1])
+    except ValueError:
+        return _reject_event("invalid-occurrence")
+    if occurrence.tzinfo is None or occurrence.utcoffset() != timedelta(hours=8):
+        return _reject_event("occurrence-not-asia-shanghai")
+    occurrence = occurrence.astimezone(SHANGHAI_TZ)
+    if (occurrence.hour, occurrence.minute) not in SCHEDULE_TIMES.values() or occurrence.second or occurrence.microsecond:
+        return _reject_event("occurrence-not-production-schedule")
+    if not is_check_day(occurrence.date()):
+        return _reject_event("occurrence-off-day")
+    age = now - occurrence
+    if age < timedelta(0) or age > timedelta(hours=48):
+        return _reject_event("occurrence-outside-window")
+    return {
+        "accepted": "true",
+        "request": "true",
+        "occurrence": occurrence.isoformat(),
+        "reason": "watchdog-request",
+    }
+
+
 def marker_status(issue_body, comments, marker):
     if marker in (issue_body or ""):
         return 0
@@ -771,6 +861,19 @@ def main(argv=None):
     date_parser.add_argument("--now")
     date_parser.add_argument("--force-check", action="store_true")
 
+    event_parser = subparsers.add_parser("event-gate")
+    event_parser.add_argument("--event-file", required=True)
+    event_parser.add_argument("--event-name", required=True)
+    event_parser.add_argument("--issue-number", required=True, type=int)
+    event_parser.add_argument("--now")
+
+    coverage_parser = subparsers.add_parser("coverage-body")
+    coverage_parser.add_argument("--occurrence", required=True)
+    coverage_parser.add_argument("--run-id", required=True)
+    coverage_parser.add_argument("--probe-state", required=True)
+    coverage_parser.add_argument("--upstream-sha", required=True)
+    coverage_parser.add_argument("--fork-main-sha", required=True)
+
     probe_state_parser = subparsers.add_parser("probe-state")
     probe_state_parser.add_argument("--main-sha", required=True)
     probe_state_parser.add_argument("--upstream-sha", required=True)
@@ -870,6 +973,26 @@ def main(argv=None):
     close_issue_parser.add_argument("--number", required=True, type=int)
 
     args = parser.parse_args(argv)
+    if args.command == "event-gate":
+        event = json.loads(Path(args.event_file).read_text())
+        now = (
+            datetime.fromisoformat(args.now.replace("Z", "+00:00"))
+            if args.now
+            else datetime.now(SHANGHAI_TZ)
+        )
+        print(json.dumps(event_gate(event, args.event_name, args.issue_number, now), ensure_ascii=False))
+        return 0
+    if args.command == "coverage-body":
+        print(
+            coverage_body(
+                args.occurrence,
+                args.run_id,
+                args.probe_state,
+                args.upstream_sha,
+                args.fork_main_sha,
+            )
+        )
+        return 0
     if args.command == "date-gate":
         occurrence = None
         runner_now = None

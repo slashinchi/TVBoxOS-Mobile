@@ -13,9 +13,12 @@ on:
         required: false
         default: false
         type: boolean
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
+  issues: read
 
 concurrency:
   group: upstream-maintenance-monitor
@@ -25,8 +28,58 @@ env:
   TZ: Asia/Shanghai
 
 jobs:
+  event_gate:
+    name: Validate event and watchdog request
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      accepted: ${{ steps.gate.outputs.accepted }}
+      request: ${{ steps.gate.outputs.request }}
+      occurrence: ${{ steps.gate.outputs.occurrence }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - name: Check out trusted monitor code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          sparse-checkout: scripts/upstream_monitor.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - id: gate
+        name: Apply strict read-only event gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_JSON: ${{ toJson(github.event) }}
+          CONTROL_ISSUE_NUMBER: ${{ vars.TVBOX_AUTOMATION_CONTROL_ISSUE_NUMBER || '0' }}
+        run: |
+          set -euo pipefail
+          event_file="$RUNNER_TEMP/github-event.json"
+          printf '%s' "$EVENT_JSON" > "$event_file"
+          runner_now=$(TZ=Asia/Shanghai date --iso-8601=seconds)
+          result=$(python3 scripts/upstream_monitor.py event-gate \
+            --event-file "$event_file" \
+            --event-name "$EVENT_NAME" \
+            --issue-number "$CONTROL_ISSUE_NUMBER" \
+            --now "$runner_now")
+          accepted=$(jq -r '.accepted' <<<"$result")
+          request=$(jq -r '.request' <<<"$result")
+          occurrence=$(jq -r '.occurrence // empty' <<<"$result")
+          reason=$(jq -r '.reason' <<<"$result")
+          echo "accepted=$accepted" >> "$GITHUB_OUTPUT"
+          echo "request=$request" >> "$GITHUB_OUTPUT"
+          echo "occurrence=$occurrence" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "event=$EVENT_NAME accepted=$accepted request=$request reason=$reason occurrence=${occurrence:-none}"
+
   date_gate:
     name: Check schedule gate
+    needs: event_gate
+    if: needs.event_gate.outputs.accepted == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -54,15 +107,20 @@ jobs:
           FORCE_CHECK: ${{ inputs.force_check || false }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SCHEDULE: ${{ github.event.schedule || '' }}
+          REQUEST_EVENT: ${{ needs.event_gate.outputs.request }}
+          REQUEST_OCCURRENCE: ${{ needs.event_gate.outputs.occurrence }}
         run: |
           set -euo pipefail
           local_date=$(TZ=Asia/Shanghai date +%F)
           args=(date-gate)
-          if [[ "$EVENT_NAME" == "schedule" ]]; then
-            runner_now=$(TZ=Asia/Shanghai date --iso-8601=seconds)
-            args+=(--schedule "$EVENT_SCHEDULE" --now "$runner_now")
-          else
-            args+=(--date "$local_date")
+           if [[ "$EVENT_NAME" == "schedule" ]]; then
+             runner_now=$(TZ=Asia/Shanghai date --iso-8601=seconds)
+             args+=(--schedule "$EVENT_SCHEDULE" --now "$runner_now")
+           elif [[ "$REQUEST_EVENT" == "true" ]]; then
+             request_date="${REQUEST_OCCURRENCE%%T*}"
+             args+=(--date "$request_date")
+           else
+             args+=(--date "$local_date")
           fi
           if [[ "$FORCE_CHECK" == "true" ]]; then
             args+=(--force-check)
@@ -72,7 +130,10 @@ jobs:
           anchor=$(jq -r '.anchor' <<<"$result")
           gate_date=$(jq -r '.date' <<<"$result")
           forced=$(jq -r '.forced' <<<"$result")
-          occurrence=$(jq -r '.occurrence // empty' <<<"$result")
+           occurrence=$(jq -r '.occurrence // empty' <<<"$result")
+           if [[ "$REQUEST_EVENT" == "true" ]]; then
+             occurrence="$REQUEST_OCCURRENCE"
+           fi
           timezone=$(jq -r '.timezone' <<<"$result")
           echo "local_date=$gate_date" >> "$GITHUB_OUTPUT"
           echo "active=$active" >> "$GITHUB_OUTPUT"
@@ -213,7 +274,57 @@ jobs:
             --policy "$policy")
           echo "state=$state" >> "$GITHUB_OUTPUT"
           echo "candidate_branch_oid=$candidate_branch_oid" >> "$GITHUB_OUTPUT"
-          echo "Probe state: $state"
+           echo "Probe state: $state"
+
+  coverage:
+    name: Record upstream probe coverage
+    needs: [event_gate, date_gate, probe]
+    if: >-
+      needs.event_gate.outputs.accepted == 'true' &&
+      needs.date_gate.outputs.active == 'true' &&
+      needs.date_gate.outputs.occurrence != '' &&
+      needs.probe.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out trusted monitor code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          sparse-checkout: scripts/upstream_monitor.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Write idempotent coverage marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_ISSUE_NUMBER: ${{ vars.TVBOX_AUTOMATION_CONTROL_ISSUE_NUMBER }}
+          OCCURRENCE: ${{ needs.date_gate.outputs.occurrence }}
+          PROBE_STATE: ${{ needs.probe.outputs.state }}
+          UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
+          FORK_MAIN_SHA: ${{ needs.probe.outputs.fork_main_sha }}
+        run: |
+          set -euo pipefail
+          trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
+          cp scripts/upstream_monitor.py "$trusted_helper"
+          body_file="$RUNNER_TEMP/tvbox-upstream-covered.md"
+          python3 "$trusted_helper" coverage-body \
+            --occurrence "$OCCURRENCE" \
+            --run-id "$GITHUB_RUN_ID" \
+            --probe-state "$PROBE_STATE" \
+            --upstream-sha "$UPSTREAM_SHA" \
+            --fork-main-sha "$FORK_MAIN_SHA" > "$body_file"
+          marker=$(sed -n '1p' "$body_file")
+          test -n "$marker"
+          python3 "$trusted_helper" issue-comment \
+            --repo "$GITHUB_REPOSITORY" \
+            --number "$CONTROL_ISSUE_NUMBER" \
+            --body-file "$body_file" \
+            --marker "$marker"
 
   candidate_validation:
     name: Validate upstream candidate without write or signing access
@@ -596,9 +707,11 @@ jobs:
 
   notify:
     name: Notify and fail closed
-    needs: [date_gate, fixture_tests, probe, candidate_validation, write_candidate, repair_candidate_pr]
+    needs: [event_gate, date_gate, fixture_tests, probe, candidate_validation, write_candidate, repair_candidate_pr]
     if: >-
       always() &&
+      needs.event_gate.result == 'success' &&
+      needs.event_gate.outputs.accepted == 'true' &&
       (
         needs.date_gate.result != 'success' ||
         (
