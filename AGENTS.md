@@ -5,6 +5,8 @@
 - GitHub is the source of truth for code/branches/commits/Actions/releases. Reconcile Drive documents against Git before editing.
 - If HANDOFF SHA/state disagrees with GitHub, stop implementation, reconcile the mismatch, and update the docs first.
 - For complex work, follow ACTIVE-PLAN through implementation and validation; do not re-plan settled decisions unless evidence requires it.
+- Repository/GitHub implementation writes are allowed only when the current GD HANDOFF state is exactly `AUTHORIZED`; `DESIGNING`, `REVIEW_PENDING`, `NEEDS_REPLAN`, and `CLOSED` mean stop without implementation writes.
+- Follow the settled ACTIVE-PLAN; a material design, scope, or permission mismatch returns `NEEDS_REPLAN` rather than improvising. Planned human gates return `REVIEW_PENDING / HUMAN_ACTION_REQUIRED`.
 - After each independently verifiable batch: commit to `patched`, run the required build/tests, append verified evidence to FACTS, maintain ACTIVE-PLAN, and rewrite HANDOFF to the new current state.
 - Documentation semantics: HANDOFF/current-state = rewrite holistically; ACTIVE-PLAN = living/current; FACTS = append-only timeline; DECISIONS = append or supersede.
 - Never store keystores, passwords, tokens, or other secrets in the repo or normal Drive docs.
