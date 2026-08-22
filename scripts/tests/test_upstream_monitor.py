@@ -35,6 +35,7 @@ from scripts.upstream_monitor import (
 
 ROOT = Path(__file__).parents[2]
 WORKFLOW = ROOT / ".github/workflows/upstream-monitor.yml"
+BUILD_WORKFLOW = ROOT / ".github/workflows/build.yml"
 
 
 class U1aContractTests(unittest.TestCase):
@@ -189,6 +190,18 @@ class U1aContractTests(unittest.TestCase):
         notify_block = workflow[notify_start:workflow.index("  recover:")]
         self.assertIn("needs.event_gate.outputs.accepted == 'true'", notify_block)
 
+    def test_signing_environment_is_limited_to_existing_signing_jobs(self):
+        workflow = BUILD_WORKFLOW.read_text()
+        signed_start = workflow.index("  build-signed-rc:")
+        publish_start = workflow.index("  publish-github-release:")
+        signed_block = workflow[signed_start:publish_start]
+        publish_block = workflow[publish_start:]
+        build_block = workflow[workflow.index("  build-apk:"):signed_start]
+
+        self.assertIn("environment: release-signing", signed_block)
+        self.assertIn("environment: release-signing", publish_block)
+        self.assertNotIn("environment: release-signing", build_block)
+
     def test_risk_classification_stays_narrow(self):
         self.assertEqual(classify_paths(["README.md", "docs/MIGRATION.md"]), "docs-only")
         self.assertEqual(classify_paths(["AGENTS.md"]), "unknown/high-risk")
@@ -254,6 +267,50 @@ class U1aContractTests(unittest.TestCase):
             self.assertIn("docs.md", result.changed_paths)
             self.assertEqual((repo / "README.md").read_text(), "fork README\nbase footer\n")
             self.assertEqual((repo / "update.json").read_text(), '{"endpoint":"fork"}\n')
+
+    def test_fork_owned_control_plane_paths_are_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._new_repo(Path(tmp))
+            _git(repo, "checkout", "-b", "patched")
+            (repo / "AGENTS.md").write_text("fork rules\n")
+            (repo / ".github/workflows/upstream-monitor.yml").parent.mkdir(parents=True)
+            (repo / ".github/workflows/upstream-monitor.yml").write_text("fork workflow\n")
+            (repo / "scripts").mkdir()
+            (repo / "scripts/upstream_monitor.py").write_text("fork helper\n")
+            (repo / "scripts/sync_release_metadata.sh").write_text("fork metadata\n")
+            self._commit(repo, "fork control plane")
+            _git(repo, "checkout", "-b", "upstream", "main")
+            (repo / "AGENTS.md").write_text("upstream rules\n")
+            (repo / ".github/workflows").mkdir(parents=True)
+            (repo / ".github/workflows/upstream-monitor.yml").write_text("upstream workflow\n")
+            (repo / ".github/workflows/new-upstream.yml").write_text("new upstream workflow\n")
+            (repo / "scripts").mkdir()
+            (repo / "scripts/upstream_monitor.py").write_text("upstream helper\n")
+            (repo / "scripts/sync_release_metadata.sh").write_text("upstream metadata\n")
+            (repo / "runtime.txt").write_text("upstream runtime\n")
+            self._commit(repo, "upstream control plane changes")
+
+            result = merge_candidate(repo, "upstream", "patched")
+
+            self.assertEqual(
+                result.preserved,
+                [
+                    ".github/workflows/new-upstream.yml",
+                    ".github/workflows/upstream-monitor.yml",
+                    "AGENTS.md",
+                    "scripts/sync_release_metadata.sh",
+                    "scripts/upstream_monitor.py",
+                ],
+            )
+            self.assertEqual((repo / "AGENTS.md").read_text(), "fork rules\n")
+            self.assertEqual(
+                (repo / ".github/workflows/upstream-monitor.yml").read_text(),
+                "fork workflow\n",
+            )
+            self.assertEqual((repo / "scripts/upstream_monitor.py").read_text(), "fork helper\n")
+            self.assertEqual((repo / "scripts/sync_release_metadata.sh").read_text(), "fork metadata\n")
+            self.assertFalse((repo / ".github/workflows/new-upstream.yml").exists())
+            self.assertIn("runtime.txt", result.changed_paths)
 
     def test_only_fork_owned_changes_do_not_need_a_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:

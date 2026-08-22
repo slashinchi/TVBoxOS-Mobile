@@ -22,7 +22,15 @@ SCHEDULE_TIMES = {
     "22 12 * * *": (12, 22),
     "22 22 * * *": (22, 22),
 }
-FORK_OWNED_PATHS = {"README.md", "update.json"}
+FORK_OWNED_PATHS = {
+    "README.md",
+    "update.json",
+    "AGENTS.md",
+    "scripts/upstream_monitor.py",
+    "scripts/tests/test_upstream_monitor.py",
+    "scripts/sync_release_metadata.sh",
+}
+FORK_OWNED_PREFIXES = (".github/workflows/",)
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 AUTOMATION_REASONS = {
     "fixture-tests-failure",
@@ -740,6 +748,10 @@ def candidate_policy(open_prs, upstream_sha, repository=None, candidate_oid=None
     return "create"
 
 
+def is_fork_owned_path(path):
+    return path in FORK_OWNED_PATHS or any(path.startswith(prefix) for prefix in FORK_OWNED_PREFIXES)
+
+
 def merge_candidate(repo, upstream_ref, base_ref):
     """Merge upstream into a detached patched candidate, preserving only owned files."""
     if _git(repo, "status", "--porcelain"):
@@ -761,7 +773,7 @@ def merge_candidate(repo, upstream_ref, base_ref):
         repo, "diff", "--name-only", f"{base_sha}...{upstream_ref}"
     ).splitlines()
     owned_upstream_changes = sorted(
-        path for path in FORK_OWNED_PATHS if path in upstream_changed_paths
+        path for path in upstream_changed_paths if is_fork_owned_path(path)
     )
     _git(repo, "config", "user.name", "tvbox-upstream-monitor")
     _git(repo, "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
@@ -782,9 +794,9 @@ def merge_candidate(repo, upstream_ref, base_ref):
     else:
         conflicts = _git(repo, "diff", "--name-only", "--diff-filter=U").splitlines()
         preserved = sorted(
-            set(owned_upstream_changes) | {path for path in conflicts if path in FORK_OWNED_PATHS}
+            set(owned_upstream_changes) | {path for path in conflicts if is_fork_owned_path(path)}
         )
-        unsafe = sorted(path for path in conflicts if path not in FORK_OWNED_PATHS)
+        unsafe = sorted(path for path in conflicts if not is_fork_owned_path(path))
         if unsafe:
             _run_git(repo, "-c", "core.hooksPath=/dev/null", "merge", "--abort")
             return CandidateResult("conflict", None, unsafe, preserved, [], True, None)
@@ -792,9 +804,9 @@ def merge_candidate(repo, upstream_ref, base_ref):
     for path in preserved:
         if _run_git(repo, "cat-file", "-e", f"{base_sha}:{path}", check=False).returncode == 0:
             _git(repo, "-c", "core.hooksPath=/dev/null", "checkout", base_sha, "--", path)
+            _git(repo, "-c", "core.hooksPath=/dev/null", "add", "-A", "--", path)
         else:
             _run_git(repo, "-c", "core.hooksPath=/dev/null", "rm", "-f", "--", path, check=False)
-        _git(repo, "-c", "core.hooksPath=/dev/null", "add", "-A", "--", path)
 
     if merge.returncode == 0:
         if _run_git(repo, "diff", "--cached", "--quiet", check=False).returncode != 0:
