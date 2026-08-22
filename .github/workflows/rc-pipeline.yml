@@ -118,7 +118,6 @@ jobs:
       INPUT_RELEASE_DEBT: ${{ inputs.release_debt }}
       INPUT_CANDIDATE_PR: ${{ inputs.candidate_pr }}
       INPUT_PROVENANCE_MARKER: ${{ inputs.provenance_marker }}
-      GRADLE_USER_HOME: ${{ runner.temp }}/tvbox-gradle
     steps:
       - name: Check out exact release SHA
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -131,6 +130,7 @@ jobs:
         name: Qualify source, version, debt and toolchain
         run: |
           set -euo pipefail
+          export GRADLE_USER_HOME="$RUNNER_TEMP/tvbox-gradle"
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           if [[ "$MODE" == "manual-local" ]]; then
             test "$RELEASE_SHA" = "$SOURCE_SHA"
@@ -274,6 +274,7 @@ jobs:
           TVBOX_STORE_PASSWORD: ''
         run: |
           set -euo pipefail
+          export GRADLE_USER_HOME="$RUNNER_TEMP/tvbox-gradle"
           ./gradlew :app:assembleRelease --stacktrace --no-daemon
           mapfile -t apks < <(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print)
           [[ "${#apks[@]}" -eq 1 ]] || { echo "::error::expected exactly one release APK"; exit 1; }
@@ -382,7 +383,6 @@ jobs:
       EXPECTED_SIGNER_SHA256: ${{ vars.TVBOX_SIGNER_SHA256 }}
       UNSIGNED_ARTIFACT_ID: ${{ needs.build_unsigned.outputs.artifact_id }}
       EXPECTED_UNSIGNED_SHA256: ${{ needs.build_unsigned.outputs.unsigned_sha256 }}
-      GRADLE_USER_HOME: ${{ runner.temp }}/unused-gradle
     steps:
       - name: Prepare fixed signer workspace before secret window
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
