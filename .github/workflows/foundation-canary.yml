@@ -50,6 +50,8 @@ jobs:
           upstream_oid=$(git rev-parse HEAD)
           git push origin "HEAD:refs/heads/$shadow_upstream"
           git push origin "$upstream_oid:refs/heads/$shadow_main"
+          git fetch origin "$shadow_patched" "$shadow_upstream"
+          git switch --detach "origin/$shadow_patched"
 
           {
             echo "real_main=$real_main"
