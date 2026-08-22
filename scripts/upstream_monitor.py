@@ -28,7 +28,10 @@ FORK_OWNED_PATHS = {
     "AGENTS.md",
     "scripts/upstream_monitor.py",
     "scripts/tests/test_upstream_monitor.py",
+    "scripts/u2_release.py",
+    "scripts/tests/test_u2_release.py",
     "scripts/sync_release_metadata.sh",
+    ".github/dependabot.yml",
 }
 FORK_OWNED_PREFIXES = (".github/workflows/",)
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -687,7 +690,7 @@ def classify_paths(paths):
         return "docs-only"
 
     def path_class(path):
-        if path.startswith(".github/") or path in {
+        if path.startswith(".github/") or path.endswith((".gradle", ".gradle.kts")) or path in {
             "build.gradle",
             "settings.gradle",
             "gradle.properties",
@@ -796,10 +799,40 @@ def merge_candidate(repo, upstream_ref, base_ref):
         preserved = sorted(
             set(owned_upstream_changes) | {path for path in conflicts if is_fork_owned_path(path)}
         )
-        unsafe = sorted(path for path in conflicts if not is_fork_owned_path(path))
+        unsafe = sorted(
+            path
+            for path in conflicts
+            if path != "app/build.gradle" and not is_fork_owned_path(path)
+        )
         if unsafe:
             _run_git(repo, "-c", "core.hooksPath=/dev/null", "merge", "--abort")
             return CandidateResult("conflict", None, unsafe, preserved, [], True, None)
+
+        if "app/build.gradle" in conflicts:
+            try:
+                base_text = _git(repo, "show", ":1:app/build.gradle")
+                ours_text = _git(repo, "show", ":2:app/build.gradle")
+                theirs_text = _git(repo, "show", ":3:app/build.gradle")
+                try:
+                    from scripts.u2_release import normalize_version_overlay
+                except ImportError:
+                    from u2_release import normalize_version_overlay
+
+                merged_text, _ = normalize_version_overlay(base_text, ours_text, theirs_text)
+                (Path(repo) / "app/build.gradle").write_text(merged_text)
+                _git(repo, "-c", "core.hooksPath=/dev/null", "add", "--", "app/build.gradle")
+                conflicts.remove("app/build.gradle")
+            except (OSError, ValueError, subprocess.CalledProcessError):
+                _run_git(repo, "-c", "core.hooksPath=/dev/null", "merge", "--abort")
+                return CandidateResult(
+                    "conflict",
+                    None,
+                    ["app/build.gradle"],
+                    preserved,
+                    [],
+                    True,
+                    None,
+                )
 
     for path in preserved:
         if _run_git(repo, "cat-file", "-e", f"{base_sha}:{path}", check=False).returncode == 0:

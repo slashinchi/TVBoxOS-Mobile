@@ -191,16 +191,16 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("needs.event_gate.outputs.accepted == 'true'", notify_block)
 
     def test_signing_environment_is_limited_to_existing_signing_jobs(self):
-        workflow = BUILD_WORKFLOW.read_text()
-        signed_start = workflow.index("  build-signed-rc:")
-        publish_start = workflow.index("  publish-github-release:")
-        signed_block = workflow[signed_start:publish_start]
-        publish_block = workflow[publish_start:]
-        build_block = workflow[workflow.index("  build-apk:"):signed_start]
+        build_workflow = BUILD_WORKFLOW.read_text()
+        rc_workflow = (ROOT / ".github/workflows/rc-pipeline.yml").read_text()
+        signed_start = rc_workflow.index("  sign_exact:")
+        verify_start = rc_workflow.index("  verify_and_attest:")
+        signed_block = rc_workflow[signed_start:verify_start]
+        verifier_block = rc_workflow[verify_start:]
 
+        self.assertIn("uses: ./.github/workflows/rc-pipeline.yml", build_workflow)
         self.assertIn("environment: release-signing", signed_block)
-        self.assertIn("environment: release-signing", publish_block)
-        self.assertNotIn("environment: release-signing", build_block)
+        self.assertNotIn("environment: release-signing", verifier_block)
 
     def test_risk_classification_stays_narrow(self):
         self.assertEqual(classify_paths(["README.md", "docs/MIGRATION.md"]), "docs-only")
@@ -208,6 +208,8 @@ class U1aContractTests(unittest.TestCase):
         self.assertEqual(classify_paths(["docs/release.sh"]), "unknown/high-risk")
         self.assertEqual(classify_paths(["app/src/main/AndroidManifest.xml"]), "runtime/high-risk")
         self.assertEqual(classify_paths([".github/workflows/other.yml"]), "build/release-sensitive")
+        self.assertEqual(classify_paths(["app/build.gradle"]), "build/release-sensitive")
+        self.assertEqual(classify_paths(["app/build.gradle.kts"]), "build/release-sensitive")
 
     def test_candidate_identity_uses_full_upstream_sha(self):
         upstream_sha = "a" * 40
@@ -347,6 +349,72 @@ class U1aContractTests(unittest.TestCase):
             self.assertEqual(result.preserved, ["README.md"])
             self.assertEqual(_git(repo, "status", "--porcelain"), "")
 
+    def test_version_overlay_resolves_with_fork_owned_workflow_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.email", "fixture@example.invalid")
+            _git(repo, "config", "user.name", "U1 Fixture")
+            (repo / "app").mkdir()
+            (repo / "app/build.gradle").write_text(
+                "versionCode 236\nversionName '2.1.26'\nbase=true\n"
+            )
+            (repo / ".github/workflows").mkdir(parents=True)
+            (repo / ".github/workflows/build.yml").write_text("name: base\n")
+            _git(repo, "add", ".")
+            _git(repo, "commit", "-m", "base")
+            _git(repo, "checkout", "-b", "patched")
+            (repo / "app/build.gradle").write_text(
+                "versionCode 23601\nversionName '2.1.26.1'\nbase=true\n"
+            )
+            (repo / ".github/workflows/build.yml").write_text("name: fork\n")
+            _git(repo, "add", ".")
+            _git(repo, "commit", "-m", "fork version")
+            _git(repo, "checkout", "-b", "upstream", "main")
+            (repo / "app/build.gradle").write_text(
+                "versionCode 237\nversionName '2.1.27'\nbase=true\nupstream=true\n"
+            )
+            (repo / ".github/workflows/build.yml").write_text("name: upstream\n")
+            _git(repo, "add", ".")
+            _git(repo, "commit", "-m", "upstream version")
+
+            result = merge_candidate(repo, "upstream", "patched")
+
+            self.assertEqual(result.status, "clean")
+            self.assertIn(".github/workflows/build.yml", result.preserved)
+            self.assertIn("versionCode 23601", (repo / "app/build.gradle").read_text())
+            self.assertIn("versionName '2.1.26.1'", (repo / "app/build.gradle").read_text())
+            self.assertIn("upstream=true", (repo / "app/build.gradle").read_text())
+            self.assertEqual((repo / ".github/workflows/build.yml").read_text(), "name: fork\n")
+
+    def test_version_overlay_does_not_hide_another_runtime_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _git(repo, "init", "-b", "main")
+            _git(repo, "config", "user.email", "fixture@example.invalid")
+            _git(repo, "config", "user.name", "U1 Fixture")
+            (repo / "app").mkdir()
+            (repo / "app/build.gradle").write_text("versionCode 236\nversionName '2.1.26'\n")
+            (repo / "runtime.txt").write_text("base\n")
+            _git(repo, "add", ".")
+            _git(repo, "commit", "-m", "base")
+            _git(repo, "checkout", "-b", "patched")
+            (repo / "app/build.gradle").write_text("versionCode 23601\nversionName '2.1.26.1'\n")
+            (repo / "runtime.txt").write_text("fork\n")
+            _git(repo, "add", ".")
+            _git(repo, "commit", "-m", "fork")
+            _git(repo, "checkout", "-b", "upstream", "main")
+            (repo / "app/build.gradle").write_text("versionCode 237\nversionName '2.1.27'\n")
+            (repo / "runtime.txt").write_text("upstream\n")
+            _git(repo, "add", ".")
+            _git(repo, "commit", "-m", "upstream")
+
+            result = merge_candidate(repo, "upstream", "patched")
+
+            self.assertEqual(result.status, "conflict")
+            self.assertIn("runtime.txt", result.conflicts)
+            self.assertEqual(_git(repo, "status", "--porcelain"), "")
+
     def test_already_integrated_upstream_has_no_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = self._new_repo(Path(tmp))
@@ -453,6 +521,13 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("validated-tree-mismatch", workflow)
         self.assertIn("candidate tree", workflow)
         self.assertIn("candidate-tree:", workflow)
+
+    def test_candidate_pr_binds_versioned_provenance_marker(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn("provenance_marker", workflow)
+        self.assertIn("EXPECTED_PROVENANCE_MARKER", workflow)
+        self.assertIn("provenance-marker", workflow)
+        self.assertIn("parse-app-version", workflow)
 
     def test_candidate_jobs_continue_using_a_trusted_helper_copy(self):
         workflow = WORKFLOW.read_text()
