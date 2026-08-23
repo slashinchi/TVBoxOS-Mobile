@@ -235,6 +235,41 @@ class U2ReleaseContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan_version("2.1.25", 235, published=[("2.1.26.1", 23601)])
 
+    def test_canonical_runtime_dependencies_select_sorted_gavs(self):
+        text = """releaseRuntimeClasspath - Runtime classpath of source set 'main'.
++--- com.example:zeta:1.0
+|    +--- com.example:alpha:1.0 -> 1.1
+|    +--- com.example:alpha:1.1
+\\--- com.example:zeta:1.0
+"""
+        result = subprocess.run(
+            [
+                "python3",
+                "scripts/u2_release.py",
+                "canonical-runtime-dependencies",
+                "--file",
+                "/dev/stdin",
+                "--configuration",
+                "releaseRuntimeClasspath",
+            ],
+            cwd=ROOT,
+            input=text,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "components": [
+                    {"group": "com.example", "module": "alpha", "version": "1.1"},
+                    {"group": "com.example", "module": "zeta", "version": "1.0"},
+                ],
+                "configuration": "releaseRuntimeClasspath",
+                "schema": "tvbox-runtime-dependencies-v1",
+            },
+        )
+
     def test_release_trailers_are_parseable_and_mode_aware(self):
         trailers = build_release_trailers(
             source_sha="a" * 40,
@@ -293,6 +328,42 @@ class U2ReleaseContractTests(unittest.TestCase):
             self.assertNotIn("4thline.org", block)
             self.assertIn('url "https://jitpack.io"', block)
             self.assertIn('includeGroupByRegex "com\\\\.github\\\\..*"', block)
+
+    def test_actions_use_only_the_local_pinned_legacy_bridge(self):
+        build = (ROOT / "build.gradle").read_text()
+        self.assertIn('TVBOX_LEGACY_REPO', build)
+        self.assertIn('url = uri(tvboxLegacyRepo)', build)
+        self.assertIn('mavenPom()', build)
+        self.assertIn('artifact()', build)
+        for coordinate in (
+            'includeVersion("com.kingja.loadsir", "loadsir", "1.3.8")',
+            'includeVersion("com.lzy.net", "okgo", "3.0.4")',
+            'includeVersion("com.owen", "tv-recyclerview", "3.0.0")',
+            'includeVersion("com.hyman", "flowlayout-lib", "1.1.2")',
+        ):
+            self.assertIn(coordinate, build)
+        for path in (
+            ROOT / ".github/workflows/build.yml",
+            ROOT / ".github/workflows/rc-pipeline.yml",
+            ROOT / ".github/workflows/upstream-monitor.yml",
+        ):
+            workflow = path.read_text()
+            self.assertIn("scripts/legacy_staging.py stage", workflow)
+            self.assertIn("gradle/legacy-dependencies.lock.json", workflow)
+            self.assertNotIn("maven.aliyun.com", workflow)
+
+    def test_rc_pipeline_attests_v2_build_inputs_and_pins_signer_jdk(self):
+        workflow = RC_WORKFLOW.read_text()
+        self.assertIn('schema:"tvbox-release-identity-v2"', workflow)
+        self.assertIn("runtime_components_sha256", workflow)
+        self.assertIn("legacy_manifest_sha256", workflow)
+        self.assertIn("apksigner_version", workflow)
+        self.assertIn("zipalign_version", workflow)
+        self.assertIn("tvbox-release-identity/v2", workflow)
+        signer = workflow[workflow.index("  sign_exact:"):workflow.index("  verify_and_attest:")]
+        self.assertIn("actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961", signer)
+        self.assertIn("java-version: '17.0.20+8'", signer)
+        self.assertNotIn("cache:", signer)
 
     def test_gradle_wrapper_is_pinned_to_official_8_7_artifacts(self):
         properties = (ROOT / "gradle/wrapper/gradle-wrapper.properties").read_text()

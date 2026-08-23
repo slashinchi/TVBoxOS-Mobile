@@ -126,6 +126,29 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Set up builder Temurin 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: '17.0.20+8'
+          cache: gradle
+
+      - name: Stage pinned legacy dependencies
+        run: |
+          set -euo pipefail
+          legacy_repo="$RUNNER_TEMP/tvbox-legacy-maven"
+          python3 scripts/legacy_staging.py stage \
+            --manifest gradle/legacy-dependencies.lock.json \
+            --output "$legacy_repo"
+          python3 scripts/legacy_staging.py verify \
+            --manifest gradle/legacy-dependencies.lock.json \
+            --output "$legacy_repo"
+          manifest_sha=$(python3 scripts/legacy_staging.py manifest-digest \
+            --manifest gradle/legacy-dependencies.lock.json | jq -r '.manifest_sha256')
+          test "$manifest_sha" != "null"
+          echo "TVBOX_LEGACY_REPO=$legacy_repo" >> "$GITHUB_ENV"
+          echo "TVBOX_LEGACY_MANIFEST_SHA256=$manifest_sha" >> "$GITHUB_ENV"
+
       - id: identity
         name: Qualify source, version, debt and toolchain
         run: |
@@ -210,18 +233,32 @@ jobs:
           fi
           [[ "$debt" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::invalid release-debt fingerprint"; exit 1; }
 
-          runner_image=$(uname -a)
-          java_version=$(java -version 2>&1 | tr '\n' ' ')
-          test -x "$ANDROID_HOME/build-tools/34.0.0/apksigner"
-          test -x "$ANDROID_HOME/build-tools/34.0.0/aapt2"
-          test -x "$ANDROID_HOME/build-tools/35.0.0/zipalign"
-          ndk_root="$ANDROID_HOME/ndk/28.2.13676358"
-          llvm_readelf="$ndk_root/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          test -x "$llvm_readelf"
-          chmod +x gradlew
-          gradle_version=$(./gradlew --version | tr '\n' ' ')
-          agp_version=$(sed -nE 's/.*com.android.tools.build:gradle:([^" ]+).*/\1/p' build.gradle | head -n 1)
-          printf '%s\n' \
+           image_os="${ImageOS:-}"
+           image_version="${ImageVersion:-}"
+           [[ -n "$image_os" && -n "$image_version" ]] || { echo "::error::hosted runner image identity is unavailable"; exit 1; }
+           runner_image=$(uname -a)
+           java_version=$(java -version 2>&1 | tr '\n' ' ')
+           [[ "$java_version" == *"17.0.20"* ]] || { echo "::error::builder JDK is not Temurin 17.0.20"; exit 1; }
+           test -x "$ANDROID_HOME/build-tools/34.0.0/apksigner"
+           test -x "$ANDROID_HOME/build-tools/34.0.0/aapt2"
+           test -x "$ANDROID_HOME/build-tools/35.0.0/zipalign"
+           ndk_root="$ANDROID_HOME/ndk/28.2.13676358"
+           llvm_readelf="$ndk_root/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+           test -x "$llvm_readelf"
+           chmod +x gradlew
+           gradle_version=$(./gradlew --version | sed -nE 's/^Gradle ([^ ]+).*/\1/p' | head -n 1)
+           [[ "$gradle_version" == "8.7" ]] || { echo "::error::unexpected Gradle version: $gradle_version"; exit 1; }
+           gradle_distribution_sha=$(sed -nE 's/^distributionSha256Sum=([0-9a-f]{64})/\1/p' gradle/wrapper/gradle-wrapper.properties)
+           wrapper_jar_sha=$(sha256sum gradle/wrapper/gradle-wrapper.jar | awk '{print $1}')
+           agp_version=$(sed -nE 's/.*com.android.tools.build:gradle:([^" ]+).*/\1/p' build.gradle | head -n 1)
+           apksigner_path="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+           zipalign_path="$ANDROID_HOME/build-tools/35.0.0/zipalign"
+           apksigner_version="34.0.0"
+           zipalign_version="35.0.0"
+           ndk_version="28.2.13676358"
+           legacy_manifest_sha="${TVBOX_LEGACY_MANIFEST_SHA256:-}"
+           [[ "$legacy_manifest_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::legacy manifest digest is unavailable"; exit 1; }
+           printf '%s\n' \
             "workflow_source_sha=$GITHUB_SHA" \
             "artifact_source_sha=$RELEASE_SHA" \
             "source_sha=$SOURCE_SHA" \
@@ -232,16 +269,24 @@ jobs:
             "version_name=$version_name" \
             "version_code=$version_code" \
             "release_debt=$debt" \
-            "candidate_pr=$INPUT_CANDIDATE_PR" \
-            "provenance_marker=$INPUT_PROVENANCE_MARKER" \
-            "runner_image=$runner_image" \
-            "java_version=$java_version" \
-            "gradle_version=$gradle_version" \
-            "agp_version=$agp_version" \
-            "apksigner=$ANDROID_HOME/build-tools/34.0.0/apksigner" \
-            "zipalign=$ANDROID_HOME/build-tools/35.0.0/zipalign" \
-            "ndk=$ndk_root" > build/release-identity.txt
-          jq -n \
+             "candidate_pr=$INPUT_CANDIDATE_PR" \
+             "provenance_marker=$INPUT_PROVENANCE_MARKER" \
+             "legacy_manifest_sha256=$legacy_manifest_sha" \
+             "runner_image_os=$image_os" \
+             "runner_image_version=$image_version" \
+             "runner_image=$runner_image" \
+             "builder_java_version=$java_version" \
+             "gradle_version=$gradle_version" \
+             "gradle_distribution_sha256=$gradle_distribution_sha" \
+             "wrapper_jar_sha256=$wrapper_jar_sha" \
+             "agp_version=$agp_version" \
+             "apksigner=$apksigner_path" \
+             "apksigner_version=$apksigner_version" \
+             "zipalign=$zipalign_path" \
+             "zipalign_version=$zipalign_version" \
+             "ndk=$ndk_root" \
+             "ndk_version=$ndk_version" > build/release-identity.txt
+           jq -n \
             --arg workflow_source_sha "$GITHUB_SHA" \
             --arg artifact_source_sha "$RELEASE_SHA" \
             --arg source_sha "$SOURCE_SHA" \
@@ -252,9 +297,22 @@ jobs:
             --arg version_name "$version_name" \
             --arg version_code "$version_code" \
             --arg release_debt "$debt" \
-            --arg candidate_pr "$INPUT_CANDIDATE_PR" \
-            --arg provenance_marker "$INPUT_PROVENANCE_MARKER" \
-            '{schema:"tvbox-release-identity-v1", workflow_source_sha:$workflow_source_sha, artifact_source_sha:$artifact_source_sha, source_sha:$source_sha, mode:$mode, upstream_sha:$upstream_sha, upstream_version:$upstream_version, upstream_code:($upstream_code|tonumber), version_name:$version_name, version_code:($version_code|tonumber), release_debt:$release_debt, candidate_pr:$candidate_pr, provenance_marker:$provenance_marker}' > build/release-identity.json
+             --arg candidate_pr "$INPUT_CANDIDATE_PR" \
+             --arg provenance_marker "$INPUT_PROVENANCE_MARKER" \
+             --arg legacy_manifest_sha256 "$legacy_manifest_sha" \
+             --arg runner_image_os "$image_os" \
+             --arg runner_image_version "$image_version" \
+             --arg builder_java_version "$java_version" \
+             --arg gradle_version "$gradle_version" \
+             --arg gradle_distribution_sha256 "$gradle_distribution_sha" \
+             --arg wrapper_jar_sha256 "$wrapper_jar_sha" \
+             --arg agp_version "$agp_version" \
+             --arg apksigner_path "$apksigner_path" \
+             --arg apksigner_version "$apksigner_version" \
+             --arg zipalign_path "$zipalign_path" \
+             --arg zipalign_version "$zipalign_version" \
+             --arg ndk_version "$ndk_version" \
+             '{schema:"tvbox-release-identity-v2", workflow_source_sha:$workflow_source_sha, artifact_source_sha:$artifact_source_sha, source_sha:$source_sha, mode:$mode, upstream_sha:$upstream_sha, upstream_version:$upstream_version, upstream_code:($upstream_code|tonumber), version_name:$version_name, version_code:$version_code, release_debt:$release_debt, candidate_pr:$candidate_pr, provenance_marker:$provenance_marker, legacy_manifest_sha256:$legacy_manifest_sha256, runner_image_os:$runner_image_os, runner_image_version:$runner_image_version, builder_java_version:$builder_java_version, gradle_version:$gradle_version, gradle_distribution_sha256:$gradle_distribution_sha256, wrapper_jar_sha256:$wrapper_jar_sha256, agp_version:$agp_version, apksigner_path:$apksigner_path, apksigner_version:$apksigner_version, zipalign_path:$zipalign_path, zipalign_version:$zipalign_version, ndk_version:$ndk_version}' > build/release-identity.json
           printf '%s\n' "$RELEASE_SHA" > build/release-source.txt
           {
             echo "version_name=$version_name"
@@ -327,16 +385,27 @@ jobs:
             if "$llvm_readelf" -lW "$so" | awk '$1 == "LOAD" && $NF != "0x4000" {bad=1} END {exit bad}'; then :; else
               echo "::error::native ELF LOAD alignment is not 16KiB: $so"; exit 1
             fi
-          done
-          ./gradlew :app:dependencies --configuration releaseRuntimeClasspath --no-daemon > build/unsigned/releaseRuntimeClasspath.txt
-          unsigned_sha256=$(sha256sum build/unsigned/unsigned.apk | awk '{print $1}')
-          payload_sha256=$(sha256sum build/unsigned/payload-manifest.json | awk '{print $1}')
-          dependency_sha256=$(sha256sum build/unsigned/releaseRuntimeClasspath.txt | awk '{print $1}')
-          printf '%s\n' \
-            "unsigned_sha256=$unsigned_sha256" \
-            "payload_manifest_sha256=$payload_sha256" \
-            "dependency_report_sha256=$dependency_sha256" \
-            "package=$package_name" \
+           done
+           ./gradlew :app:dependencies --configuration releaseRuntimeClasspath --no-daemon > build/unsigned/releaseRuntimeClasspath.txt
+           python3 scripts/u2_release.py canonical-runtime-dependencies \
+             --file build/unsigned/releaseRuntimeClasspath.txt \
+             --configuration releaseRuntimeClasspath > build/unsigned/releaseRuntimeClasspath.json
+           unsigned_sha256=$(sha256sum build/unsigned/unsigned.apk | awk '{print $1}')
+           payload_sha256=$(sha256sum build/unsigned/payload-manifest.json | awk '{print $1}')
+           dependency_sha256=$(sha256sum build/unsigned/releaseRuntimeClasspath.json | awk '{print $1}')
+           raw_dependency_sha256=$(sha256sum build/unsigned/releaseRuntimeClasspath.txt | awk '{print $1}')
+           jq --arg unsigned "$unsigned_sha256" \
+             --arg payload "$payload_sha256" \
+             --arg dependencies "$dependency_sha256" \
+             '. + {unsigned_sha256:$unsigned, payload_manifest_sha256:$payload, runtime_components_sha256:$dependencies}' \
+             build/release-identity.json > build/release-identity.json.tmp
+           mv build/release-identity.json.tmp build/release-identity.json
+           printf '%s\n' \
+             "unsigned_sha256=$unsigned_sha256" \
+             "payload_manifest_sha256=$payload_sha256" \
+             "runtime_components_sha256=$dependency_sha256" \
+             "raw_dependency_report_sha256=$raw_dependency_sha256" \
+             "package=$package_name" \
             "version_name=$apk_name" \
             "version_code=$apk_code" >> build/release-identity.txt
           echo "unsigned_sha256=$unsigned_sha256" >> "$GITHUB_OUTPUT"
@@ -347,13 +416,15 @@ jobs:
         with:
           name: tvbox-u2-unsigned-${{ inputs.release_sha }}-${{ github.run_attempt }}
           path: |
-            build/unsigned/unsigned.apk
-            build/unsigned/payload-manifest.json
-            build/unsigned/releaseRuntimeClasspath.txt
-            build/release-identity.txt
-            build/release-identity.json
-            build/release-source.txt
-            build/release-fields.env
+             build/unsigned/unsigned.apk
+             build/unsigned/payload-manifest.json
+             build/unsigned/releaseRuntimeClasspath.txt
+             build/unsigned/releaseRuntimeClasspath.json
+             build/release-identity.txt
+             build/release-identity.json
+             build/release-source.txt
+             build/release-fields.env
+             gradle/legacy-dependencies.lock.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 90
@@ -384,6 +455,12 @@ jobs:
       UNSIGNED_ARTIFACT_ID: ${{ needs.build_unsigned.outputs.artifact_id }}
       EXPECTED_UNSIGNED_SHA256: ${{ needs.build_unsigned.outputs.unsigned_sha256 }}
     steps:
+      - name: Set up signer Temurin 17 before secret window
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: '17.0.20+8'
+
       - name: Prepare fixed signer workspace before secret window
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -405,9 +482,15 @@ jobs:
           [[ "$identity_unsigned" == "$EXPECTED_UNSIGNED_SHA256" ]] || { echo "::error::unsigned digest mismatch"; exit 1; }
           test -x "$ANDROID_HOME/build-tools/34.0.0/apksigner"
           mkdir -p "$RUNNER_TEMP/fixed"
-          cp -- "$root/unsigned.apk" "$RUNNER_TEMP/fixed/unsigned.apk"
-          cp -- "$root/release-identity.txt" "$RUNNER_TEMP/fixed/release-identity.txt"
-          cp -- "$root/release-fields.env" "$RUNNER_TEMP/fixed/release-fields.env"
+           cp -- "$root/unsigned.apk" "$RUNNER_TEMP/fixed/unsigned.apk"
+           cp -- "$root/release-identity.txt" "$RUNNER_TEMP/fixed/release-identity.txt"
+           cp -- "$root/release-fields.env" "$RUNNER_TEMP/fixed/release-fields.env"
+
+      - name: Capture signer JDK identity before secret window
+        run: |
+          set -euo pipefail
+          java -version 2>&1 | tr '\n' ' ' > "$RUNNER_TEMP/signer-java-version.txt"
+          grep -q '17.0.20' "$RUNNER_TEMP/signer-java-version.txt"
 
       - id: sign
         name: Sign exact APK with the only secret-bearing step
@@ -438,16 +521,18 @@ jobs:
           "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose --print-certs "$RUNNER_TEMP/signed.apk" | tee "$RUNNER_TEMP/signer-output.txt"
           signer_sha=$(sed -nE 's/.*certificate SHA-256 digest: ([0-9A-Fa-f:]+).*/\1/p' "$RUNNER_TEMP/signer-output.txt" | tr -d ':' | tr '[:upper:]' '[:lower:]' | head -n 1)
           expected_sha=$(printf '%s' "$EXPECTED_SIGNER_SHA256" | tr -d ':' | tr '[:upper:]' '[:lower:]')
-          [[ "$signer_sha" =~ ^[0-9a-f]{64}$ && "$signer_sha" == "$expected_sha" ]] || { echo "::error::signer fingerprint mismatch"; exit 1; }
-          signed_sha=$(sha256sum "$RUNNER_TEMP/signed.apk" | awk '{print $1}')
-          mkdir -p signed
+           [[ "$signer_sha" =~ ^[0-9a-f]{64}$ && "$signer_sha" == "$expected_sha" ]] || { echo "::error::signer fingerprint mismatch"; exit 1; }
+           signed_sha=$(sha256sum "$RUNNER_TEMP/signed.apk" | awk '{print $1}')
+           signer_java_version=$(cat "$RUNNER_TEMP/signer-java-version.txt")
+           mkdir -p signed
           cp "$RUNNER_TEMP/signed.apk" signed/signed.apk
           cp "$root/release-identity.txt" signed/builder-release-identity.txt
           {
-            echo "unsigned_sha256=$identity_unsigned"
-            echo "signed_sha256=$signed_sha"
-            echo "signer_sha256=$signer_sha"
-            echo "signer_job=$GITHUB_JOB"
+             echo "unsigned_sha256=$identity_unsigned"
+             echo "signed_sha256=$signed_sha"
+             echo "signer_sha256=$signer_sha"
+             echo "signer_java_version=$signer_java_version"
+             echo "signer_job=$GITHUB_JOB"
             echo "run_id=$GITHUB_RUN_ID"
             echo "run_attempt=$GITHUB_RUN_ATTEMPT"
           } > signed/signer-output.txt
@@ -511,18 +596,24 @@ jobs:
         run: |
           set -euo pipefail
           unsigned="$RUNNER_TEMP/unsigned/unsigned.apk"
-          signed="$RUNNER_TEMP/signed/signed.apk"
-          test -f "$unsigned"; test -f "$signed"
-          builder_unsigned=$(sed -n 's/^unsigned_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
-          builder_payload=$(sed -n 's/^payload_manifest_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
-          builder_dependencies=$(sed -n 's/^dependency_report_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
-          actual_unsigned=$(sha256sum "$unsigned" | awk '{print $1}')
-          actual_signed=$(sha256sum "$signed" | awk '{print $1}')
-          [[ "$builder_unsigned" == "$actual_unsigned" ]] || { echo "::error::unsigned artifact digest changed"; exit 1; }
-          [[ "$builder_payload" == "$(sha256sum "$RUNNER_TEMP/unsigned/payload-manifest.json" | awk '{print $1}')" ]] || { echo "::error::payload manifest changed"; exit 1; }
-          [[ "$builder_dependencies" == "$(sha256sum "$RUNNER_TEMP/unsigned/releaseRuntimeClasspath.txt" | awk '{print $1}')" ]] || { echo "::error::dependency report changed"; exit 1; }
-          builder_identity="$RUNNER_TEMP/unsigned/release-identity.json"
-          expected_package='com.github.tvbox.osc'
+           signed="$RUNNER_TEMP/signed/signed.apk"
+           test -f "$unsigned"; test -f "$signed"
+           builder_identity="$RUNNER_TEMP/unsigned/release-identity.json"
+           test -f "$builder_identity"
+           jq -e '.schema == "tvbox-release-identity-v2" and (.legacy_manifest_sha256 | test("^[0-9a-f]{64}$")) and (.runtime_components_sha256 | test("^[0-9a-f]{64}$")) and .gradle_version == "8.7" and .gradle_distribution_sha256 == "544c35d6bd849ae8a5ed0bcea39ba677dc40f49df7d1835561582da2009b961d" and .wrapper_jar_sha256 == "cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8" and .agp_version == "8.5.2" and .apksigner_version == "34.0.0" and .zipalign_version == "35.0.0" and .ndk_version == "28.2.13676358" and (.builder_java_version | contains("17.0.20"))' "$builder_identity" >/dev/null
+           builder_unsigned=$(sed -n 's/^unsigned_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
+           builder_payload=$(sed -n 's/^payload_manifest_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
+           builder_dependencies=$(sed -n 's/^runtime_components_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
+           builder_manifest=$(sed -n 's/^legacy_manifest_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
+           actual_unsigned=$(sha256sum "$unsigned" | awk '{print $1}')
+           actual_signed=$(sha256sum "$signed" | awk '{print $1}')
+           [[ "$builder_unsigned" == "$actual_unsigned" ]] || { echo "::error::unsigned artifact digest changed"; exit 1; }
+           [[ "$builder_payload" == "$(sha256sum "$RUNNER_TEMP/unsigned/payload-manifest.json" | awk '{print $1}')" ]] || { echo "::error::payload manifest changed"; exit 1; }
+           [[ "$builder_dependencies" == "$(sha256sum "$RUNNER_TEMP/unsigned/releaseRuntimeClasspath.json" | awk '{print $1}')" ]] || { echo "::error::canonical dependency report changed"; exit 1; }
+           manifest_file="$RUNNER_TEMP/unsigned/gradle/legacy-dependencies.lock.json"
+           test -f "$manifest_file"
+           [[ "$builder_manifest" == "$(sha256sum "$manifest_file" | awk '{print $1}')" ]] || { echo "::error::legacy manifest changed"; exit 1; }
+           expected_package='com.github.tvbox.osc'
           expected_name=$(jq -r '.version_name' "$builder_identity")
           expected_code=$(jq -r '.version_code' "$builder_identity")
           "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose --print-certs "$signed" | tee "$RUNNER_TEMP/verify-signature.txt"
@@ -537,13 +628,22 @@ jobs:
             echo "::error::verifier package/version mismatch"; exit 1;
           }
           sudo apt-get update
-          sudo apt-get install -y apksigcopier=1.1.1-1
-          apksigcopier compare --unsigned "$signed" "$unsigned"
-          printf '%s\n' \
+           sudo apt-get install -y apksigcopier=1.1.1-1
+           apksigcopier compare --unsigned "$signed" "$unsigned"
+           signer_java_version=$(sed -n 's/^signer_java_version=//p' "$RUNNER_TEMP/signed/signer-output.txt")
+           [[ "$signer_java_version" == *"17.0.20"* ]] || { echo "::error::signer JDK identity mismatch"; exit 1; }
+           verifier_image_os="${ImageOS:-unknown}"
+           verifier_image_version="${ImageVersion:-unknown}"
+           printf '%s\n' \
             "signed_sha256=$actual_signed" \
-            "unsigned_sha256=$actual_unsigned" \
-            "signer_sha256=$signer_sha" \
-            "artifact_source_sha=${{ inputs.release_sha }}" \
+             "unsigned_sha256=$actual_unsigned" \
+             "signer_sha256=$signer_sha" \
+             "legacy_manifest_sha256=$builder_manifest" \
+             "runtime_components_sha256=$builder_dependencies" \
+             "signer_java_version=$signer_java_version" \
+             "verifier_image_os=$verifier_image_os" \
+             "verifier_image_version=$verifier_image_version" \
+             "artifact_source_sha=${{ inputs.release_sha }}" \
             "workflow_source_sha=$GITHUB_SHA" \
             "unsigned_artifact_id=$UNSIGNED_ARTIFACT_ID" \
             "signed_artifact_id=$SIGNED_ARTIFACT_ID" > "$RUNNER_TEMP/verified-release-identity.txt"
@@ -561,24 +661,27 @@ jobs:
       - name: Write custom release identity predicate
         run: |
           set -euo pipefail
-          identity="$RUNNER_TEMP/unsigned/release-identity.json"
-          test -f "$identity"
-          jq -n \
-            --argjson builder "$(cat "$identity")" \
+           identity="$RUNNER_TEMP/unsigned/release-identity.json"
+           test -f "$identity"
+           jq -n \
+             --argjson builder "$(cat "$identity")" \
             --arg unsigned "${{ needs.build_unsigned.outputs.unsigned_sha256 }}" \
             --arg signed "${{ steps.verify.outputs.signed_sha256 }}" \
             --arg signer "${{ steps.verify.outputs.signer_sha256 }}" \
-            --arg workflow_source "$GITHUB_SHA" \
-            --arg run "$GITHUB_RUN_ID" \
-            --arg attempt "$GITHUB_RUN_ATTEMPT" \
-            '$builder + {schema:"tvbox-release-identity-v1-attested", unsigned_sha256:$unsigned, signed_sha256:$signed, signer_sha256:$signer, verifier_workflow_source_sha:$workflow_source, run_id:$run, run_attempt:$attempt}' > release-identity-predicate.json
+             --arg workflow_source "$GITHUB_SHA" \
+             --arg run "$GITHUB_RUN_ID" \
+             --arg attempt "$GITHUB_RUN_ATTEMPT" \
+             --arg signer_java "$(sed -n 's/^signer_java_version=//p' "$RUNNER_TEMP/signed/signer-output.txt")" \
+             --arg verifier_image_os "${ImageOS:-unknown}" \
+             --arg verifier_image_version "${ImageVersion:-unknown}" \
+             '$builder + {schema:"tvbox-release-identity-v2", unsigned_sha256:$unsigned, signed_sha256:$signed, signer_sha256:$signer, signer_java_version:$signer_java, verifier_image_os:$verifier_image_os, verifier_image_version:$verifier_image_version, verifier_workflow_source_sha:$workflow_source, run_id:$run, run_attempt:$attempt}' > release-identity-predicate.json
 
       - id: custom_attest
         name: Attest project-specific release identity
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: ${{ runner.temp }}/signed/signed.apk
-          predicate-type: https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v1
+          predicate-type: https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v2
           predicate-path: release-identity-predicate.json
           push-to-registry: false
           create-storage-record: false

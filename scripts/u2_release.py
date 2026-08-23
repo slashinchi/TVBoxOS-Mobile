@@ -423,6 +423,47 @@ def build_release_trailers(source_sha, mode, upstream_sha, version_name, debt, p
     return "\n".join(lines)
 
 
+def canonical_runtime_dependencies(text, configuration):
+    """Normalize Gradle's dependency tree to a stable selected-GAV JSON object."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", configuration or ""):
+        raise ValueError("invalid dependency configuration")
+    gav_re = re.compile(
+        r"(?P<group>[A-Za-z0-9_.-]+):(?P<module>[A-Za-z0-9_.-]+):"
+        r"(?P<requested>[A-Za-z0-9][A-Za-z0-9+_.-]*)"
+        r"(?:\s*->\s*(?P<selected>[A-Za-z0-9][A-Za-z0-9+_.-]*))?"
+    )
+    selected = {}
+    for line in (text or "").splitlines():
+        for match in gav_re.finditer(line):
+            group = match.group("group")
+            module = match.group("module")
+            version = match.group("selected") or match.group("requested")
+            key = (group, module)
+            is_selected = match.group("selected") is not None
+            previous = selected.get(key)
+            if previous is None:
+                selected[key] = (version, is_selected)
+            elif is_selected:
+                if previous[1] and previous[0] != version:
+                    raise ValueError(f"conflicting selected versions for {group}:{module}")
+                selected[key] = (version, True)
+            elif previous[1]:
+                continue
+            elif previous[0] != version:
+                raise ValueError(f"conflicting selected versions for {group}:{module}")
+    if not selected:
+        raise ValueError("dependency report contains no selected external GAVs")
+    components = [
+        {"group": group, "module": module, "version": version[0]}
+        for (group, module), version in sorted(selected.items())
+    ]
+    return {
+        "schema": "tvbox-runtime-dependencies-v1",
+        "configuration": configuration,
+        "components": components,
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -472,6 +513,10 @@ def main(argv=None):
     trailers_parser.add_argument("--debt", required=True)
     trailers_parser.add_argument("--pr", type=int)
 
+    dependency_parser = subparsers.add_parser("canonical-runtime-dependencies")
+    dependency_parser.add_argument("--file", required=True)
+    dependency_parser.add_argument("--configuration", required=True)
+
     args = parser.parse_args(argv)
     if args.command == "parse-app-version":
         print(json.dumps(dict(zip(("versionName", "versionCode"), parse_app_version(Path(args.file).read_text())))))
@@ -497,6 +542,9 @@ def main(argv=None):
         print(json.dumps(plan_version(args.upstream_name, args.upstream_code, json.loads(Path(args.published_file).read_text()))))
     elif args.command == "release-trailers":
         print(build_release_trailers(args.source, args.mode, args.upstream, args.version, args.debt, args.pr, args.code))
+    elif args.command == "canonical-runtime-dependencies":
+        result = canonical_runtime_dependencies(Path(args.file).read_text(), args.configuration)
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
 
 
