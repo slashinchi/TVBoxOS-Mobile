@@ -365,6 +365,13 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("java-version: '17.0.20+8'", signer)
         self.assertNotIn("cache:", signer)
 
+    def test_rc_builder_uses_a_fresh_cache_disabled_gradle_home(self):
+        workflow = RC_WORKFLOW.read_text()
+        builder = workflow[workflow.index("  build_unsigned:"):workflow.index("  sign_exact:")]
+        self.assertIn('export GRADLE_USER_HOME="$RUNNER_TEMP/tvbox-gradle"', builder)
+        self.assertNotIn("cache: gradle", builder)
+        self.assertNotIn("setup-gradle", builder)
+
     def test_gradle_wrapper_is_pinned_to_official_8_7_artifacts(self):
         properties = (ROOT / "gradle/wrapper/gradle-wrapper.properties").read_text()
         self.assertIn("gradle-8.7-bin.zip", properties)

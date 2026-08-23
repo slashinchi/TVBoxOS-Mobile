@@ -131,7 +131,6 @@ jobs:
         with:
           distribution: temurin
           java-version: '17.0.20+8'
-          cache: gradle
 
       - name: Stage pinned legacy dependencies
         run: |
