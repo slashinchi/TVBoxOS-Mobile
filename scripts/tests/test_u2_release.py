@@ -372,6 +372,11 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("cache: gradle", builder)
         self.assertNotIn("setup-gradle", builder)
 
+    def test_rc_identity_creates_evidence_directory_before_writing(self):
+        workflow = RC_WORKFLOW.read_text()
+        identity = workflow[workflow.index("      - id: identity"):workflow.index("      - id: build")]
+        self.assertIn("mkdir -p build", identity)
+
     def test_gradle_wrapper_is_pinned_to_official_8_7_artifacts(self):
         properties = (ROOT / "gradle/wrapper/gradle-wrapper.properties").read_text()
         self.assertIn("gradle-8.7-bin.zip", properties)

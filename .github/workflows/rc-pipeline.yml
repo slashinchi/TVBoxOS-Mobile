@@ -153,6 +153,7 @@ jobs:
         run: |
           set -euo pipefail
           export GRADLE_USER_HOME="$RUNNER_TEMP/tvbox-gradle"
+          mkdir -p build
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           if [[ "$MODE" == "manual-local" ]]; then
             test "$RELEASE_SHA" = "$SOURCE_SHA"
