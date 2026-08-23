@@ -352,7 +352,7 @@ jobs:
           [[ "$apk_code" == "$(sed -n 's/^version_code=//p' build/release-fields.env)" ]] || { echo "::error::versionCode mismatch"; exit 1; }
           [[ "$apk_name" == "$(sed -n 's/^version_name=//p' build/release-fields.env)" ]] || { echo "::error::versionName mismatch"; exit 1; }
 
-          python3 - build/unsigned/unsigned.apk build/unsigned/native <<'PY'
+          python3 - build/unsigned/unsigned.apk <<'PY'
           import base64
           import hashlib
           import json
@@ -361,10 +361,7 @@ jobs:
           import zipfile
 
           apk = pathlib.Path(sys.argv[1])
-          native = pathlib.Path(sys.argv[2])
-          native.mkdir()
           entries = []
-          native_index = 0
           with zipfile.ZipFile(apk) as archive:
               for info in sorted(archive.infolist(), key=lambda item: item.filename.encode()):
                   if info.is_dir():
@@ -372,20 +369,20 @@ jobs:
                   data = archive.read(info)
                   encoded = base64.b64encode(info.filename.encode('utf-8', 'surrogateescape')).decode('ascii')
                   entries.append({"path_b64": encoded, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "method": info.compress_type})
-                  if info.filename.startswith('lib/arm64-v8a/') and info.filename.endswith('.so'):
-                      target = native / f"native-{native_index}.so"
-                      target.write_bytes(data)
-                      native_index += 1
           pathlib.Path('build/unsigned/payload-manifest.json').write_text(json.dumps(entries, sort_keys=True, separators=(',', ':')) + '\n')
           PY
 
           llvm_readelf="$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          for so in build/unsigned/native/*.so; do
-            [[ -f "$so" ]] || continue
-            if "$llvm_readelf" -lW "$so" | awk '$1 == "LOAD" && $NF != "0x4000" {bad=1} END {exit bad}'; then :; else
-              echo "::error::native ELF LOAD alignment is not 16KiB: $so"; exit 1
-            fi
-           done
+          # Native compatibility rule: every PT_LOAD p_align >= 0x4000.
+          native_result=$(python3 scripts/native_compat.py \
+            --apk build/unsigned/unsigned.apk \
+            --llvm-readelf "$llvm_readelf" \
+            --output build/unsigned/native-compat.json)
+          native_report_sha=$(jq -r '.report_sha256' <<<"$native_result")
+          native_status=$(jq -r '.status' <<<"$native_result")
+          native_incompatible_count=$(jq -r '.incompatible_count' <<<"$native_result")
+          native_incompatible_paths=$(jq -c '.incompatible_paths' <<<"$native_result")
+          [[ "$native_report_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::invalid native compatibility report digest"; exit 1; }
            ./gradlew :app:dependencies --configuration releaseRuntimeClasspath --no-daemon > build/unsigned/releaseRuntimeClasspath.txt
            python3 scripts/u2_release.py canonical-runtime-dependencies \
              --file build/unsigned/releaseRuntimeClasspath.txt \
@@ -400,11 +397,22 @@ jobs:
              '. + {unsigned_sha256:$unsigned, payload_manifest_sha256:$payload, runtime_components_sha256:$dependencies}' \
              build/release-identity.json > build/release-identity.json.tmp
            mv build/release-identity.json.tmp build/release-identity.json
+           jq --arg native_report "$native_report_sha" \
+             --arg native_status "$native_status" \
+             --arg native_count "$native_incompatible_count" \
+             --argjson native_paths "$native_incompatible_paths" \
+             '. + {native_compat_report_sha256:$native_report, native_compat_status:$native_status, native_incompatible_count:($native_count|tonumber), native_incompatible_paths:$native_paths}' \
+             build/release-identity.json > build/release-identity.json.tmp
+           mv build/release-identity.json.tmp build/release-identity.json
            printf '%s\n' \
              "unsigned_sha256=$unsigned_sha256" \
              "payload_manifest_sha256=$payload_sha256" \
              "runtime_components_sha256=$dependency_sha256" \
              "raw_dependency_report_sha256=$raw_dependency_sha256" \
+             "native_compat_report_sha256=$native_report_sha" \
+             "native_compat_status=$native_status" \
+             "native_incompatible_count=$native_incompatible_count" \
+             "native_incompatible_paths=$native_incompatible_paths" \
              "package=$package_name" \
             "version_name=$apk_name" \
             "version_code=$apk_code" >> build/release-identity.txt
@@ -418,6 +426,7 @@ jobs:
           path: |
              build/unsigned/unsigned.apk
              build/unsigned/payload-manifest.json
+             build/unsigned/native-compat.json
              build/unsigned/releaseRuntimeClasspath.txt
              build/unsigned/releaseRuntimeClasspath.json
              build/release-identity.txt
@@ -600,16 +609,27 @@ jobs:
            test -f "$unsigned"; test -f "$signed"
            builder_identity="$RUNNER_TEMP/unsigned/release-identity.json"
            test -f "$builder_identity"
-           jq -e '.schema == "tvbox-release-identity-v2" and (.legacy_manifest_sha256 | test("^[0-9a-f]{64}$")) and (.runtime_components_sha256 | test("^[0-9a-f]{64}$")) and .gradle_version == "8.7" and .gradle_distribution_sha256 == "544c35d6bd849ae8a5ed0bcea39ba677dc40f49df7d1835561582da2009b961d" and .wrapper_jar_sha256 == "cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8" and .agp_version == "8.5.2" and .apksigner_version == "34.0.0" and .zipalign_version == "35.0.0" and .ndk_version == "28.2.13676358" and (.builder_java_version | contains("17.0.20"))' "$builder_identity" >/dev/null
+           jq -e '.schema == "tvbox-release-identity-v2" and (.legacy_manifest_sha256 | test("^[0-9a-f]{64}$")) and (.runtime_components_sha256 | test("^[0-9a-f]{64}$")) and (.native_compat_report_sha256 | test("^[0-9a-f]{64}$")) and .native_compat_status == "known-debt" and .native_incompatible_count == 3 and .native_incompatible_paths == ["lib/arm64-v8a/libconscrypt_jni.so", "lib/arm64-v8a/libquickjs-android-wrapper.so", "lib/arm64-v8a/librtmp-jni.so"] and .gradle_version == "8.7" and .gradle_distribution_sha256 == "544c35d6bd849ae8a5ed0bcea39ba677dc40f49df7d1835561582da2009b961d" and .wrapper_jar_sha256 == "cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8" and .agp_version == "8.5.2" and .apksigner_version == "34.0.0" and .zipalign_version == "35.0.0" and .ndk_version == "28.2.13676358" and (.builder_java_version | contains("17.0.20"))' "$builder_identity" >/dev/null
            builder_unsigned=$(sed -n 's/^unsigned_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
            builder_payload=$(sed -n 's/^payload_manifest_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
            builder_dependencies=$(sed -n 's/^runtime_components_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
            builder_manifest=$(sed -n 's/^legacy_manifest_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
+           builder_native=$(sed -n 's/^native_compat_report_sha256=//p' "$RUNNER_TEMP/unsigned/release-identity.txt")
            actual_unsigned=$(sha256sum "$unsigned" | awk '{print $1}')
            actual_signed=$(sha256sum "$signed" | awk '{print $1}')
            [[ "$builder_unsigned" == "$actual_unsigned" ]] || { echo "::error::unsigned artifact digest changed"; exit 1; }
            [[ "$builder_payload" == "$(sha256sum "$RUNNER_TEMP/unsigned/payload-manifest.json" | awk '{print $1}')" ]] || { echo "::error::payload manifest changed"; exit 1; }
            [[ "$builder_dependencies" == "$(sha256sum "$RUNNER_TEMP/unsigned/releaseRuntimeClasspath.json" | awk '{print $1}')" ]] || { echo "::error::canonical dependency report changed"; exit 1; }
+           native_report="$RUNNER_TEMP/unsigned/native-compat.json"
+           test -f "$native_report"
+           [[ "$builder_native" == "$(sha256sum "$native_report" | awk '{print $1}')" ]] || { echo "::error::native compatibility report changed"; exit 1; }
+           llvm_readelf="$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+           native_recomputed=$(python3 scripts/native_compat.py \
+             --apk "$unsigned" \
+             --llvm-readelf "$llvm_readelf" \
+             --output "$RUNNER_TEMP/recomputed-native-compat.json")
+           [[ "$builder_native" == "$(jq -r '.report_sha256' <<<"$native_recomputed")" ]] || { echo "::error::native compatibility recomputation mismatch"; exit 1; }
+           cmp -s "$native_report" "$RUNNER_TEMP/recomputed-native-compat.json" || { echo "::error::native compatibility report bytes differ"; exit 1; }
            manifest_file="$RUNNER_TEMP/unsigned/gradle/legacy-dependencies.lock.json"
            test -f "$manifest_file"
            [[ "$builder_manifest" == "$(sha256sum "$manifest_file" | awk '{print $1}')" ]] || { echo "::error::legacy manifest changed"; exit 1; }
@@ -640,6 +660,9 @@ jobs:
              "signer_sha256=$signer_sha" \
              "legacy_manifest_sha256=$builder_manifest" \
              "runtime_components_sha256=$builder_dependencies" \
+             "native_compat_report_sha256=$builder_native" \
+             "native_compat_status=$(jq -r '.native_compat_status' "$builder_identity")" \
+             "native_incompatible_count=$(jq -r '.native_incompatible_count' "$builder_identity")" \
              "signer_java_version=$signer_java_version" \
              "verifier_image_os=$verifier_image_os" \
              "verifier_image_version=$verifier_image_version" \
@@ -648,6 +671,7 @@ jobs:
             "unsigned_artifact_id=$UNSIGNED_ARTIFACT_ID" \
             "signed_artifact_id=$SIGNED_ARTIFACT_ID" > "$RUNNER_TEMP/verified-release-identity.txt"
           cp "$RUNNER_TEMP/verified-release-identity.txt" verified-release-identity.txt
+          cp "$native_report" verified-native-compat.json
           echo "signed_sha256=$actual_signed" >> "$GITHUB_OUTPUT"
           echo "signer_sha256=$signer_sha" >> "$GITHUB_OUTPUT"
 
@@ -693,6 +717,7 @@ jobs:
           path: |
             verified-release-identity.txt
             release-identity-predicate.json
+            verified-native-compat.json
           if-no-files-found: error
           retention-days: 90
           overwrite: false

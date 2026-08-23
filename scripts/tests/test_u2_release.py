@@ -377,6 +377,17 @@ class U2ReleaseContractTests(unittest.TestCase):
         identity = workflow[workflow.index("      - id: identity"):workflow.index("      - id: build")]
         self.assertIn("mkdir -p build", identity)
 
+    def test_rc_native_compatibility_uses_canonical_report_and_attested_debt(self):
+        workflow = RC_WORKFLOW.read_text()
+        self.assertIn("scripts/native_compat.py", workflow)
+        self.assertIn("native-compat.json", workflow)
+        self.assertIn("native_compat_report_sha256", workflow)
+        self.assertIn("native_compat_status", workflow)
+        self.assertIn("p_align >= 0x4000", workflow)
+        self.assertIn("libconscrypt_jni.so", workflow)
+        self.assertIn("libquickjs-android-wrapper.so", workflow)
+        self.assertIn("librtmp-jni.so", workflow)
+
     def test_gradle_wrapper_is_pinned_to_official_8_7_artifacts(self):
         properties = (ROOT / "gradle/wrapper/gradle-wrapper.properties").read_text()
         self.assertIn("gradle-8.7-bin.zip", properties)
