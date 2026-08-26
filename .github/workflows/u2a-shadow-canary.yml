@@ -107,9 +107,10 @@ jobs:
           test -n "$pr_number"
           echo "PR #$pr_number"
           for i in $(seq 1 90); do
-            state=$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json state --jq .state)
-            merged=$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json merged --jq .merged)
-            if [[ "$merged" == "true" ]]; then break; fi
+            pr_json=$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json state,mergedAt --jq '{state, mergedAt}')
+            state=$(jq -r '.state' <<<"$pr_json")
+            merged_at=$(jq -r '.mergedAt // empty' <<<"$pr_json")
+            if [[ "$state" == "MERGED" || -n "$merged_at" ]]; then break; fi
             if [[ "$i" -eq 90 ]]; then
               echo "::error::shadow PR not merged within timeout"
               exit 1
@@ -117,7 +118,7 @@ jobs:
             sleep 20
           done
           pr_json=$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" \
-            --json state,merged,mergedBy,mergeCommit,baseRefName,headRefName,headRepository,author,url)
+            --json state,mergedBy,mergeCommit,baseRefName,headRefName,headRepository,author,url)
           merged_by=$(jq -r '.mergedBy.login' <<<"$pr_json")
           merge_sha=$(jq -r '.mergeCommit.oid' <<<"$pr_json")
           author=$(jq -r '.author.login' <<<"$pr_json")
