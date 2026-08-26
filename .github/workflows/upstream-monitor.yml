@@ -921,7 +921,10 @@ jobs:
              --repo "$GITHUB_REPOSITORY" \
              --marker "$comment_marker" \
              --state all)
-           existing=$(jq -r '.number // empty' <<<"${existing_issue:-{}}")
+           if [[ -z "${existing_issue:-}" ]]; then
+             existing_issue='null'
+           fi
+           existing=$(jq -r '.number // empty' <<<"$existing_issue")
            if [[ -n "$existing" ]]; then
              python3 "$trusted_helper" issue-comment \
                --repo "$GITHUB_REPOSITORY" \

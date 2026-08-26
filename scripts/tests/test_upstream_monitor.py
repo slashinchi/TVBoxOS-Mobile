@@ -194,13 +194,13 @@ class U1aContractTests(unittest.TestCase):
         build_workflow = BUILD_WORKFLOW.read_text()
         rc_workflow = (ROOT / ".github/workflows/rc-pipeline.yml").read_text()
         signed_start = rc_workflow.index("  sign_exact:")
-        verify_start = rc_workflow.index("  verify_and_attest:")
+        verify_start = rc_workflow.index("  verify_signed:")
         signed_block = rc_workflow[signed_start:verify_start]
-        verifier_block = rc_workflow[verify_start:]
+        attestor_block = rc_workflow[rc_workflow.index("  attest_signed:"):]
 
         self.assertIn("uses: ./.github/workflows/rc-pipeline.yml", build_workflow)
         self.assertIn("environment: release-signing", signed_block)
-        self.assertNotIn("environment: release-signing", verifier_block)
+        self.assertNotIn("environment: release-signing", attestor_block)
 
     def test_risk_classification_stays_narrow(self):
         self.assertEqual(classify_paths(["README.md", "docs/MIGRATION.md"]), "docs-only")
@@ -588,6 +588,14 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn('"$trusted_helper" issue-comment', workflow)
         self.assertIn('"$trusted_helper" issue-close', workflow)
         self.assertIn('"$trusted_helper" find-issue', workflow)
+
+    def test_notify_json_fallback_uses_valid_json_default(self):
+        workflow = WORKFLOW.read_text()
+        notify = workflow[workflow.index("  notify:"):workflow.index("  recover:")]
+        self.assertIn('existing_issue=$(python3 "$trusted_helper" find-issue', notify)
+        self.assertNotIn('<<<"${existing_issue:-{}}"', notify)
+        self.assertIn("existing_issue='null'", notify)
+        self.assertIn("jq -r '.number // empty' <<<\"$existing_issue\"", notify)
 
     def test_no_actionable_updates_have_information_notification_path(self):
         workflow = WORKFLOW.read_text()

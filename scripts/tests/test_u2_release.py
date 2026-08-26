@@ -287,24 +287,44 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("workflow_call:", workflow)
         self.assertNotIn("workflow_dispatch:", workflow)
         self.assertIn("build_unsigned:", workflow)
+        self.assertIn("prepare_sign_input:", workflow)
         self.assertIn("sign_exact:", workflow)
-        self.assertIn("verify_and_attest:", workflow)
+        self.assertIn("verify_signed:", workflow)
+        self.assertIn("attest_signed:", workflow)
         self.assertIn("environment: release-signing", workflow)
-        builder = workflow[workflow.index("  build_unsigned:"):workflow.index("  sign_exact:")]
-        signer = workflow[workflow.index("  sign_exact:"):workflow.index("  verify_and_attest:")]
-        verifier = workflow[workflow.index("  verify_and_attest:"):]
+        builder = workflow[workflow.index("  build_unsigned:"):workflow.index("  prepare_sign_input:")]
+        preflight = workflow[workflow.index("  prepare_sign_input:"):workflow.index("  sign_exact:")]
+        signer = workflow[workflow.index("  sign_exact:"):workflow.index("  verify_signed:")]
+        verifier = workflow[workflow.index("  verify_signed:"):workflow.index("  attest_signed:")]
+        attestor = workflow[workflow.index("  attest_signed:"):]
         self.assertNotIn("release-signing", builder)
         self.assertNotIn("secrets.", builder)
         self.assertNotIn("actions/checkout", signer)
         self.assertNotIn("./gradlew", signer)
         self.assertNotIn("id-token: write", signer)
         self.assertNotIn("attestations: write", signer)
-        self.assertLess(signer.index("Validate transport bundle before secret window"), signer.index("Sign exact APK"))
+        self.assertNotIn("release-signing", preflight)
+        self.assertNotIn("secrets.", preflight)
+        self.assertNotIn("id-token: write", preflight)
+        self.assertNotIn("attestations: write", preflight)
+        self.assertNotIn("sudo apt-get", preflight)
+        self.assertNotIn("setup-java", preflight)
+        self.assertNotIn("ANDROID_HOME", preflight)
+        self.assertLess(signer.index("Validate sign input and rehash actual APK before secret window"), signer.index("Sign exact APK with the only secret-bearing step"))
+        self.assertIn("sha256sum \"$root/unsigned.apk\"", signer)
         self.assertIn("TVBOX_KEY_PASSWORD: ${{ secrets.TVBOX_KEY_PASSWORD }}", signer)
         self.assertNotIn("release-signing", verifier)
         self.assertNotIn("secrets.", verifier)
-        self.assertIn("id-token: write", verifier)
-        self.assertIn("attestations: write", verifier)
+        self.assertNotIn("id-token: write", verifier)
+        self.assertNotIn("attestations: write", verifier)
+        self.assertNotIn("actions/checkout", attestor)
+        self.assertNotIn("sudo apt-get", attestor)
+        self.assertNotIn("./gradlew", attestor)
+        self.assertNotIn("secrets.", attestor)
+        self.assertNotIn("release-signing", attestor)
+        self.assertIn("id-token: write", attestor)
+        self.assertIn("attestations: write", attestor)
+        self.assertIn("verify_signed.outputs.signed_sha256", attestor)
 
     def test_manual_build_wrapper_rejects_arbitrary_target_and_calls_rc_pipeline(self):
         workflow = BUILD_WORKFLOW.read_text()
@@ -360,22 +380,60 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("apksigner_version", workflow)
         self.assertIn("zipalign_version", workflow)
         self.assertIn("tvbox-release-identity/v2", workflow)
-        signer = workflow[workflow.index("  sign_exact:"):workflow.index("  verify_and_attest:")]
+        signer = workflow[workflow.index("  sign_exact:"):workflow.index("  verify_signed:")]
         self.assertIn("actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961", signer)
         self.assertIn("java-version: '17.0.20+8'", signer)
         self.assertNotIn("cache:", signer)
 
     def test_rc_builder_uses_a_fresh_cache_disabled_gradle_home(self):
         workflow = RC_WORKFLOW.read_text()
-        builder = workflow[workflow.index("  build_unsigned:"):workflow.index("  sign_exact:")]
+        builder = workflow[workflow.index("  build_unsigned:"):workflow.index("  prepare_sign_input:")]
         self.assertIn('export GRADLE_USER_HOME="$RUNNER_TEMP/tvbox-gradle"', builder)
         self.assertNotIn("cache: gradle", builder)
         self.assertNotIn("setup-gradle", builder)
 
+    def test_rc_artifact_contracts_are_flat_and_exact(self):
+        workflow = RC_WORKFLOW.read_text()
+        self.assertIn("tvbox-u2-build-evidence-", workflow)
+        self.assertIn("tvbox-u2-sign-input-", workflow)
+        self.assertIn("tvbox-u2-signed-output-", workflow)
+        self.assertIn("tvbox-u2-attest-input-", workflow)
+        builder = workflow[workflow.index("  build_unsigned:"):workflow.index("  prepare_sign_input:")]
+        self.assertIn("build/evidence", builder)
+        self.assertIn("legacy-dependencies.lock.json", builder)
+        self.assertIn("build-identity.json", builder)
+        self.assertNotIn("tvbox-u2-unsigned-", builder)
+        preflight = workflow[workflow.index("  prepare_sign_input:"):workflow.index("  sign_exact:")]
+        self.assertIn("expected_files=", preflight)
+        self.assertIn("sha256sum \"$root/unsigned.apk\"", preflight)
+        self.assertIn("actual_count", preflight)
+        self.assertIn("sign-input", preflight)
+        signer = workflow[workflow.index("  sign_exact:"):workflow.index("  verify_signed:")]
+        self.assertIn("signer-result.json", signer)
+        self.assertNotIn("builder-release-identity.txt", signer)
+        signer_upload = signer[signer.index("      - name: Upload exact signed output"):]
+        self.assertNotIn("signer-output.txt", signer_upload)
+        attestor = workflow[workflow.index("  attest_signed:"):]
+        self.assertIn("release-identity-predicate.json", attestor)
+        self.assertIn("attest-input", attestor)
+        self.assertNotIn("release-identity.txt", attestor)
+
+    def test_rc_attestor_has_no_checkout_or_scripts(self):
+        workflow = RC_WORKFLOW.read_text()
+        attestor = workflow[workflow.index("  attest_signed:"):]
+        self.assertNotIn("actions/checkout", attestor)
+        self.assertNotIn("scripts/native_compat.py", attestor)
+        self.assertNotIn("scripts/u2_release.py", attestor)
+        self.assertNotIn("sudo apt-get", attestor)
+        self.assertNotIn("apksigcopier", attestor)
+        self.assertIn("subject-path: ${{ runner.temp }}/signed-output/signed.apk", attestor)
+        self.assertIn("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4", attestor)
+        self.assertNotIn("attest-build-provenance@", attestor)
+
     def test_rc_identity_creates_evidence_directory_before_writing(self):
         workflow = RC_WORKFLOW.read_text()
         identity = workflow[workflow.index("      - id: identity"):workflow.index("      - id: build")]
-        self.assertIn("mkdir -p build", identity)
+        self.assertIn("mkdir -p build/evidence", identity)
 
     def test_rc_native_compatibility_uses_canonical_report_and_attested_debt(self):
         workflow = RC_WORKFLOW.read_text()
@@ -387,6 +445,9 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("libconscrypt_jni.so", workflow)
         self.assertIn("libquickjs-android-wrapper.so", workflow)
         self.assertIn("librtmp-jni.so", workflow)
+        verifier = workflow[workflow.index("  verify_signed:"):workflow.index("  attest_signed:")]
+        self.assertIn('.native_compat_status == "clean" and .native_incompatible_count == 0', verifier)
+        self.assertIn('"known-debt"', verifier)
 
     def test_gradle_wrapper_is_pinned_to_official_8_7_artifacts(self):
         properties = (ROOT / "gradle/wrapper/gradle-wrapper.properties").read_text()

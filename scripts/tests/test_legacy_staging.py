@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from scripts.legacy_staging import (
     validate_pom_bytes,
     verify_staged_directory,
 )
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).parents[2]
@@ -121,10 +123,41 @@ class LegacyStagingContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "maven"
-            stage_manifest(manifest, root, opener=opener)
-            verify_staged_directory(manifest, root)
-            for path in root.rglob("*"):
-                self.assertEqual(path.stat().st_mode & 0o222, 0, str(path))
+            with patch.dict(os.environ, {"RUNNER_TEMP": tmp}, clear=False):
+                stage_manifest(manifest, root, opener=opener)
+                verify_staged_directory(manifest, root)
+                for path in root.rglob("*"):
+                    self.assertEqual(path.stat().st_mode & 0o222, 0, str(path))
+
+    def test_stage_rejects_output_outside_runner_temp(self):
+        manifest, payloads = synthetic_manifest_and_payloads()
+
+        class Response(io.BytesIO):
+            def __init__(self, data, url):
+                super().__init__(data)
+                self.url = url
+
+            def geturl(self):
+                return self.url
+
+        def opener(request, timeout):
+            filename = request.full_url.rsplit("/", 1)[-1]
+            module = next(
+                component["module"]
+                for component in manifest["components"]
+                if filename in {component["pom"], component["binary"]}
+            )
+            payload = payloads[module][0 if filename.endswith(".pom") else 1]
+            return Response(payload, request.full_url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner_temp = Path(tmp) / "runner-temp"
+            runner_temp.mkdir()
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}, clear=False):
+                with self.assertRaisesRegex(ValueError, "must be under RUNNER_TEMP"):
+                    stage_manifest(manifest, outside / "maven", opener=opener)
 
 
 if __name__ == "__main__":
