@@ -76,10 +76,11 @@ jobs:
           - 临时验证用；由 slashinchi 执行一次普通 Merge commit 后关闭并清理 refs。
           EOF
           )
-          pr_url=$(gh pr create --repo "$GITHUB_REPOSITORY" \
+          gh pr create --repo "$GITHUB_REPOSITORY" \
             --base "$BASE_REF" --head "$HEAD_REF" \
             --title "chore: U2a shadow merge canary ${RUN_ID}" \
-            --body "$body" --json url --jq .url)
+            --body "$body"
+          pr_url=$(gh pr view --repo "$GITHUB_REPOSITORY" --head "$HEAD_REF" --json url --jq .url)
           echo "pr_url=$pr_url"
 
   observe_merge:
