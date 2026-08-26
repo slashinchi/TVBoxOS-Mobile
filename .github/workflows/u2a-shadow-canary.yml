@@ -80,7 +80,7 @@ jobs:
             --base "$BASE_REF" --head "$HEAD_REF" \
             --title "chore: U2a shadow merge canary ${RUN_ID}" \
             --body "$body"
-          pr_url=$(gh pr view --repo "$GITHUB_REPOSITORY" --head "$HEAD_REF" --json url --jq .url)
+          pr_url=$(gh api "repos/$GITHUB_REPOSITORY/pulls?head=$HEAD_REF&state=open" --jq '.[0].html_url')
           echo "pr_url=$pr_url"
 
   observe_merge:
