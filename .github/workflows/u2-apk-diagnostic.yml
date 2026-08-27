@@ -1,0 +1,399 @@
+name: Disposable U2 APK Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  DIAGNOSTIC_RUN_ID: '33027782081'
+  BUILD_ARTIFACT_ID: '9629119832'
+  SIGN_INPUT_ARTIFACT_ID: '9629122593'
+  SIGNED_OUTPUT_ARTIFACT_ID: '9629228757'
+  RELEASE_SHA: '0b7a6e5c9c57820c8ab2403873acbf98632cd3e3'
+  BUILD_ARTIFACT_NAME: 'tvbox-u2-build-evidence-0b7a6e5c9c57820c8ab2403873acbf98632cd3e3-1'
+  SIGN_INPUT_ARTIFACT_NAME: 'tvbox-u2-sign-input-0b7a6e5c9c57820c8ab2403873acbf98632cd3e3-1'
+  SIGNED_OUTPUT_ARTIFACT_NAME: 'tvbox-u2-signed-output-0b7a6e5c9c57820c8ab2403873acbf98632cd3e3-1'
+
+jobs:
+  diagnostic:
+    name: Diagnose APK signature reconstruction
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Set up diagnostic Temurin 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: '17.0.20+8'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          cmdline-tools-version: '12266719'
+
+      - name: Install pinned diagnostic tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y apksigcopier=1.1.1-1 unzip
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "build-tools;35.0.0"
+          mkdir -p diagnostic/metadata diagnostic/logs diagnostic/inputs diagnostic/reconstructed diagnostic/extracted
+
+      - name: Validate immutable source artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          check_artifact() {
+            local artifact_id="$1"
+            local expected_name="$2"
+            local output="$3"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" > "$output"
+            test "$(jq -r '.id' "$output")" = "$artifact_id"
+            test "$(jq -r '.name' "$output")" = "$expected_name"
+            test "$(jq -r '.workflow_run.id' "$output")" = "$DIAGNOSTIC_RUN_ID"
+            test "$(jq -r '.expired' "$output")" = "false"
+          }
+          check_artifact "$BUILD_ARTIFACT_ID" "$BUILD_ARTIFACT_NAME" diagnostic/metadata/build-artifact.json
+          check_artifact "$SIGN_INPUT_ARTIFACT_ID" "$SIGN_INPUT_ARTIFACT_NAME" diagnostic/metadata/sign-input-artifact.json
+          check_artifact "$SIGNED_OUTPUT_ARTIFACT_ID" "$SIGNED_OUTPUT_ARTIFACT_NAME" diagnostic/metadata/signed-output-artifact.json
+
+      - name: Download immutable source artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ env.BUILD_ARTIFACT_ID }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.DIAGNOSTIC_RUN_ID }}
+          path: diagnostic/inputs/build-evidence
+
+      - name: Download immutable sign input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ env.SIGN_INPUT_ARTIFACT_ID }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.DIAGNOSTIC_RUN_ID }}
+          path: diagnostic/inputs/sign-input
+
+      - name: Download immutable signed output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ env.SIGNED_OUTPUT_ARTIFACT_ID }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.DIAGNOSTIC_RUN_ID }}
+          path: diagnostic/inputs/signed-output
+
+      - name: Validate exact downloaded roots
+        run: |
+          set -euo pipefail
+          validate_root() {
+            local root="$1"
+            shift
+            local actual expected
+            test -d "$root"
+            actual=$(find "$root" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+            expected=$(printf '%s\n' "$@" | LC_ALL=C sort)
+            test "$actual" = "$expected" || {
+              printf 'unexpected root set for %s:\n%s\n' "$root" "$actual"
+              exit 1
+            }
+            test -z "$(find "$root" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+            for member in "$@"; do
+              test -f "$root/$member"
+              test ! -L "$root/$member"
+            done
+          }
+          validate_root diagnostic/inputs/build-evidence \
+            unsigned.apk build-identity.json payload-manifest.json native-compat.json \
+            runtime-components.json legacy-dependencies.lock.json
+          validate_root diagnostic/inputs/sign-input unsigned.apk build-identity.json
+          validate_root diagnostic/inputs/signed-output signed.apk signer-result.json
+          test "$(sha256sum diagnostic/inputs/build-evidence/unsigned.apk | awk '{print $1}')" = \
+            "$(jq -r '.unsigned_sha256' diagnostic/inputs/build-evidence/build-identity.json)"
+          test "$(sha256sum diagnostic/inputs/sign-input/unsigned.apk | awk '{print $1}')" = \
+            "$(sha256sum diagnostic/inputs/build-evidence/unsigned.apk | awk '{print $1}')"
+          cp -- diagnostic/inputs/signed-output/signed.apk diagnostic/original-signed.apk
+          cp -- diagnostic/inputs/build-evidence/unsigned.apk diagnostic/original-unsigned.apk
+
+      - name: Record measured tool identities
+        run: |
+          set -euo pipefail
+          apksigner="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          zipalign="$ANDROID_HOME/build-tools/35.0.0/zipalign"
+          test -x "$apksigner"
+          test -x "$zipalign"
+          {
+            printf 'runner_image_os=%s\n' "${ImageOS:-unknown}"
+            printf 'runner_image_version=%s\n' "${ImageVersion:-unknown}"
+            printf 'java_version='
+            java -version 2>&1 | tr '\n' ' '
+            printf '\n'
+            printf 'apksigner_path=%s\n' "$apksigner"
+            printf 'apksigner_version='
+            "$apksigner" version 2>&1 | tr '\n' ' '
+            printf '\n'
+            printf 'zipalign_path=%s\n' "$zipalign"
+            printf 'apksigcopier_path=%s\n' "$(command -v apksigcopier)"
+            printf 'apksigcopier_package_version=%s\n' "$(dpkg-query -W -f='${Version}' apksigcopier)"
+            printf 'python_version=%s\n' "$(python3 --version 2>&1)"
+          } > diagnostic/tool-identity.txt
+          python3 - <<'PY' >> diagnostic/tool-identity.txt
+          import importlib.metadata
+          import importlib.util
+          import pathlib
+
+          spec = importlib.util.find_spec("apksigcopier")
+          print(f"apksigcopier_module={spec.origin}")
+          print(f"apksigcopier_python_version={importlib.metadata.version('apksigcopier')}")
+          PY
+          sha256sum \
+            "$apksigner" \
+            "$zipalign" \
+            "$(command -v apksigcopier)" \
+            "$(command -v python3)" \
+            "$(python3 -c 'import apksigcopier; print(apksigcopier.__file__)')" \
+            > diagnostic/tool-sha256.txt
+          "$apksigner" version > diagnostic/logs/apksigner-version.log 2>&1
+          "$zipalign" -h > diagnostic/logs/zipalign-help.log 2>&1 || true
+          apksigcopier --help > diagnostic/logs/apksigcopier-help.log 2>&1
+
+      - name: Verify original signed APK
+        run: |
+          set -u
+          export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
+          apksigner verify --verbose --print-certs diagnostic/original-signed.apk \
+            > diagnostic/logs/original-apksigner-verify.log 2>&1
+          printf 'original_apksigner_verify_status=%s\n' "$?" >> diagnostic/command-status.env
+
+      - name: Extract original signature metadata
+        run: |
+          set -u
+          apksigcopier extract diagnostic/original-signed.apk diagnostic/extracted \
+            > diagnostic/logs/apksigcopier-extract.log 2>&1
+          printf 'apksigcopier_extract_status=%s\n' "$?" >> diagnostic/command-status.env
+          find diagnostic/extracted -maxdepth 1 -type f -print | LC_ALL=C sort \
+            > diagnostic/logs/extracted-files.txt
+
+      - name: Copy signature metadata onto unsigned APK
+        run: |
+          set -u
+          apksigcopier copy diagnostic/original-signed.apk diagnostic/original-unsigned.apk \
+            diagnostic/reconstructed/copied.apk > diagnostic/logs/apksigcopier-copy.log 2>&1
+          printf 'apksigcopier_copy_status=%s\n' "$?" >> diagnostic/command-status.env
+          if test -f diagnostic/reconstructed/copied.apk; then
+            sha256sum diagnostic/reconstructed/copied.apk >> diagnostic/tool-sha256.txt
+          fi
+
+      - name: Re-run compare command from failed verifier
+        run: |
+          set -u
+          export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
+          apksigcopier compare --unsigned diagnostic/original-signed.apk diagnostic/original-unsigned.apk \
+            > diagnostic/logs/apksigcopier-compare.log 2>&1
+          printf 'apksigcopier_compare_status=%s\n' "$?" >> diagnostic/command-status.env
+
+      - name: Compare ZIP records and APK Signing Block geometry
+        run: |
+          set -u
+          for apk in diagnostic/original-signed.apk diagnostic/reconstructed/copied.apk; do
+            if test -f "$apk"; then
+              label=$(basename "$apk" .apk)
+              unzip -t "$apk" > "diagnostic/logs/${label}-unzip-test.log" 2>&1
+              zipinfo -v "$apk" > "diagnostic/logs/${label}-zipinfo.log" 2>&1
+            fi
+          done
+          python3 - diagnostic/original-signed.apk diagnostic/reconstructed/copied.apk \
+            > diagnostic/zip-comparison.json <<'PY'
+          import base64
+          import hashlib
+          import json
+          import pathlib
+          import struct
+          import sys
+          import zipfile
+
+          EOCD = b"PK\x05\x06"
+          CENTRAL = b"PK\x01\x02"
+          LOCAL = b"PK\x03\x04"
+          APK_MAGIC = b"APK Sig Block 42"
+
+          def digest(value):
+              return hashlib.sha256(value).hexdigest()
+
+          def b64(value):
+              return base64.b64encode(value).decode("ascii")
+
+          def central_directory(raw):
+              eocd = raw.rfind(EOCD)
+              if eocd < 0:
+                  raise ValueError("EOCD not found")
+              cd_size = struct.unpack_from("<I", raw, eocd + 12)[0]
+              cd_offset = struct.unpack_from("<I", raw, eocd + 16)[0]
+              cd = raw[cd_offset:cd_offset + cd_size]
+              offset = 0
+              while offset < len(cd):
+                  if cd[offset:offset + 4] != CENTRAL:
+                      raise ValueError(f"central directory record missing at {offset}")
+                  name_len, extra_len, comment_len = struct.unpack_from("<HHH", cd, offset + 28)
+                  length = 46 + name_len + extra_len + comment_len
+                  offset += length
+              if offset != len(cd):
+                  raise ValueError("central directory length mismatch")
+              return eocd, cd_offset, cd_size, cd
+
+          def signing_block(raw, cd_offset):
+              result = {
+                  "present": False,
+                  "central_directory_offset": cd_offset,
+              }
+              end = cd_offset - 24
+              if end < 0 or raw[cd_offset - 16:cd_offset] != APK_MAGIC:
+                  return result
+              end_size = struct.unpack_from("<Q", raw, end)[0]
+              start = cd_offset - (end_size + 8)
+              if start < 0 or raw[start:start + 8] != struct.pack("<Q", end_size):
+                  result["error"] = "APK Signing Block size mismatch"
+                  return result
+              block = raw[start:cd_offset]
+              result.update({
+                  "present": True,
+                  "start": start,
+                  "end": cd_offset,
+                  "size_field": end_size,
+                  "total_size": len(block),
+                  "sha256": digest(block),
+              })
+              return result
+
+          def records(path):
+              raw = pathlib.Path(path).read_bytes()
+              eocd, cd_offset, cd_size, cd = central_directory(raw)
+              with zipfile.ZipFile(path) as archive:
+                  infos = archive.infolist()
+              entries = {}
+              name_counts = {}
+              for info in sorted(infos, key=lambda item: item.header_offset):
+                  name = info.filename.encode("utf-8", "surrogateescape")
+                  ordinal = name_counts.get(name, 0)
+                  name_counts[name] = ordinal + 1
+                  key = f"{b64(name)}#{ordinal}"
+                  local = info.header_offset
+                  if raw[local:local + 4] != LOCAL:
+                      raise ValueError(f"local header missing for {key}")
+                  name_len, extra_len = struct.unpack_from("<HH", raw, local + 26)
+                  data_start = local + 30 + name_len + extra_len
+                  compressed = raw[data_start:data_start + info.compress_size]
+                  next_offsets = [item.header_offset for item in infos if item.header_offset > local]
+                  next_offset = min(next_offsets, default=cd_offset)
+                  padding = raw[data_start + info.compress_size:next_offset]
+                  entries[key] = {
+                      "filename_b64": b64(name),
+                      "compress_type": info.compress_type,
+                      "flag_bits": info.flag_bits,
+                      "date_time": list(info.date_time),
+                      "crc": info.CRC,
+                      "compress_size": info.compress_size,
+                      "file_size": info.file_size,
+                      "create_system": info.create_system,
+                      "create_version": info.create_version,
+                      "extract_version": info.extract_version,
+                      "external_attr": info.external_attr,
+                      "internal_attr": info.internal_attr,
+                      "extra_b64": b64(info.extra),
+                      "header_offset": local,
+                      "compressed_bytes_sha256": digest(compressed),
+                      "_compressed_bytes": compressed,
+                      "alignment_padding_length": len(padding),
+                      "alignment_padding_sha256": digest(padding),
+                      "_alignment_padding": padding,
+                  }
+              return {
+                  "sha256": digest(raw),
+                  "size": len(raw),
+                  "eocd_offset": eocd,
+                  "central_directory_offset": cd_offset,
+                  "central_directory_size": cd_size,
+                  "central_directory_sha256": digest(cd),
+                  "_central_directory": cd,
+                  "signing_block": signing_block(raw, cd_offset),
+                  "entries": entries,
+              }
+
+          def public_image(image):
+              return {
+                  key: ({
+                      entry_key: entry_value
+                      for entry_key, entry_value in entry.items()
+                      if not entry_key.startswith("_")
+                  } if key == "entries" else value)
+                  for key, value in image.items()
+                  if not key.startswith("_")
+              }
+
+          original = records(sys.argv[1])
+          reconstructed_path = pathlib.Path(sys.argv[2])
+          result = {
+              "schema": "tvbox-apk-diagnostic-v1",
+              "original": public_image(original),
+              "reconstructed": None,
+              "comparison": {
+                  "zip_records_equal": False,
+                  "compressed_bytes_equal": False,
+                  "central_directory_equal": False,
+                  "alignment_padding_equal": False,
+                  "signing_block_geometry_equal": False,
+              },
+          }
+          if reconstructed_path.is_file():
+              reconstructed = records(reconstructed_path)
+              result["reconstructed"] = public_image(reconstructed)
+              original_entries = original["entries"]
+              reconstructed_entries = reconstructed["entries"]
+              result["comparison"].update({
+                  "zip_records_equal": original_entries == reconstructed_entries,
+                  "compressed_bytes_equal": (
+                      set(original_entries) == set(reconstructed_entries)
+                      and all(
+                          original_entries[key]["_compressed_bytes"] == reconstructed_entries[key]["_compressed_bytes"]
+                          for key in original_entries
+                      )
+                  ),
+                  "central_directory_equal": (
+                      original["_central_directory"] == reconstructed["_central_directory"]
+                  ),
+                  "alignment_padding_equal": (
+                      set(original_entries) == set(reconstructed_entries)
+                      and all(
+                          original_entries[key]["_alignment_padding"] == reconstructed_entries[key]["_alignment_padding"]
+                          for key in original_entries
+                      )
+                  ),
+                  "signing_block_geometry_equal": (
+                      original["signing_block"] == reconstructed["signing_block"]
+                  ),
+              })
+          json.dump(result, sys.stdout, sort_keys=True, indent=2)
+          print()
+          PY
+          printf 'zip_comparison_status=%s\n' "$?" >> diagnostic/command-status.env
+
+      - name: Upload disposable diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tvbox-u2-apk-diagnostic-${{ env.DIAGNOSTIC_RUN_ID }}-${{ github.run_attempt }}
+          path: diagnostic
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          overwrite: false

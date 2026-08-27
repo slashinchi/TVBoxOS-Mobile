@@ -30,9 +30,28 @@ from scripts.u2_release import (
 ROOT = Path(__file__).parents[2]
 RC_WORKFLOW = ROOT / ".github/workflows/rc-pipeline.yml"
 BUILD_WORKFLOW = ROOT / ".github/workflows/build.yml"
+DIAGNOSTIC_WORKFLOW = ROOT / ".github/workflows/u2-apk-diagnostic.yml"
 
 
 class U2ReleaseContractTests(unittest.TestCase):
+    def test_apk_diagnostic_is_secret_free_and_reproducible(self):
+        self.assertTrue(DIAGNOSTIC_WORKFLOW.is_file())
+        workflow = DIAGNOSTIC_WORKFLOW.read_text()
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("runs-on: ubuntu-24.04", workflow)
+        self.assertIn("contents: read", workflow)
+        self.assertIn("actions: read", workflow)
+        self.assertNotIn("environment:", workflow)
+        self.assertIn("33027782081", workflow)
+        self.assertIn("artifact-ids:", workflow)
+        self.assertIn("apksigcopier extract", workflow)
+        self.assertIn("apksigcopier copy", workflow)
+        self.assertIn("apksigner verify", workflow)
+        self.assertIn("zipalign", workflow)
+        self.assertIn("sha256sum", workflow)
+        self.assertIn("central directory", workflow)
+        self.assertIn("APK Signing Block", workflow)
+
     def test_parse_app_version_requires_one_active_pair(self):
         text = "versionCode 236\nversionName '2.1.26'\n"
         self.assertEqual(parse_app_version(text), ("2.1.26", 236))
@@ -334,7 +353,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("github.event.inputs.release_sha", workflow)
         wrapper = workflow[workflow.index("  build-signed-rc:"):workflow.index("  publish-github-release:")]
         self.assertNotIn("actions/checkout", wrapper)
-        self.assertIn("environment: release-signing", wrapper)
+        self.assertNotIn("environment: release-signing", wrapper)
 
     def test_gradle_actions_path_is_https_only_and_jitpack_filtered(self):
         build = (ROOT / "build.gradle").read_text()
