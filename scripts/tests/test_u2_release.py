@@ -51,6 +51,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("sha256sum", workflow)
         self.assertIn("central directory", workflow)
         self.assertIn("APK Signing Block", workflow)
+        self.assertGreaterEqual(workflow.count("set +e"), 5)
 
     def test_parse_app_version_requires_one_active_pair(self):
         text = "versionCode 236\nversionName '2.1.26'\n"

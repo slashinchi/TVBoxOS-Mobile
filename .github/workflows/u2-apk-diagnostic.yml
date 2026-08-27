@@ -171,25 +171,34 @@ jobs:
         run: |
           set -u
           export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
+          set +e
           apksigner verify --verbose --print-certs diagnostic/original-signed.apk \
             > diagnostic/logs/original-apksigner-verify.log 2>&1
-          printf 'original_apksigner_verify_status=%s\n' "$?" >> diagnostic/command-status.env
+          status=$?
+          set -e
+          printf 'original_apksigner_verify_status=%s\n' "$status" >> diagnostic/command-status.env
 
       - name: Extract original signature metadata
         run: |
           set -u
+          set +e
           apksigcopier extract diagnostic/original-signed.apk diagnostic/extracted \
             > diagnostic/logs/apksigcopier-extract.log 2>&1
-          printf 'apksigcopier_extract_status=%s\n' "$?" >> diagnostic/command-status.env
+          status=$?
+          set -e
+          printf 'apksigcopier_extract_status=%s\n' "$status" >> diagnostic/command-status.env
           find diagnostic/extracted -maxdepth 1 -type f -print | LC_ALL=C sort \
             > diagnostic/logs/extracted-files.txt
 
       - name: Copy signature metadata onto unsigned APK
         run: |
           set -u
+          set +e
           apksigcopier copy diagnostic/original-signed.apk diagnostic/original-unsigned.apk \
             diagnostic/reconstructed/copied.apk > diagnostic/logs/apksigcopier-copy.log 2>&1
-          printf 'apksigcopier_copy_status=%s\n' "$?" >> diagnostic/command-status.env
+          status=$?
+          set -e
+          printf 'apksigcopier_copy_status=%s\n' "$status" >> diagnostic/command-status.env
           if test -f diagnostic/reconstructed/copied.apk; then
             sha256sum diagnostic/reconstructed/copied.apk >> diagnostic/tool-sha256.txt
           fi
@@ -198,13 +207,17 @@ jobs:
         run: |
           set -u
           export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
+          set +e
           apksigcopier compare --unsigned diagnostic/original-signed.apk diagnostic/original-unsigned.apk \
             > diagnostic/logs/apksigcopier-compare.log 2>&1
-          printf 'apksigcopier_compare_status=%s\n' "$?" >> diagnostic/command-status.env
+          status=$?
+          set -e
+          printf 'apksigcopier_compare_status=%s\n' "$status" >> diagnostic/command-status.env
 
       - name: Compare ZIP records and APK Signing Block geometry
         run: |
           set -u
+          set +e
           for apk in diagnostic/original-signed.apk diagnostic/reconstructed/copied.apk; do
             if test -f "$apk"; then
               label=$(basename "$apk" .apk)
@@ -385,7 +398,9 @@ jobs:
           json.dump(result, sys.stdout, sort_keys=True, indent=2)
           print()
           PY
-          printf 'zip_comparison_status=%s\n' "$?" >> diagnostic/command-status.env
+          status=$?
+          set -e
+          printf 'zip_comparison_status=%s\n' "$status" >> diagnostic/command-status.env
 
       - name: Upload disposable diagnostic evidence
         if: always()
