@@ -125,7 +125,7 @@ jobs:
           head_repo=$(jq -r '.headRepository.nameWithOwner' <<<"$pr_json")
           echo "merged_by=$merged_by author=$author head_repo=$head_repo merge_sha=$merge_sha"
           test "$merged_by" = "slashinchi" || { echo "::error::merged_by != slashinchi"; exit 1; }
-          test "$author" = "github-actions[bot]" || { echo "::error::author != github-actions[bot]"; exit 1; }
+          test "$author" = "github-actions[bot]" || test "$author" = "app/github-actions" || { echo "::error::author is not the bot: $author"; exit 1; }
           test "$head_repo" = "$GITHUB_REPOSITORY" || { echo "::error::head_repo mismatch"; exit 1; }
           git fetch origin "refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" "refs/heads/$HEAD_REF:refs/remotes/origin/$HEAD_REF"
           parents=$(git rev-list --parents -n 1 "$merge_sha")
