@@ -346,7 +346,7 @@ jobs:
               return {
                   key: ({
                       entry_key: entry_value
-                      for entry_key, entry_value in entry.items()
+                      for entry_key, entry_value in value.items()
                       if not entry_key.startswith("_")
                   } if key == "entries" else value)
                   for key, value in image.items()
@@ -407,7 +407,15 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: tvbox-u2-apk-diagnostic-${{ env.DIAGNOSTIC_RUN_ID }}-${{ github.run_attempt }}
-          path: diagnostic
+          path: |
+            diagnostic/metadata
+            diagnostic/logs
+            diagnostic/command-status.env
+            diagnostic/tool-identity.txt
+            diagnostic/tool-sha256.txt
+            diagnostic/zip-comparison.json
+            diagnostic/reconstructed
+            diagnostic/extracted
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
