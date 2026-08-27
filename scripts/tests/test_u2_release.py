@@ -30,6 +30,7 @@ from scripts.u2_release import (
 ROOT = Path(__file__).parents[2]
 RC_WORKFLOW = ROOT / ".github/workflows/rc-pipeline.yml"
 BUILD_WORKFLOW = ROOT / ".github/workflows/build.yml"
+CONTROL_WORKFLOW = ROOT / ".github/workflows/rc-control.yml"
 DIAGNOSTIC_WORKFLOW = ROOT / ".github/workflows/u2-apk-diagnostic.yml"
 
 
@@ -351,15 +352,41 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("attestations: write", attestor)
         self.assertIn("verify_signed.outputs.signed_sha256", attestor)
 
-    def test_manual_build_wrapper_rejects_arbitrary_target_and_calls_rc_pipeline(self):
-        workflow = BUILD_WORKFLOW.read_text()
-        self.assertIn("uses: ./.github/workflows/rc-pipeline.yml", workflow)
+    def test_rc_control_workflow_is_dispatch_gated_and_sha_locked(self):
+        self.assertTrue(CONTROL_WORKFLOW.is_file())
+        workflow = CONTROL_WORKFLOW.read_text()
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("workflow_call:", workflow)
+        self.assertIn("refs/tags/rc-control-v1", workflow)
         self.assertIn("github.actor == 'slashinchi'", workflow)
-        self.assertIn("github.ref == 'refs/heads/patched'", workflow)
-        self.assertNotIn("github.event.inputs.release_sha", workflow)
-        wrapper = workflow[workflow.index("  build-signed-rc:"):workflow.index("  publish-github-release:")]
-        self.assertNotIn("actions/checkout", wrapper)
-        self.assertNotIn("environment: release-signing", wrapper)
+        self.assertIn("refs/heads/patched", workflow)
+        self.assertNotIn("release-signing", workflow)
+        self.assertNotIn("${{ secrets", workflow)
+        self.assertIn("uses: ./.github/workflows/rc-pipeline.yml", workflow)
+        resolve = self._job_block(workflow, "resolve")
+        self.assertIn("actions/github-script", resolve)
+        self.assertIn("getCommit", resolve)
+        self.assertIn("hex", resolve)
+        call = self._job_block(workflow, "call_rc_pipeline")
+        self.assertIn("secrets: inherit", call)
+        self.assertIn("needs.resolve.outputs.patched_sha", call)
+        self.assertIn("source_sha: ${{ needs.resolve.outputs.patched_sha }}", call)
+        self.assertIn("release_sha: ${{ needs.resolve.outputs.patched_sha }}", call)
+        self.assertIn("mode: manual-local", call)
+        outer = workflow[: workflow.index("jobs:")]
+        self.assertIn("contents: read", outer)
+        self.assertNotIn("id-token: write", outer)
+        self.assertNotIn("attestations: write", outer)
+
+    def test_build_workflow_has_no_signing_entry_and_no_tag_publisher(self):
+        workflow = BUILD_WORKFLOW.read_text()
+        self.assertNotIn("build-signed-rc", workflow)
+        self.assertNotIn("publish-github-release", workflow)
+        self.assertNotIn("release-signing", workflow)
+        self.assertNotIn("rc-pipeline", workflow)
+        self.assertNotIn('tags: ["v*"]', workflow)
+        self.assertNotIn("workflow_dispatch", workflow)
+        self.assertIn("build-apk:", workflow)
 
     def test_gradle_actions_path_is_https_only_and_jitpack_filtered(self):
         build = (ROOT / "build.gradle").read_text()

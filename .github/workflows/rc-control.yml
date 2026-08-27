@@ -1,0 +1,72 @@
+name: TVBox RC Control
+
+# Dispatch only from the immutable control tag rc-control-v1. The resolve job
+# reads the current refs/heads/patched commit through the GitHub API and locks
+# that exact 40-hex SHA for the reusable pipeline called from this control ref.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  resolve:
+    name: Lock current patched SHA read-only
+    if: github.ref == 'refs/tags/rc-control-v1' && github.actor == 'slashinchi'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      patched_sha: ${{ steps.lock.outputs.patched_sha }}
+    steps:
+      - name: Read refs/heads/patched through the GitHub API
+        id: read
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const response = await github.rest.repos.getCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: 'heads/patched',
+            });
+            core.setOutput('sha', response.data.sha);
+
+      - name: Validate the locked 40-hex patched SHA
+        id: lock
+        env:
+          CANDIDATE_SHA: ${{ steps.read.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Resolved patched ref is not a 40-hex commit SHA"
+            exit 1
+          fi
+          echo "patched_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Locked patched SHA: $CANDIDATE_SHA"
+
+  call_rc_pipeline:
+    name: Run exact-SHA RC pipeline from control ref
+    needs: resolve
+    if: github.ref == 'refs/tags/rc-control-v1' && github.actor == 'slashinchi'
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/rc-pipeline.yml
+    secrets: inherit
+    with:
+      release_sha: ${{ needs.resolve.outputs.patched_sha }}
+      source_sha: ${{ needs.resolve.outputs.patched_sha }}
+      mode: manual-local
+      upstream_sha: ''
+      upstream_version: ''
+      upstream_code: ''
+      expected_version_name: ''
+      expected_version_code: ''
+      release_debt: ''
+      candidate_pr: ''
+      provenance_marker: ''
