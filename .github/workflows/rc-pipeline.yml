@@ -690,6 +690,7 @@ jobs:
         name: Verify identity and signed-vs-unsigned equivalence
         run: |
           set -euo pipefail
+          export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
           unsigned="$RUNNER_TEMP/build-evidence/unsigned.apk"
            signed="$RUNNER_TEMP/signed-output/signed.apk"
            test -f "$unsigned"; test -f "$signed"
