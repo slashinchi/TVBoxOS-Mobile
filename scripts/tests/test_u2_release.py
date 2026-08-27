@@ -552,6 +552,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         ):
             self.assertIn(field, workflow)
         self.assertIn('apksigner_tool_version="34.0.0"', recipe)
+        self.assertIn('aapt2_tool_version="34.0.0"', recipe)
         self.assertIn('zipalign_tool_version="35.0.0"', recipe)
         self.assertIn("needs: [build_unsigned, build_repro]", compare)
         self.assertIn('python3 "$CONTROL_WORKFLOW_ROOT/scripts/reproducibility.py" compare', compare)

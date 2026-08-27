@@ -459,7 +459,7 @@ aapt2_sha=$(hash_file "$aapt2_path")
 zipalign_sha=$(hash_file "$zipalign_path")
 llvm_readelf_sha=$(hash_file "$llvm_readelf")
 apksigner_tool_version="34.0.0"
-aapt2_tool_version=$({ "$aapt2_path" version 2>&1 || true; } | tr '\n' ' ')
+aapt2_tool_version="34.0.0"
 zipalign_tool_version="35.0.0"
 llvm_readelf_tool_version=$({ "$llvm_readelf" --version 2>&1 || true; } | tr '\n' ' ')
 [[ -n "$apksigner_tool_version" && -n "$aapt2_tool_version" && -n "$zipalign_tool_version" && -n "$llvm_readelf_tool_version" ]] || {
