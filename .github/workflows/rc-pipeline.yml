@@ -639,7 +639,7 @@ jobs:
 
   verify_signed:
     name: Independently verify signed APK without OIDC
-    needs: [build_unsigned, prepare_sign_input, sign_exact]
+    needs: [build_unsigned, sign_exact]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -647,11 +647,12 @@ jobs:
       actions: read
     outputs:
       signed_sha256: ${{ steps.verify.outputs.signed_sha256 }}
+      unsigned_sha256: ${{ steps.verify.outputs.unsigned_sha256 }}
       signer_sha256: ${{ steps.verify.outputs.signer_sha256 }}
+      attest_input_artifact_id: ${{ steps.upload_attest_input.outputs.artifact-id }}
     env:
       EXPECTED_SIGNER_SHA256: ${{ vars.TVBOX_SIGNER_SHA256 }}
       BUILD_EVIDENCE_ARTIFACT_ID: ${{ needs.build_unsigned.outputs.artifact_id }}
-      SIGN_INPUT_ARTIFACT_ID: ${{ needs.prepare_sign_input.outputs.artifact_id }}
       SIGNED_OUTPUT_ARTIFACT_ID: ${{ needs.sign_exact.outputs.artifact_id }}
     steps:
       - name: Check out exact release SHA for trusted helper code
@@ -691,6 +692,31 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
+          validate_root() {
+            local root="$1"
+            shift
+            local actual expected
+            actual=$(find "$root" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+            expected=$(printf '%s\n' "$@" | LC_ALL=C sort)
+            test "$actual" = "$expected" || { echo "::error::unexpected artifact root: $root"; exit 1; }
+            test -z "$(find "$root" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" || {
+              echo "::error::artifact root contains non-regular entries: $root"; exit 1;
+            }
+            for member in "$@"; do
+              test -f "$root/$member"
+              test ! -L "$root/$member"
+            done
+          }
+          validate_root "$RUNNER_TEMP/build-evidence" \
+            unsigned.apk build-identity.json payload-manifest.json native-compat.json \
+            runtime-components.json legacy-dependencies.lock.json
+          test "$(find "$RUNNER_TEMP/build-evidence" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 6 || {
+            echo "::error::build evidence must contain exactly 6 files"; exit 1;
+          }
+          validate_root "$RUNNER_TEMP/signed-output" signed.apk signer-result.json
+          test "$(find "$RUNNER_TEMP/signed-output" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 2 || {
+            echo "::error::signed output must contain exactly 2 files"; exit 1;
+          }
           unsigned="$RUNNER_TEMP/build-evidence/unsigned.apk"
            signed="$RUNNER_TEMP/signed-output/signed.apk"
            test -f "$unsigned"; test -f "$signed"
@@ -741,127 +767,108 @@ jobs:
           [[ "$package_name" == "$expected_package" && "$apk_code" == "$expected_code" && "$apk_name" == "$expected_name" ]] || {
             echo "::error::verifier package/version mismatch"; exit 1;
           }
-          sudo apt-get update
-           sudo apt-get install -y apksigcopier=1.1.1-1
-           apksigcopier compare --unsigned "$signed" "$unsigned"
+           equivalence=$(python3 scripts/apk_equivalence.py \
+             --signed "$signed" \
+             --unsigned "$unsigned")
+           printf '%s\n' "$equivalence" | tee "$RUNNER_TEMP/apk-equivalence.json"
+           jq -e '.schema == "tvbox-apk-equivalence-v1" and .status == "equivalent"' \
+             "$RUNNER_TEMP/apk-equivalence.json" >/dev/null
            signer_java_version=$(jq -r '.signer_java_version' "$signer_result")
            [[ "$signer_java_version" == *"17.0.20"* ]] || { echo "::error::signer JDK identity mismatch"; exit 1; }
            verifier_image_os="${ImageOS:-unknown}"
            verifier_image_version="${ImageVersion:-unknown}"
-           printf '%s\n' \
-            "signed_sha256=$actual_signed" \
-             "unsigned_sha256=$actual_unsigned" \
-             "signer_sha256=$signer_sha" \
-             "legacy_manifest_sha256=$builder_manifest" \
-             "runtime_components_sha256=$builder_dependencies" \
-             "native_compat_report_sha256=$builder_native" \
-             "native_compat_status=$(jq -r '.native_compat_status' "$builder_identity")" \
-             "native_incompatible_count=$(jq -r '.native_incompatible_count' "$builder_identity")" \
-             "signer_java_version=$signer_java_version" \
-             "verifier_image_os=$verifier_image_os" \
-             "verifier_image_version=$verifier_image_version" \
-             "artifact_source_sha=${{ inputs.release_sha }}" \
-            "workflow_source_sha=$GITHUB_SHA" \
-            "unsigned_artifact_id=$BUILD_EVIDENCE_ARTIFACT_ID" \
-            "signed_artifact_id=$SIGNED_OUTPUT_ARTIFACT_ID" > "$RUNNER_TEMP/verified-release-identity.txt"
-          cp "$RUNNER_TEMP/verified-release-identity.txt" verified-release-identity.txt
-          cp "$native_report" verified-native-compat.json
-          echo "signed_sha256=$actual_signed" >> "$GITHUB_OUTPUT"
-          echo "signer_sha256=$signer_sha" >> "$GITHUB_OUTPUT"
+            mkdir -p "$RUNNER_TEMP/attest-input"
+           cp -- "$signed" "$RUNNER_TEMP/attest-input/signed.apk"
+           jq -n \
+             --argjson builder "$(cat "$builder_identity")" \
+             --arg unsigned "$actual_unsigned" \
+             --arg signed "$actual_signed" \
+             --arg signer "$signer_sha" \
+             --arg workflow_source "$GITHUB_SHA" \
+             --arg run "$GITHUB_RUN_ID" \
+             --arg attempt "$GITHUB_RUN_ATTEMPT" \
+             --arg signer_java "$signer_java_version" \
+             --arg verifier_image_os "$verifier_image_os" \
+             --arg verifier_image_version "$verifier_image_version" \
+             '$builder + {schema:"tvbox-release-identity-v2", unsigned_sha256:$unsigned, signed_sha256:$signed, signer_sha256:$signer, signer_java_version:$signer_java, verifier_image_os:$verifier_image_os, verifier_image_version:$verifier_image_version, verifier_workflow_source_sha:$workflow_source, run_id:$run, run_attempt:$attempt}' \
+             > "$RUNNER_TEMP/attest-input/release-identity-predicate.json"
+           test "$(find "$RUNNER_TEMP/attest-input" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 2 || {
+             echo "::error::attest input must contain exactly 2 files"; exit 1;
+           }
+           echo "unsigned_sha256=$actual_unsigned" >> "$GITHUB_OUTPUT"
+           echo "signed_sha256=$actual_signed" >> "$GITHUB_OUTPUT"
+           echo "signer_sha256=$signer_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Upload verifier evidence
+      - name: Upload verifier-produced attest input
+        id: upload_attest_input
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: tvbox-u2-verified-${{ inputs.release_sha }}-${{ github.run_attempt }}
-          path: |
-            verified-release-identity.txt
-            verified-native-compat.json
+          name: tvbox-u2-attest-input-${{ inputs.release_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/attest-input
           if-no-files-found: error
           retention-days: 90
           overwrite: false
 
   attest_signed:
     name: Attest verified signed APK with minimal OIDC
-    needs: [build_unsigned, sign_exact, verify_signed]
+    needs: verify_signed
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      contents: read
+      contents: none
       actions: read
       id-token: write
       attestations: write
     outputs:
       default_attestation_id: ${{ steps.default_attest.outputs.attestation-id }}
       custom_attestation_id: ${{ steps.custom_attest.outputs.attestation-id }}
-    env:
-      BUILD_EVIDENCE_ARTIFACT_ID: ${{ needs.build_unsigned.outputs.artifact_id }}
-      SIGNED_OUTPUT_ARTIFACT_ID: ${{ needs.sign_exact.outputs.artifact_id }}
     steps:
-      - name: Download exact build evidence
+      - name: Download verifier-produced attest input
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          artifact-ids: ${{ needs.build_unsigned.outputs.artifact_id }}
-          path: ${{ runner.temp }}/build-evidence
-      - name: Download exact signed output
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          artifact-ids: ${{ needs.sign_exact.outputs.artifact_id }}
-          path: ${{ runner.temp }}/signed-output
+          artifact-ids: ${{ needs.verify_signed.outputs.attest_input_artifact_id }}
+          path: ${{ runner.temp }}/attest-input
 
       - id: verify_input
         name: Validate attest input file set
         run: |
           set -euo pipefail
-          signed="$RUNNER_TEMP/signed-output/signed.apk"
-          identity="$RUNNER_TEMP/build-evidence/build-identity.json"
-          test -f "$signed"
-          test -f "$identity"
-          jq -e '.schema == "tvbox-release-identity-v2" and (.unsigned_sha256 | test("^[0-9a-f]{64}$"))' "$identity" >/dev/null
-          test "$(sha256sum "$signed" | awk '{print $1}')" = "${{ needs.verify_signed.outputs.signed_sha256 }}" || { echo "::error::attest input signed digest mismatch"; exit 1; }
-
-      - name: Write final release identity predicate
-        run: |
-          set -euo pipefail
-           identity="$RUNNER_TEMP/build-evidence/build-identity.json"
-           test -f "$identity"
-           signer_result="$RUNNER_TEMP/signed-output/signer-result.json"
-           test -f "$signer_result"
-           jq -n \
-             --argjson builder "$(cat "$identity")" \
-            --arg unsigned "${{ needs.build_unsigned.outputs.unsigned_sha256 }}" \
-            --arg signed "${{ needs.verify_signed.outputs.signed_sha256 }}" \
-            --arg signer "${{ needs.verify_signed.outputs.signer_sha256 }}" \
-             --arg workflow_source "$GITHUB_SHA" \
-             --arg run "$GITHUB_RUN_ID" \
-             --arg attempt "$GITHUB_RUN_ATTEMPT" \
-             --arg signer_java "$(jq -r '.signer_java_version' "$signer_result")" \
-             --arg verifier_image_os "${ImageOS:-unknown}" \
-             --arg verifier_image_version "${ImageVersion:-unknown}" \
-             '$builder + {schema:"tvbox-release-identity-v2", unsigned_sha256:$unsigned, signed_sha256:$signed, signer_sha256:$signer, signer_java_version:$signer_java, verifier_image_os:$verifier_image_os, verifier_image_version:$verifier_image_version, verifier_workflow_source_sha:$workflow_source, run_id:$run, run_attempt:$attempt}' > "$RUNNER_TEMP/release-identity-predicate.json"
+          root="$RUNNER_TEMP/attest-input"
+          expected_files="signed.apk release-identity-predicate.json"
+          actual=$(find "$root" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+          expected=$(printf '%s\n' $expected_files | LC_ALL=C sort)
+          test "$actual" = "$expected" || { echo "::error::unexpected attest input root"; exit 1; }
+          test "$(find "$root" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 2 || {
+            echo "::error::attest input must contain exactly 2 files"; exit 1;
+          }
+          test -z "$(find "$root" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" || {
+            echo "::error::attest input contains non-regular entries"; exit 1;
+          }
+          signed="$root/signed.apk"
+          predicate="$root/release-identity-predicate.json"
+          test ! -L "$signed"
+          test ! -L "$predicate"
+          actual_signed=$(sha256sum "$signed" | awk '{print $1}')
+          expected_signed="${{ needs.verify_signed.outputs.signed_sha256 }}"
+          expected_unsigned="${{ needs.verify_signed.outputs.unsigned_sha256 }}"
+          test "$actual_signed" = "$expected_signed" || { echo "::error::attest subject digest mismatch"; exit 1; }
+          jq -e --arg signed "$expected_signed" --arg unsigned "$expected_unsigned" \
+            '.schema == "tvbox-release-identity-v2" and .signed_sha256 == $signed and .unsigned_sha256 == $unsigned' \
+            "$predicate" >/dev/null || { echo "::error::attest predicate identity mismatch"; exit 1; }
 
       - id: default_attest
         name: Attest signed APK with GitHub build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-path: ${{ runner.temp }}/signed-output/signed.apk
+          subject-path: ${{ runner.temp }}/attest-input/signed.apk
           push-to-registry: false
 
       - id: custom_attest
         name: Attest project-specific release identity
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-path: ${{ runner.temp }}/signed-output/signed.apk
+          subject-path: ${{ runner.temp }}/attest-input/signed.apk
           predicate-type: https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v2
-          predicate-path: ${{ runner.temp }}/release-identity-predicate.json
+          predicate-path: ${{ runner.temp }}/attest-input/release-identity-predicate.json
           push-to-registry: false
           create-storage-record: false
-
-      - name: Upload final predicate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: tvbox-u2-attest-input-${{ inputs.release_sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/release-identity-predicate.json
-          if-no-files-found: error
-          retention-days: 90
-          overwrite: false

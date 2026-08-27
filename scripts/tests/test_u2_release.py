@@ -441,9 +441,15 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("builder-release-identity.txt", signer)
         signer_upload = signer[signer.index("      - name: Upload exact signed output"):]
         self.assertNotIn("signer-output.txt", signer_upload)
+        verifier = workflow[workflow.index("  verify_signed:"):workflow.index("  attest_signed:")]
+        self.assertIn("scripts/apk_equivalence.py", verifier)
+        self.assertIn("tvbox-apk-equivalence-v1", verifier)
+        self.assertIn("release-identity-predicate.json", verifier)
+        self.assertIn("tvbox-u2-attest-input-", verifier)
+        self.assertIn("exactly 2 files", verifier)
         attestor = workflow[workflow.index("  attest_signed:"):]
-        self.assertIn("release-identity-predicate.json", attestor)
         self.assertIn("attest-input", attestor)
+        self.assertNotIn("Write final release identity predicate", attestor)
         self.assertNotIn("release-identity.txt", attestor)
 
     def test_rc_attestor_has_no_checkout_or_scripts(self):
@@ -454,9 +460,28 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("scripts/u2_release.py", attestor)
         self.assertNotIn("sudo apt-get", attestor)
         self.assertNotIn("apksigcopier", attestor)
-        self.assertIn("subject-path: ${{ runner.temp }}/signed-output/signed.apk", attestor)
+        self.assertIn("subject-path: ${{ runner.temp }}/attest-input/signed.apk", attestor)
         self.assertIn("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4", attestor)
         self.assertNotIn("attest-build-provenance@", attestor)
+
+    def test_rc_verifier_uses_strict_raw_equivalence_and_owns_attest_input(self):
+        workflow = RC_WORKFLOW.read_text()
+        verifier = workflow[workflow.index("  verify_signed:"):workflow.index("  attest_signed:")]
+        attestor = workflow[workflow.index("  attest_signed:"):]
+        self.assertNotIn("apksigcopier", verifier)
+        self.assertNotIn("sudo apt-get", verifier)
+        self.assertIn("python3 scripts/apk_equivalence.py", verifier)
+        self.assertIn("attest_input_artifact_id:", verifier)
+        self.assertIn("Upload verifier-produced attest input", verifier)
+        self.assertIn("EXPECTED_SIGNER_SHA256", verifier)
+        self.assertIn("verifier signer fingerprint mismatch", verifier)
+        self.assertIn("path: ${{ runner.temp }}/attest-input", verifier)
+        self.assertIn("needs: verify_signed", attestor)
+        self.assertIn("artifact-ids: ${{ needs.verify_signed.outputs.attest_input_artifact_id }}", attestor)
+        self.assertIn("Validate attest input file set", attestor)
+        self.assertIn("signed.apk release-identity-predicate.json", attestor)
+        self.assertNotIn("build-evidence", attestor)
+        self.assertNotIn("signed-output", attestor)
 
     def test_rc_identity_creates_evidence_directory_before_writing(self):
         workflow = RC_WORKFLOW.read_text()
