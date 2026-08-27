@@ -97,13 +97,13 @@ jobs:
 
   build-signed-rc:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/patched' && github.actor == 'slashinchi'
-    environment: release-signing
     permissions:
       contents: read
       actions: read
       id-token: write
       attestations: write
     uses: ./.github/workflows/rc-pipeline.yml
+    secrets: inherit
     with:
       release_sha: ${{ github.sha }}
       source_sha: ${{ github.sha }}
