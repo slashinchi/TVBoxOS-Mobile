@@ -120,7 +120,7 @@ stage_post_build_helpers() {
   printf '%s' "$U2_TRUSTED_LEGACY_STAGING_B64" | base64 --decode > "$post_build_root/scripts/legacy_staging.py"
   printf '%s' "$U2_TRUSTED_U2_RELEASE_B64" | base64 --decode > "$post_build_root/scripts/u2_release.py"
   printf '%s' "$U2_TRUSTED_NATIVE_COMPAT_B64" | base64 --decode > "$post_build_root/scripts/native_compat.py"
-  chmod -R a-w "$post_build_root"
+  chmod -R a-w,u+w "$post_build_root"
   [[ "$(hash_file "$post_build_root/scripts/u2_build_evidence.sh")" == "$U2_TRUSTED_RECIPE_SHA" ]] || { echo "::error::staged recipe digest mismatch"; exit 1; }
   [[ "$(hash_file "$post_build_root/scripts/legacy_staging.py")" == "$U2_TRUSTED_LEGACY_STAGING_SHA" ]] || { echo "::error::staged legacy helper digest mismatch"; exit 1; }
   [[ "$(hash_file "$post_build_root/scripts/u2_release.py")" == "$U2_TRUSTED_U2_RELEASE_SHA" ]] || { echo "::error::staged release helper digest mismatch"; exit 1; }

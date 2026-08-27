@@ -438,7 +438,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn('U2_TRUSTED_RECIPE_B64="$trusted_recipe_b64"', initial_stage)
         self.assertIn("U2_BUILDER_PHASE=post-build", recipe)
         self.assertIn("base64 --decode", recipe)
-        self.assertIn("chmod -R a-w", recipe)
+        self.assertIn("chmod -R a-w,u+w", recipe)
         self.assertIn('bash "$post_build_root/scripts/u2_build_evidence.sh" "$@"', recipe)
 
     def test_rc_builder_reexec_is_bound_and_dependencies_cannot_mutate_evidence(self):
