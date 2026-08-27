@@ -334,6 +334,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("github.event.inputs.release_sha", workflow)
         wrapper = workflow[workflow.index("  build-signed-rc:"):workflow.index("  publish-github-release:")]
         self.assertNotIn("actions/checkout", wrapper)
+        self.assertIn("environment: release-signing", wrapper)
 
     def test_gradle_actions_path_is_https_only_and_jitpack_filtered(self):
         build = (ROOT / "build.gradle").read_text()
