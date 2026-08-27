@@ -373,7 +373,9 @@ jobs:
               original_entries = original["entries"]
               reconstructed_entries = reconstructed["entries"]
               result["comparison"].update({
-                  "zip_records_equal": original_entries == reconstructed_entries,
+                  "zip_records_equal": (
+                      public_image(original)["entries"] == public_image(reconstructed)["entries"]
+                  ),
                   "compressed_bytes_equal": (
                       set(original_entries) == set(reconstructed_entries)
                       and all(

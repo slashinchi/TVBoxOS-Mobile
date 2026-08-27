@@ -53,6 +53,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("APK Signing Block", workflow)
         self.assertGreaterEqual(workflow.count("set +e"), 5)
         self.assertIn("for entry_key, entry_value in value.items()", workflow)
+        self.assertIn('public_image(original)["entries"]', workflow)
         self.assertIn("diagnostic/reconstructed", workflow)
         self.assertNotIn("path: diagnostic\n", workflow)
 
