@@ -345,7 +345,11 @@ jobs:
           def public_image(image):
               return {
                   key: ({
-                      entry_key: entry_value
+                      entry_key: {
+                          field: field_value
+                          for field, field_value in entry_value.items()
+                          if not field.startswith("_")
+                      }
                       for entry_key, entry_value in value.items()
                       if not entry_key.startswith("_")
                   } if key == "entries" else value)
