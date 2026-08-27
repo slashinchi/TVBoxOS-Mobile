@@ -394,8 +394,11 @@ class U2ReleaseContractTests(unittest.TestCase):
             ROOT / ".github/workflows/upstream-monitor.yml",
         ):
             workflow = path.read_text()
-            self.assertIn("scripts/legacy_staging.py stage", workflow)
-            self.assertIn("gradle/legacy-dependencies.lock.json", workflow)
+            if path == RC_WORKFLOW:
+                self.assertIn("scripts/u2_build_evidence.sh", workflow)
+            else:
+                self.assertIn("scripts/legacy_staging.py stage", workflow)
+                self.assertIn("gradle/legacy-dependencies.lock.json", workflow)
             self.assertNotIn("maven.aliyun.com", workflow)
 
     def test_rc_pipeline_attests_v2_build_inputs_and_pins_signer_jdk(self):
@@ -413,10 +416,52 @@ class U2ReleaseContractTests(unittest.TestCase):
 
     def test_rc_builder_uses_a_fresh_cache_disabled_gradle_home(self):
         workflow = RC_WORKFLOW.read_text()
+        recipe = (ROOT / "scripts/u2_build_evidence.sh").read_text()
+        self.assertIn('export GRADLE_USER_HOME="$RUNNER_TEMP/tvbox-gradle"', recipe)
+        for helper in ("legacy_staging.py", "u2_release.py", "native_compat.py"):
+            self.assertIn(f'"$control_scripts/{helper}"', recipe)
+        self.assertNotIn("python3 scripts/legacy_staging.py", recipe)
+        self.assertNotIn("python3 scripts/u2_release.py", recipe)
+        self.assertNotIn("python3 scripts/native_compat.py", recipe)
+        self.assertIn("U2_BUILDER_REEXEC", recipe)
+        self.assertIn("verify_trusted_helpers", recipe)
         builder = workflow[workflow.index("  build_unsigned:"):workflow.index("  prepare_sign_input:")]
-        self.assertIn('export GRADLE_USER_HOME="$RUNNER_TEMP/tvbox-gradle"', builder)
+        self.assertIn("scripts/u2_build_evidence.sh", builder)
         self.assertNotIn("cache: gradle", builder)
         self.assertNotIn("setup-gradle", builder)
+
+    def test_rc_builder_reexecs_from_immutable_helper_snapshot_after_gradle(self):
+        recipe = (ROOT / "scripts/u2_build_evidence.sh").read_text()
+        self.assertIn("U2_BUILDER_PHASE", recipe)
+        self.assertIn("U2_TRUSTED_RECIPE_B64", recipe)
+        initial_stage = recipe[recipe.index('if [[ "$reexec" == "0" ]]'):recipe.index("control_scripts=")]
+        self.assertIn('U2_TRUSTED_RECIPE_B64="$trusted_recipe_b64"', initial_stage)
+        self.assertIn("U2_BUILDER_PHASE=post-build", recipe)
+        self.assertIn("base64 --decode", recipe)
+        self.assertIn("chmod -R a-w", recipe)
+        self.assertIn('bash "$post_build_root/scripts/u2_build_evidence.sh" "$@"', recipe)
+
+    def test_rc_builder_reexec_is_bound_and_dependencies_cannot_mutate_evidence(self):
+        recipe = (ROOT / "scripts/u2_build_evidence.sh").read_text()
+        self.assertNotIn('CONTROL_WORKFLOW_SOURCE_ROOT:-', recipe)
+        self.assertIn('case "$reexec" in', recipe)
+        self.assertIn("run_assemble_and_reexec", recipe)
+        self.assertIn("run_dependencies_and_reexec", recipe)
+        self.assertIn("U2_SKIP_DEPENDENCIES", recipe)
+        self.assertIn("U2_STATE_RAW_DEPENDENCY_SHA", recipe)
+        self.assertIn("U2_STATE_ASSEMBLE_APK_SHA", recipe)
+        self.assertIn("legacy manifest changed during build", recipe)
+        self.assertLess(
+            recipe.index("./gradlew :app:assembleRelease"),
+            recipe.index('run_assemble_and_reexec "$@"'),
+        )
+        self.assertLess(
+            recipe.index("./gradlew :app:dependencies"),
+            recipe.index('run_dependencies_and_reexec "$@"'),
+        )
+        self.assertIn('[[ "$apk_after_dependencies" == "$apk_before_dependencies" &&', recipe)
+        self.assertIn('"$source_apk_after_dependencies" == "$source_apk_before_dependencies"', recipe)
+        self.assertIn("write_identity", recipe)
 
     def test_rc_artifact_contracts_are_flat_and_exact(self):
         workflow = RC_WORKFLOW.read_text()
@@ -425,12 +470,13 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("tvbox-u2-signed-output-", workflow)
         self.assertIn("tvbox-u2-attest-input-", workflow)
         builder = workflow[workflow.index("  build_unsigned:"):workflow.index("  prepare_sign_input:")]
+        recipe = (ROOT / "scripts/u2_build_evidence.sh").read_text()
         self.assertIn("build/evidence", builder)
-        self.assertIn("legacy-dependencies.lock.json", builder)
-        self.assertIn("build-identity.json", builder)
+        self.assertIn("legacy-dependencies.lock.json", recipe)
+        self.assertIn("build-identity.json", recipe)
         self.assertNotIn("tvbox-u2-unsigned-", builder)
-        self.assertIn("-delete", builder)
-        self.assertIn("exactly 6 files", builder)
+        self.assertIn("-delete", recipe)
+        self.assertIn("exactly 6 files", recipe)
         preflight = workflow[workflow.index("  prepare_sign_input:"):workflow.index("  sign_exact:")]
         self.assertIn("expected_files=", preflight)
         self.assertIn("sha256sum \"$root/unsigned.apk\"", preflight)
@@ -442,7 +488,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         signer_upload = signer[signer.index("      - name: Upload exact signed output"):]
         self.assertNotIn("signer-output.txt", signer_upload)
         verifier = workflow[workflow.index("  verify_signed:"):workflow.index("  attest_signed:")]
-        self.assertIn("scripts/apk_equivalence.py", verifier)
+        self.assertIn("control-workflow/scripts/apk_equivalence.py", verifier)
         self.assertIn("tvbox-apk-equivalence-v1", verifier)
         self.assertIn("release-identity-predicate.json", verifier)
         self.assertIn("tvbox-u2-attest-input-", verifier)
@@ -470,7 +516,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         attestor = workflow[workflow.index("  attest_signed:"):]
         self.assertNotIn("apksigcopier", verifier)
         self.assertNotIn("sudo apt-get", verifier)
-        self.assertIn("python3 scripts/apk_equivalence.py", verifier)
+        self.assertIn("python3 control-workflow/scripts/apk_equivalence.py", verifier)
         self.assertIn("attest_input_artifact_id:", verifier)
         self.assertIn("Upload verifier-produced attest input", verifier)
         self.assertIn("EXPECTED_SIGNER_SHA256", verifier)
@@ -483,18 +529,84 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("build-evidence", attestor)
         self.assertNotIn("signed-output", attestor)
 
-    def test_rc_identity_creates_evidence_directory_before_writing(self):
+    def test_rc_reproducibility_gate_binds_primary_and_repro_before_signing(self):
         workflow = RC_WORKFLOW.read_text()
-        identity = workflow[workflow.index("      - id: identity"):workflow.index("      - id: build")]
-        self.assertIn("mkdir -p build/evidence", identity)
+        primary = self._job_block(workflow, "build_unsigned")
+        repro = self._job_block(workflow, "build_repro")
+        compare = self._job_block(workflow, "compare_reproducibility")
+        prepare = self._job_block(workflow, "prepare_sign_input")
+        signer = self._job_block(workflow, "sign_exact")
+        verifier = self._job_block(workflow, "verify_signed")
+
+        self.assertIn("bash \"$CONTROL_WORKFLOW_ROOT/scripts/u2_build_evidence.sh\" primary", primary)
+        self.assertIn("bash \"$CONTROL_WORKFLOW_ROOT/scripts/u2_build_evidence.sh\" repro", repro)
+        self.assertIn("BUILDER_ROLE", primary)
+        for field in (
+            "builder_recipe_sha256",
+            "java_binary_sha256",
+            "apksigner_sha256",
+            "aapt2_sha256",
+            "zipalign_sha256",
+            "llvm_readelf_sha256",
+        ):
+            self.assertIn(field, workflow)
+        self.assertIn("needs: [build_unsigned, build_repro]", compare)
+        self.assertIn('python3 "$CONTROL_WORKFLOW_ROOT/scripts/reproducibility.py" compare', compare)
+        self.assertIn("primary-artifact-id", compare)
+        self.assertIn("repro-artifact-id", compare)
+        self.assertIn("primary-artifact-digest", compare)
+        self.assertIn("repro-artifact-digest", compare)
+        self.assertIn("repro-comparison", compare)
+        self.assertIn("EXPECTED_RELEASE_SHA", compare)
+        self.assertIn("needs: [build_unsigned, compare_reproducibility]", prepare)
+        self.assertIn("primary_artifact_id", prepare)
+        self.assertIn("primary_artifact_digest", prepare)
+        self.assertIn("reproducibility_report_artifact_digest", prepare)
+        self.assertIn("runner_image_drift", workflow)
+        self.assertIn("needs: [prepare_sign_input, compare_reproducibility]", signer)
+        self.assertIn("EXPECTED_COMPARISON_REPORT_SHA256", signer)
+        self.assertIn("EXPECTED_PRIMARY_ARTIFACT_DIGEST", signer)
+        self.assertIn("job.workflow_sha", verifier)
+        self.assertIn("reproducibility-report.json", verifier)
+        self.assertIn("compare_reproducibility.outputs.report_artifact_id", verifier)
+        self.assertIn("EXPECTED_SIGNED_OUTPUT_ARTIFACT_DIGEST", verifier)
+        self.assertIn("signed_artifact_digest", verifier)
+
+        attestor = self._job_block(workflow, "attest_signed")
+        self.assertIn("EXPECTED_REPRODUCIBILITY_REPORT_ARTIFACT_DIGEST", attestor)
+        self.assertIn("signed_artifact_digest", attestor)
+
+    def test_rc_reproducibility_evidence_is_separate_from_production_contracts(self):
+        workflow = RC_WORKFLOW.read_text()
+        compare = self._job_block(workflow, "compare_reproducibility")
+        self.assertIn("tvbox-u2-repro-build-evidence-", workflow)
+        self.assertIn("tvbox-u2-repro-comparison-", workflow)
+        self.assertIn("reproducibility-report.json", compare)
+        self.assertIn("-eq 1", compare)
+        self.assertIn("--primary-artifact-id", compare)
+
+    @staticmethod
+    def _job_block(workflow, job_id):
+        match = re.search(
+            rf"(?ms)^  {re.escape(job_id)}:\n.*?(?=^  [A-Za-z0-9_-]+:|\Z)",
+            workflow,
+        )
+        if not match:
+            raise AssertionError(f"missing workflow job: {job_id}")
+        return match.group(0)
+
+    def test_rc_identity_creates_evidence_directory_before_writing(self):
+        recipe = (ROOT / "scripts/u2_build_evidence.sh").read_text()
+        self.assertIn("mkdir -p build/evidence", recipe)
 
     def test_rc_native_compatibility_uses_canonical_report_and_attested_debt(self):
         workflow = RC_WORKFLOW.read_text()
+        native = (ROOT / "scripts/native_compat.py").read_text()
         self.assertIn("scripts/native_compat.py", workflow)
         self.assertIn("native-compat.json", workflow)
         self.assertIn("native_compat_report_sha256", workflow)
         self.assertIn("native_compat_status", workflow)
-        self.assertIn("p_align >= 0x4000", workflow)
+        self.assertIn("MIN_16K_ALIGNMENT = 0x4000", native)
         self.assertIn("libconscrypt_jni.so", workflow)
         self.assertIn("libquickjs-android-wrapper.so", workflow)
         self.assertIn("librtmp-jni.so", workflow)
