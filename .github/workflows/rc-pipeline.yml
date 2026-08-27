@@ -427,7 +427,9 @@ jobs:
           cp -- build/evidence/unsigned/runtime-components.json build/evidence/runtime-components.json
           cp -- gradle/legacy-dependencies.lock.json build/evidence/legacy-dependencies.lock.json
           rm -rf build/evidence/unsigned
+          find build/evidence -type f ! -name 'unsigned.apk' ! -name 'build-identity.json' ! -name 'payload-manifest.json' ! -name 'native-compat.json' ! -name 'runtime-components.json' ! -name 'legacy-dependencies.lock.json' -delete
           ls -la build/evidence
+          test "$(find build/evidence -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 6 || { echo "::error::build evidence must contain exactly 6 files"; exit 1; }
 
       - name: Upload exact unsigned build evidence
         id: upload

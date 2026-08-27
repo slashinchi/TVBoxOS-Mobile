@@ -403,6 +403,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("legacy-dependencies.lock.json", builder)
         self.assertIn("build-identity.json", builder)
         self.assertNotIn("tvbox-u2-unsigned-", builder)
+        self.assertIn("-delete", builder)
+        self.assertIn("exactly 6 files", builder)
         preflight = workflow[workflow.index("  prepare_sign_input:"):workflow.index("  sign_exact:")]
         self.assertIn("expected_files=", preflight)
         self.assertIn("sha256sum \"$root/unsigned.apk\"", preflight)
