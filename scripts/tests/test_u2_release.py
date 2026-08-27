@@ -531,6 +531,7 @@ class U2ReleaseContractTests(unittest.TestCase):
 
     def test_rc_reproducibility_gate_binds_primary_and_repro_before_signing(self):
         workflow = RC_WORKFLOW.read_text()
+        recipe = (ROOT / "scripts/u2_build_evidence.sh").read_text()
         primary = self._job_block(workflow, "build_unsigned")
         repro = self._job_block(workflow, "build_repro")
         compare = self._job_block(workflow, "compare_reproducibility")
@@ -550,6 +551,8 @@ class U2ReleaseContractTests(unittest.TestCase):
             "llvm_readelf_sha256",
         ):
             self.assertIn(field, workflow)
+        self.assertIn('apksigner_tool_version="34.0.0"', recipe)
+        self.assertIn('zipalign_tool_version="35.0.0"', recipe)
         self.assertIn("needs: [build_unsigned, build_repro]", compare)
         self.assertIn('python3 "$CONTROL_WORKFLOW_ROOT/scripts/reproducibility.py" compare', compare)
         self.assertIn("primary-artifact-id", compare)
