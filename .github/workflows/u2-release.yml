@@ -94,6 +94,7 @@ jobs:
   build_rc:
     name: Build exact signed RC
     needs: [gate, qualify]
+    if: needs.gate.outputs.enabled == 'true'
     uses: ./.github/workflows/rc-pipeline.yml
     permissions:
       contents: read
