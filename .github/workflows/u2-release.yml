@@ -2,6 +2,12 @@ name: TVBox U2 Release Orchestrator
 
 on:
   workflow_dispatch:
+    inputs:
+      canary_mode:
+        description: 'Draft-only canary: build RC and create a draft release without publishing (requires actor slashinchi)'
+        required: false
+        default: 'false'
+        type: boolean
   push:
     branches:
       - patched
@@ -26,25 +32,41 @@ jobs:
           EVENT: ${{ github.event_name }}
           ACTOR: ${{ github.actor }}
           REF: ${{ github.ref }}
+          CANARY: ${{ github.event.inputs.canary_mode }}
         run: |
           set -euo pipefail
-          if [[ "${U2_ENABLED:-}" != "true" ]]; then
-            echo "U2 is disabled (TVBOX_U2_ENABLED is not 'true'). No release work is performed."
+          if [[ "$EVENT" == "push" ]]; then
+            [[ "$REF" == "refs/heads/patched" ]] || { echo "enabled=false" >> "$GITHUB_OUTPUT"; exit 0; }
+            [[ "${U2_ENABLED:-}" == "true" ]] || {
+              echo "U2 is disabled (TVBOX_U2_ENABLED is not 'true'). No release work is performed."
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            }
+            echo "mode=auto-upstream" >> "$GITHUB_OUTPUT"
+            echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT" == "workflow_dispatch" ]]; then
+            [[ "$ACTOR" == "slashinchi" ]] || {
+              echo "::error::manual dispatch requires actor slashinchi"
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            }
+            if [[ "${CANARY:-false}" == "true" ]]; then
+              echo "Canary mode: draft-only, no publish."
+              echo "mode=canary" >> "$GITHUB_OUTPUT"
+            else
+              [[ "${U2_ENABLED:-}" == "true" ]] || {
+                echo "U2 is disabled (TVBOX_U2_ENABLED is not 'true'). No release work is performed."
+                echo "enabled=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              }
+              echo "mode=manual-local" >> "$GITHUB_OUTPUT"
+            fi
+            echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
-          fi
-          if [[ "$EVENT" == "push" && "$REF" != "refs/heads/patched" ]]; then
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [[ "$EVENT" == "workflow_dispatch" && "$ACTOR" != "slashinchi" ]]; then
-            echo "::error::manual dispatch requires actor slashinchi"
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            exit 1
           fi
           echo "enabled=true" >> "$GITHUB_OUTPUT"
-          echo "mode=$EVENT" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
   qualify:
     name: Qualify release intent
@@ -76,7 +98,11 @@ jobs:
           echo "Qualifying ${MODE} release intent at ${SOURCE_SHA}"
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
           echo "release_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          pipeline_mode="$MODE"
+          if [[ "$MODE" == "canary" ]]; then
+            pipeline_mode="manual-local"
+          fi
+          echo "mode=$pipeline_mode" >> "$GITHUB_OUTPUT"
           echo "expected_version_name=" >> "$GITHUB_OUTPUT"
           echo "expected_version_code=" >> "$GITHUB_OUTPUT"
           echo "release_debt=" >> "$GITHUB_OUTPUT"
@@ -108,7 +134,7 @@ jobs:
   publish:
     name: Production approval and exact immutable publish
     needs: [gate, qualify, build_rc]
-    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success'
+    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.gate.outputs.mode != 'canary'
     runs-on: ubuntu-24.04
     environment: release-production
     permissions:
@@ -148,7 +174,7 @@ jobs:
   canary_publish:
     name: Draft-only canary publish
     needs: [gate, qualify, build_rc]
-    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && vars.TVBOX_U2_CANARY == 'true'
+    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.gate.outputs.mode == 'canary'
     runs-on: ubuntu-24.04
     environment: release-production
     permissions:
@@ -161,6 +187,11 @@ jobs:
           ref: refs/heads/patched
           fetch-depth: 0
           persist-credentials: false
+      - name: Download exact signed APK
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.build_rc.outputs.signed_artifact_id }}
+          path: ${{ runner.temp }}/signed-output
       - name: Create draft-only canary release
         env:
           RELEASE_SHA: ${{ needs.qualify.outputs.release_sha }}
@@ -172,5 +203,20 @@ jobs:
         run: |
           set -euo pipefail
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
-          echo "Canary mode: creating draft-only release without publishing."
-          echo "release=$RELEASE_SHA version=$EXPECTED_VERSION apk=$EXPECTED_APK run=$RUN_ID"
+          [[ -n "$EXPECTED_VERSION" ]] || { echo "::error::canary requires an expected version"; exit 1; }
+          signed="$RUNNER_TEMP/signed-output/signed.apk"
+          test -f "$signed" || { echo "::error::signed.apk missing from canary download"; exit 1; }
+          actual=$(sha256sum "$signed" | awk '{print $1}')
+          [[ "$actual" == "$EXPECTED_APK" ]] || {
+            echo "::error::canary signed APK digest mismatch: $actual != $EXPECTED_APK"; exit 1;
+          }
+          echo "::notice::canary signed APK digest verified: $actual"
+          tag="u2-canary-${RUN_ID}"
+          GH_TOKEN="$TOKEN" gh release create "$tag" \
+            --repo slashinchi/TVBoxOS-Mobile \
+            --draft \
+            --target "$RELEASE_SHA" \
+            --title "U2 canary $tag" \
+            --notes "Draft-only U2 canary. release=$RELEASE_SHA version=$EXPECTED_VERSION debt=${EXPECTED_DEBT:-none} run=$RUN_ID. Not published; disposable." \
+            "$signed"
+          echo "::notice::canary draft created: $tag"
