@@ -87,6 +87,7 @@ jobs:
       baseline_tag: ${{ steps.qualify.outputs.baseline_tag }}
       debt_classification: ${{ steps.qualify.outputs.debt_classification }}
       qualified: ${{ steps.qualify.outputs.qualified }}
+      canary: ${{ steps.qualify.outputs.canary }}
     steps:
       - name: Check out patched
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -107,7 +108,12 @@ jobs:
           if [[ "$MODE" == "canary" ]]; then
             echo "Canary mode: forcing qualified=true for draft-only RC build."
             echo "qualified=true" >> "$GITHUB_OUTPUT"
+            echo "canary=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "canary=false" >> "$GITHUB_OUTPUT"
           fi
+          # rc-pipeline accepts only auto-upstream|manual-local.
+          echo "mode=manual-local" >> "$GITHUB_OUTPUT"
 
   build_rc:
     name: Build exact signed RC
@@ -136,7 +142,7 @@ jobs:
   publish:
     name: Production approval and exact immutable publish
     needs: [gate, qualify, build_rc]
-    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.gate.outputs.mode != 'canary'
+    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.qualify.outputs.canary != 'true'
     runs-on: ubuntu-24.04
     environment: release-production
     permissions:
@@ -208,7 +214,7 @@ jobs:
   canary_publish:
     name: Draft-only canary publish
     needs: [gate, qualify, build_rc]
-    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.gate.outputs.mode == 'canary'
+    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.qualify.outputs.canary == 'true'
     runs-on: ubuntu-24.04
     environment: release-production
     permissions:
