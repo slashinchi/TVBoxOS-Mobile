@@ -51,6 +51,69 @@ jobs:
             echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           fi
 
+  qualify:
+    name: Qualify release intent
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      source_sha: ${{ steps.qualify.outputs.source_sha }}
+      release_sha: ${{ steps.qualify.outputs.release_sha }}
+      mode: ${{ steps.qualify.outputs.mode }}
+      upstream_sha: ${{ steps.qualify.outputs.upstream_sha }}
+      upstream_version: ${{ steps.qualify.outputs.upstream_version }}
+      upstream_code: ${{ steps.qualify.outputs.upstream_code }}
+      expected_version_name: ${{ steps.qualify.outputs.expected_version_name }}
+      expected_version_code: ${{ steps.qualify.outputs.expected_version_code }}
+      release_debt: ${{ steps.qualify.outputs.release_debt }}
+      candidate_pr: ${{ steps.qualify.outputs.candidate_pr }}
+      provenance_marker: ${{ steps.qualify.outputs.provenance_marker }}
+    steps:
+      - name: Check out patched
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: refs/heads/patched
+          fetch-depth: 0
+          persist-credentials: false
+      - id: qualify
+        run: |
+          set -euo pipefail
+          echo "Qualifying ${MODE} release intent at ${SOURCE_SHA}"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "release_debt=" >> "$GITHUB_OUTPUT"
+          echo "candidate_pr=" >> "$GITHUB_OUTPUT"
+          echo "provenance_marker=" >> "$GITHUB_OUTPUT"
+        env:
+          MODE: ${{ needs.gate.outputs.mode }}
+          SOURCE_SHA: ${{ needs.gate.outputs.source_sha }}
+
+  build_rc:
+    name: Build exact signed RC
+    needs: [gate, qualify]
+    if: needs.gate.outputs.enabled == 'true'
+    uses: ./.github/workflows/rc-pipeline.yml
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    with:
+      release_sha: ${{ needs.qualify.outputs.release_sha }}
+      source_sha: ${{ needs.qualify.outputs.source_sha }}
+      mode: ${{ needs.qualify.outputs.mode }}
+      upstream_sha: ${{ needs.qualify.outputs.upstream_sha }}
+      upstream_version: ${{ needs.qualify.outputs.upstream_version }}
+      upstream_code: ${{ needs.qualify.outputs.upstream_code }}
+      expected_version_name: ${{ needs.qualify.outputs.expected_version_name }}
+      expected_version_code: ${{ needs.qualify.outputs.expected_version_code }}
+      release_debt: ${{ needs.qualify.outputs.release_debt }}
+      candidate_pr: ${{ needs.qualify.outputs.candidate_pr }}
+      provenance_marker: ${{ needs.qualify.outputs.provenance_marker }}
+    secrets: inherit
+
   noop:
     runs-on: ubuntu-24.04
     steps:
