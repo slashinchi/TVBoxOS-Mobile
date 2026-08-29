@@ -8,6 +8,9 @@ from pathlib import Path
 from scripts.u2_release import (
     build_provenance_marker,
     build_release_trailers,
+    build_approval_marker,
+    parse_approval_marker,
+    approval_matches_release,
     candidate_branch_name,
     classify_release_paths,
     canonical_release_baseline,
@@ -180,6 +183,29 @@ class U2ReleaseContractTests(unittest.TestCase):
             "v2.1.26.1",
         )
 
+    def test_delivery_hold_is_identity_bound_not_boolean(self):
+        release = {
+            "tag": "v2.1.26.1",
+            "target": "c" * 40,
+            "versionName": "2.1.26.1",
+            "versionCode": 23601,
+            "assetSha256": "d" * 64,
+            "signerSha256": "e" * 64,
+            "verified": True,
+            "tag_ancestor": True,
+        }
+        from scripts.u2_release import hold_covers_lag, HOLD_RELEASE_TAG_RE
+
+        hold = {"release_tag": "v2.1.26.1", "release_target": "c" * 40, "issue": 3}
+        self.assertTrue(hold_covers_lag(hold, release, lag_version="2.1.26"))
+        other = {"release_tag": "v2.1.27.1", "release_target": "f" * 40, "issue": 4}
+        self.assertFalse(hold_covers_lag(other, release, lag_version="2.1.26"))
+        with self.assertRaises(ValueError):
+            hold_covers_lag({"release_tag": "nope", "release_target": "c" * 40, "issue": 3}, release, "2.1.26")
+        self.assertTrue(HOLD_RELEASE_TAG_RE.fullmatch("v2.1.26.1"))
+        self.assertFalse(HOLD_RELEASE_TAG_RE.fullmatch("v2.1.26"))
+        self.assertFalse(HOLD_RELEASE_TAG_RE.fullmatch("nope"))
+
     def test_prep_reconcile_and_post_promotion_are_identity_bound(self):
         parent = "a" * 40
         debt = "b" * 64
@@ -307,6 +333,65 @@ class U2ReleaseContractTests(unittest.TestCase):
         )
         self.assertIn("TVBox-U2-Mode: manual-local", trailers)
         self.assertNotIn("TVBox-U2-PR:", trailers)
+
+    def test_approval_marker_is_exact_and_bound_to_run_attempt(self):
+        marker = build_approval_marker(
+            release_sha="a" * 40,
+            debt="b" * 64,
+            version="2.1.27.1",
+            apk_sha="c" * 64,
+            run="123456",
+            attempt=1,
+        )
+        self.assertEqual(
+            parse_approval_marker(marker),
+            {
+                "release": "a" * 40,
+                "debt": "b" * 64,
+                "version": "2.1.27.1",
+                "apk": "c" * 64,
+                "run": "123456",
+                "attempt": "1",
+            },
+        )
+        with self.assertRaises(ValueError):
+            parse_approval_marker(marker.replace("run=123456", "run=short"))
+        with self.assertRaises(ValueError):
+            parse_approval_marker(marker.replace("attempt=1", "attempt="))
+        with self.assertRaises(ValueError):
+            build_approval_marker("a" * 39, "b" * 64, "2.1.27.1", "c" * 64, "123456", 1)
+
+    def test_approval_matches_only_identical_release_identity(self):
+        marker = build_approval_marker(
+            release_sha="a" * 40,
+            debt="b" * 64,
+            version="2.1.27.1",
+            apk_sha="c" * 64,
+            run="123456",
+            attempt=1,
+        )
+        release = {
+            "release_sha": "a" * 40,
+            "debt": "b" * 64,
+            "version": "2.1.27.1",
+            "apk_sha": "c" * 64,
+            "run": "123456",
+            "attempt": 1,
+        }
+        self.assertTrue(approval_matches_release(marker, release))
+        for field in ("debt", "apk_sha", "release_sha", "version"):
+            changed = dict(release)
+            if field == "debt":
+                changed["debt"] = "f" * 64
+            elif field == "apk_sha":
+                changed["apk_sha"] = "f" * 64
+            elif field == "release_sha":
+                changed["release_sha"] = "f" * 40
+            else:
+                changed["version"] = "2.1.27.2"
+            self.assertFalse(approval_matches_release(marker, changed))
+        self.assertFalse(approval_matches_release(marker, {**release, "attempt": 2}))
+        self.assertFalse(approval_matches_release(marker, {**release, "run": "999999"}))
 
     def test_rc_workflow_is_reusable_and_separates_trust_domains(self):
         workflow = RC_WORKFLOW.read_text()
@@ -615,6 +700,31 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("reproducibility-report.json", compare)
         self.assertIn("-eq 1", compare)
         self.assertIn("--primary-artifact-id", compare)
+
+    def test_whole_repo_has_exactly_one_release_signing_consumer(self):
+        consumers = []
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            text = path.read_text()
+            if "environment: release-signing" not in text:
+                continue
+            for line_no, line in enumerate(text.splitlines(), 1):
+                if "environment: release-signing" in line:
+                    consumers.append(f"{path.name}:{line_no}")
+        self.assertEqual(consumers, ["rc-pipeline.yml:490"])
+
+    def test_u2_publish_is_the_only_release_write_workflow(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        self.assertIn("TVBOX_U2_ENABLED", workflow)
+        self.assertIn("TVBOX_RELEASE_TOKEN", workflow)
+        self.assertIn("release-production", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("push:", workflow)
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            text = path.read_text()
+            if path.name in {"u2-release.yml", "rc-pipeline.yml"}:
+                continue
+            self.assertNotIn("TVBOX_RELEASE_TOKEN", text, path.name)
+            self.assertNotIn("release-production", text, path.name)
 
     @staticmethod
     def _job_block(workflow, job_id):

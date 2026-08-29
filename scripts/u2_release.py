@@ -15,6 +15,17 @@ FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)+$")
 VERSION_CODE_RE = re.compile(r"^[0-9]+$")
+RUN_ID_RE = re.compile(r"^[0-9]+$")
+HOLD_RELEASE_TAG_RE = re.compile(r"^v[0-9]+(?:\.[0-9]+){3}$")
+APPROVAL_RE = re.compile(
+    r"^TVBOX_RELEASE_APPROVE_V2 "
+    r"release=(?P<release>[0-9a-f]{40}) "
+    r"debt=(?P<debt>[0-9a-f]{64}) "
+    r"version=(?P<version>[0-9]+(?:\.[0-9]+)+) "
+    r"apk=(?P<apk>[0-9a-f]{64}) "
+    r"run=(?P<run>[0-9]+) "
+    r"attempt=(?P<attempt>[0-9]+)$"
+)
 PROVENANCE_RE = re.compile(
     r"^<!-- tvbox-upstream-candidate-v2 "
     r"upstream=(?P<upstream>[0-9a-f]{40}) "
@@ -421,6 +432,70 @@ def build_release_trailers(source_sha, mode, upstream_sha, version_name, debt, p
     if pr_number is not None:
         lines.append(f"TVBox-U2-PR: {int(pr_number)}")
     return "\n".join(lines)
+
+
+def build_approval_marker(release_sha, debt, version, apk_sha, run, attempt):
+    """Build the exact binary-bound production approval marker."""
+    _full_sha(release_sha, "release SHA")
+    if not HEX64_RE.fullmatch(debt or ""):
+        raise ValueError("approval debt must be a SHA-256 fingerprint")
+    _version_tuple(version)
+    if not HEX64_RE.fullmatch(apk_sha or ""):
+        raise ValueError("approval APK SHA must be a SHA-256 digest")
+    if not RUN_ID_RE.fullmatch(str(run)) or not RUN_ID_RE.fullmatch(str(attempt)):
+        raise ValueError("approval run/attempt must be numeric")
+    return (
+        "TVBOX_RELEASE_APPROVE_V2 "
+        f"release={release_sha} debt={debt} version={version} "
+        f"apk={apk_sha} run={run} attempt={attempt}"
+    )
+
+
+def parse_approval_marker(marker):
+    """Parse and strictly validate an approval marker."""
+    match = APPROVAL_RE.fullmatch((marker or "").strip())
+    if not match:
+        raise ValueError("invalid exact release approval marker")
+    return match.groupdict()
+
+
+def approval_matches_release(marker, release):
+    """True only when the approval marker binds the exact same release identity."""
+    try:
+        parsed = parse_approval_marker(marker)
+    except ValueError:
+        return False
+    if not isinstance(release, dict):
+        return False
+    fields = {
+        "release": "release_sha",
+        "debt": "debt",
+        "version": "version",
+        "apk": "apk_sha",
+        "run": "run",
+        "attempt": "attempt",
+    }
+    for parsed_key, release_key in fields.items():
+        if parsed[parsed_key] != str(release.get(release_key, "")):
+            return False
+    return True
+
+
+def hold_covers_lag(hold, release, lag_version):
+    """A delivery hold covers a lagging update only when it names the same release."""
+    if not isinstance(hold, dict) or not isinstance(release, dict):
+        return False
+    tag = hold.get("release_tag") or ""
+    if not HOLD_RELEASE_TAG_RE.fullmatch(tag):
+        raise ValueError("delivery hold must name a formal v* release tag")
+    if hold.get("release_target") != release.get("target"):
+        return False
+    if tag != release.get("tag"):
+        return False
+    if not isinstance(hold.get("issue"), int) or hold["issue"] <= 0:
+        raise ValueError("delivery hold must carry a positive issue number")
+    _version_tuple(lag_version)
+    return True
 
 
 def canonical_runtime_dependencies(text, configuration):
