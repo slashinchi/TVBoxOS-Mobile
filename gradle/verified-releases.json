@@ -1,0 +1,12 @@
+[
+  {
+    "tag": "v2.1.26.1",
+    "target": "b187b6ff8d89525da30e2543ed77e8e55bc58b2c",
+    "versionName": "2.1.26.1",
+    "versionCode": 23601,
+    "assetSha256": "df1760aa82a60c78da88655cdbbf2f2caec2e60c141cef3e78e1b63f314a57ce",
+    "signerSha256": "11eca31346835da4a0a5ab295647b14070f4c07533f08358679188941ae7d010",
+    "verified": true,
+    "tag_ancestor": true
+  }
+]

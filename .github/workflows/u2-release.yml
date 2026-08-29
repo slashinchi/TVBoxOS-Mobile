@@ -50,15 +50,15 @@ jobs:
               echo "enabled=false" >> "$GITHUB_OUTPUT"
               exit 1
             }
+            [[ "${U2_ENABLED:-}" == "true" ]] || {
+              echo "U2 is disabled (TVBOX_U2_ENABLED is not 'true'). Canary and manual release are both gated."
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            }
             if [[ "${CANARY:-false}" == "true" ]]; then
               echo "Canary mode: draft-only, no publish."
               echo "mode=canary" >> "$GITHUB_OUTPUT"
             else
-              [[ "${U2_ENABLED:-}" == "true" ]] || {
-                echo "U2 is disabled (TVBOX_U2_ENABLED is not 'true'). No release work is performed."
-                echo "enabled=false" >> "$GITHUB_OUTPUT"
-                exit 0
-              }
               echo "mode=manual-local" >> "$GITHUB_OUTPUT"
             fi
             echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
@@ -75,6 +75,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      actions: read
     outputs:
       source_sha: ${{ steps.qualify.outputs.source_sha }}
       release_sha: ${{ steps.qualify.outputs.release_sha }}
@@ -82,6 +83,10 @@ jobs:
       expected_version_name: ${{ steps.qualify.outputs.expected_version_name }}
       expected_version_code: ${{ steps.qualify.outputs.expected_version_code }}
       release_debt: ${{ steps.qualify.outputs.release_debt }}
+      noop: ${{ steps.qualify.outputs.noop }}
+      baseline_tag: ${{ steps.qualify.outputs.baseline_tag }}
+      debt_classification: ${{ steps.qualify.outputs.debt_classification }}
+      qualified: ${{ steps.qualify.outputs.qualified }}
     steps:
       - name: Check out patched
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -93,27 +98,21 @@ jobs:
         env:
           MODE: ${{ needs.gate.outputs.mode }}
           SOURCE_SHA: ${{ needs.gate.outputs.source_sha }}
+          NOOP: ${{ vars.TVBOX_U2_NOOP }}
         run: |
           set -euo pipefail
-          echo "Qualifying ${MODE} release intent at ${SOURCE_SHA}"
-          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          echo "release_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          pipeline_mode="$MODE"
+          chmod +x scripts/u2_qualify.sh
+          bash scripts/u2_qualify.sh
+          qualified=$(grep '^qualified=' "$GITHUB_OUTPUT" | cut -d= -f2)
           if [[ "$MODE" == "canary" ]]; then
-            pipeline_mode="manual-local"
+            echo "Canary mode: forcing qualified=true for draft-only RC build."
+            echo "qualified=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "mode=$pipeline_mode" >> "$GITHUB_OUTPUT"
-          version_json=$(python3 scripts/u2_release.py parse-app-version --file app/build.gradle)
-          version_name=$(jq -r '.versionName' <<<"$version_json")
-          version_code=$(jq -r '.versionCode' <<<"$version_json")
-          echo "expected_version_name=$version_name" >> "$GITHUB_OUTPUT"
-          echo "expected_version_code=$version_code" >> "$GITHUB_OUTPUT"
-          echo "release_debt=" >> "$GITHUB_OUTPUT"
 
   build_rc:
     name: Build exact signed RC
     needs: [gate, qualify]
-    if: needs.gate.outputs.enabled == 'true'
+    if: needs.gate.outputs.enabled == 'true' && needs.qualify.outputs.qualified == 'true'
     permissions:
       contents: read
       actions: read
@@ -150,7 +149,7 @@ jobs:
           ref: refs/heads/patched
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate release identity and approval binding
+      - name: Validate release identity and approval marker binding
         id: identity
         env:
           RELEASE_SHA: ${{ needs.qualify.outputs.release_sha }}
@@ -167,12 +166,44 @@ jobs:
           set -euo pipefail
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing from release-production"; exit 1; }
           [[ "$EXPECTED_APK" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::signed APK SHA-256 is invalid"; exit 1; }
+          [[ -n "$EXPECTED_DEBT" && "$EXPECTED_DEBT" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "::error::release debt fingerprint is empty or invalid"; exit 1;
+          }
           echo "RELEASE_SHA=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
           echo "EXPECTED_VERSION=$EXPECTED_VERSION" >> "$GITHUB_OUTPUT"
           echo "EXPECTED_DEBT=$EXPECTED_DEBT" >> "$GITHUB_OUTPUT"
           echo "EXPECTED_APK=$EXPECTED_APK" >> "$GITHUB_OUTPUT"
           echo "SIGNER_SHA=$SIGNER_SHA" >> "$GITHUB_OUTPUT"
-          echo "Release identity validated: $EXPECTED_VERSION at $RELEASE_SHA (apk $EXPECTED_APK)"
+          expected_marker="TVBOX_RELEASE_APPROVE_V2 release=${RELEASE_SHA} debt=${EXPECTED_DEBT} version=${EXPECTED_VERSION} apk=${EXPECTED_APK} run=${RUN_ID} attempt=${RUN_ATTEMPT}"
+          echo "expected_marker=$expected_marker" >> "$GITHUB_OUTPUT"
+          echo "::notice::Release identity validated: $EXPECTED_VERSION at $RELEASE_SHA (apk $EXPECTED_APK)"
+
+      - name: Verify approval marker from deployment review history
+        id: approval
+        env:
+          RUN_ID: ${{ github.run_id }}
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          approvals=$(gh api "repos/slashinchi/TVBoxOS-Mobile/actions/runs/${RUN_ID}/approvals" --jq '[.[] | select(.state=="approved" and .environments[]?.name=="release-production")]')
+          [[ -n "$approvals" && "$approvals" != "[]" ]] || {
+            echo "::error::no release-production approval found for run ${RUN_ID}"; exit 1;
+          }
+          comment=$(jq -r '.[0].comment // ""' <<<"$approvals")
+          [[ -n "$comment" ]] || { echo "::error::approval comment is empty; exact marker required"; exit 1; }
+          matched=$(python3 scripts/u2_release.py approval-matches \
+            --marker "$comment" \
+            --release-sha "${{ steps.identity.outputs.RELEASE_SHA }}" \
+            --debt "${{ steps.identity.outputs.EXPECTED_DEBT }}" \
+            --version "${{ steps.identity.outputs.EXPECTED_VERSION }}" \
+            --apk "${{ steps.identity.outputs.EXPECTED_APK }}" \
+            --run "${{ github.run_id }}" \
+            --attempt "${{ github.run_attempt }}")
+          jq -e '.matched == true' <<<"$matched" >/dev/null || {
+            echo "::error::approval marker does not match the exact release identity"; exit 1;
+          }
+          echo "::notice::exact approval marker verified for run ${RUN_ID} attempt ${RUN_ATTEMPT}"
 
   canary_publish:
     name: Draft-only canary publish
@@ -202,6 +233,7 @@ jobs:
           EXPECTED_DEBT: ${{ needs.qualify.outputs.release_debt }}
           EXPECTED_APK: ${{ needs.build_rc.outputs.signed_sha256 }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
         run: |
           set -euo pipefail
@@ -214,12 +246,14 @@ jobs:
             echo "::error::canary signed APK digest mismatch: $actual != $EXPECTED_APK"; exit 1;
           }
           echo "::notice::canary signed APK digest verified: $actual"
-          tag="u2-canary-${RUN_ID}"
+          asset_name="TVBox-Mobile-v${EXPECTED_VERSION}.apk"
+          cp "$signed" "$RUNNER_TEMP/$asset_name"
+          tag="u2-canary-${RUN_ID}-attempt${RUN_ATTEMPT}"
           GH_TOKEN="$TOKEN" gh release create "$tag" \
             --repo slashinchi/TVBoxOS-Mobile \
             --draft \
             --target "$RELEASE_SHA" \
             --title "U2 canary $tag" \
-            --notes "Draft-only U2 canary. release=$RELEASE_SHA version=$EXPECTED_VERSION debt=${EXPECTED_DEBT:-none} run=$RUN_ID. Not published; disposable." \
-            "$signed"
-          echo "::notice::canary draft created: $tag"
+            --notes "Draft-only U2 canary. release=$RELEASE_SHA version=$EXPECTED_VERSION debt=${EXPECTED_DEBT:-none} run=$RUN_ID attempt=$RUN_ATTEMPT. Not published; disposable." \
+            "$RUNNER_TEMP/$asset_name"
+          echo "::notice::canary draft created: $tag with asset $asset_name"

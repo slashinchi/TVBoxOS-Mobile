@@ -303,6 +303,10 @@ def post_promotion_state(patched_sha, release_sha, release_ancestor, formal_stat
         return "published-recovery-forward"
     if formal_state == "pending" and patched_sha != release_sha:
         return "pre-promotion-stale"
+    if formal_state == "draft" and (patched_sha == release_sha or release_ancestor):
+        return "draft-recovery-continue"
+    if formal_state == "draft" and patched_sha != release_sha and not release_ancestor:
+        return "draft-stale"
     return "fail-closed"
 
 
@@ -592,6 +596,24 @@ def main(argv=None):
     dependency_parser.add_argument("--file", required=True)
     dependency_parser.add_argument("--configuration", required=True)
 
+    debt_parser = subparsers.add_parser("release-debt")
+    debt_parser.add_argument("--repo", default=".")
+    debt_parser.add_argument("--releases-file", required=True)
+    debt_parser.add_argument("--current", required=True)
+    debt_parser.add_argument("--exclude", action="append", default=[])
+
+    baseline_parser = subparsers.add_parser("canonical-release-baseline")
+    baseline_parser.add_argument("--file", required=True)
+
+    approval_parser = subparsers.add_parser("approval-matches")
+    approval_parser.add_argument("--marker", required=True)
+    approval_parser.add_argument("--release-sha", required=True)
+    approval_parser.add_argument("--debt", required=True)
+    approval_parser.add_argument("--version", required=True)
+    approval_parser.add_argument("--apk", required=True)
+    approval_parser.add_argument("--run", required=True)
+    approval_parser.add_argument("--attempt", required=True)
+
     args = parser.parse_args(argv)
     if args.command == "parse-app-version":
         print(json.dumps(dict(zip(("versionName", "versionCode"), parse_app_version(Path(args.file).read_text())))))
@@ -620,6 +642,42 @@ def main(argv=None):
     elif args.command == "canonical-runtime-dependencies":
         result = canonical_runtime_dependencies(Path(args.file).read_text(), args.configuration)
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    elif args.command == "release-debt":
+        releases = json.loads(Path(args.releases_file).read_text())
+        baseline = canonical_release_baseline(releases)
+        debt = cumulative_release_debt(Path(args.repo), baseline["target"], args.current, args.exclude)
+        print(json.dumps({
+            "baseline": {
+                "tag": baseline["tag"],
+                "target": baseline["target"],
+                "versionName": baseline["versionName"],
+                "versionCode": baseline["versionCode"],
+            },
+            "classification": debt["classification"],
+            "fingerprint": debt["fingerprint"],
+            "path_count": len(debt["paths"]),
+        }, sort_keys=True))
+    elif args.command == "canonical-release-baseline":
+        baseline = canonical_release_baseline(json.loads(Path(args.file).read_text()))
+        print(json.dumps({
+            "tag": baseline["tag"],
+            "target": baseline["target"],
+            "versionName": baseline["versionName"],
+            "versionCode": baseline["versionCode"],
+        }, sort_keys=True))
+    elif args.command == "approval-matches":
+        release = {
+            "release_sha": args.release_sha,
+            "debt": args.debt,
+            "version": args.version,
+            "apk_sha": args.apk,
+            "run": args.run,
+            "attempt": args.attempt,
+        }
+        if approval_matches_release(args.marker, release):
+            print(json.dumps({"matched": True}, sort_keys=True))
+        else:
+            print(json.dumps({"matched": False}, sort_keys=True))
     return 0
 
 

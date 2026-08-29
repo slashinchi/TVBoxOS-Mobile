@@ -218,6 +218,9 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertEqual(post_promotion_state(parent, parent, False, "published"), "published-at-release")
         self.assertEqual(post_promotion_state("d" * 40, parent, True, "published"), "published-recovery-forward")
         self.assertEqual(post_promotion_state("d" * 40, parent, False, "pending"), "pre-promotion-stale")
+        self.assertEqual(post_promotion_state(parent, parent, False, "draft"), "draft-recovery-continue")
+        self.assertEqual(post_promotion_state("d" * 40, parent, True, "draft"), "draft-recovery-continue")
+        self.assertEqual(post_promotion_state("d" * 40, parent, False, "draft"), "draft-stale")
 
     def test_debt_manifest_includes_mode_type_oid_and_tombstone(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -725,6 +728,17 @@ class U2ReleaseContractTests(unittest.TestCase):
                 continue
             self.assertNotIn("TVBOX_RELEASE_TOKEN", text, path.name)
             self.assertNotIn("release-production", text, path.name)
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            text = path.read_text()
+            if path.name == "u2-release.yml":
+                self.assertIn("gh release", text)
+            else:
+                self.assertNotIn("gh release", text, path.name)
+        qualify = (ROOT / "scripts/u2_qualify.sh").read_text()
+        self.assertIn("release-debt", qualify)
+        self.assertIn("verified-releases.json", qualify)
+        self.assertIn("docs-only", qualify)
+        self.assertIn("NOOP", qualify)
 
     @staticmethod
     def _job_block(workflow, job_id):
@@ -773,6 +787,53 @@ class U2ReleaseContractTests(unittest.TestCase):
                 if "uses:" not in line or "./.github/" in line:
                     continue
                 self.assertRegex(line, r"uses: [^@]+@[0-9a-f]{40}(?:\s+# .+)?$", str(path))
+
+    def test_release_debt_cli_computes_canonical_baseline_and_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._git(repo, "init", "-b", "main")
+            self._git(repo, "config", "user.name", "U2 test")
+            self._git(repo, "config", "user.email", "u2@example.invalid")
+            (repo / "runtime.txt").write_text("one\n")
+            (repo / "app").mkdir()
+            (repo / "app/build.gradle").write_text("versionCode 23601\nversionName '2.1.26.1'\n")
+            self._git(repo, "add", ".")
+            self._git(repo, "commit", "-m", "release v2.1.26.1")
+            baseline = self._git(repo, "rev-parse", "HEAD")
+            (repo / "runtime.txt").write_text("two\n")
+            self._git(repo, "add", "-A")
+            self._git(repo, "commit", "-m", "runtime change")
+            current = self._git(repo, "rev-parse", "HEAD")
+            releases = [{
+                "tag": "v2.1.26.1",
+                "target": baseline,
+                "versionName": "2.1.26.1",
+                "versionCode": 23601,
+                "assetSha256": "d" * 64,
+                "signerSha256": "e" * 64,
+                "verified": True,
+                "tag_ancestor": True,
+            }]
+            releases_file = repo / "releases.json"
+            releases_file.write_text(json.dumps(releases))
+            result = subprocess.run(
+                [
+                    "python3", "scripts/u2_release.py", "release-debt",
+                    "--repo", str(repo),
+                    "--releases-file", str(releases_file),
+                    "--current", current,
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            parsed = json.loads(result.stdout)
+            self.assertEqual(parsed["baseline"]["tag"], "v2.1.26.1")
+            self.assertEqual(parsed["baseline"]["target"], baseline)
+            self.assertEqual(parsed["classification"], "unknown/high-risk")
+            self.assertEqual(len(parsed["fingerprint"]), 64)
+            self.assertEqual(parsed["path_count"], 1)
 
     @staticmethod
     def _git(repo, *args):
