@@ -103,8 +103,11 @@ jobs:
             pipeline_mode="manual-local"
           fi
           echo "mode=$pipeline_mode" >> "$GITHUB_OUTPUT"
-          echo "expected_version_name=" >> "$GITHUB_OUTPUT"
-          echo "expected_version_code=" >> "$GITHUB_OUTPUT"
+          version_json=$(python3 scripts/u2_release.py parse-app-version --file app/build.gradle)
+          version_name=$(jq -r '.versionName' <<<"$version_json")
+          version_code=$(jq -r '.versionCode' <<<"$version_json")
+          echo "expected_version_name=$version_name" >> "$GITHUB_OUTPUT"
+          echo "expected_version_code=$version_code" >> "$GITHUB_OUTPUT"
           echo "release_debt=" >> "$GITHUB_OUTPUT"
 
   build_rc:
