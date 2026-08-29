@@ -96,6 +96,10 @@ jobs:
     needs: [gate, qualify]
     if: needs.gate.outputs.enabled == 'true'
     uses: ./.github/workflows/rc-pipeline.yml
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     with:
       release_sha: ${{ needs.qualify.outputs.release_sha }}
       source_sha: ${{ needs.qualify.outputs.source_sha }}
