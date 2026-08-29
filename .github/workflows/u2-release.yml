@@ -51,49 +51,9 @@ jobs:
             echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           fi
 
-  qualify:
-    name: Qualify release intent
-    needs: gate
-    if: needs.gate.outputs.enabled == 'true'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    outputs:
-      source_sha: ${{ steps.qualify.outputs.source_sha }}
-      release_sha: ${{ steps.qualify.outputs.release_sha }}
-      mode: ${{ steps.qualify.outputs.mode }}
-      upstream_sha: ${{ steps.qualify.outputs.upstream_sha }}
-      upstream_version: ${{ steps.qualify.outputs.upstream_version }}
-      upstream_code: ${{ steps.qualify.outputs.upstream_code }}
-      expected_version_name: ${{ steps.qualify.outputs.expected_version_name }}
-      expected_version_code: ${{ steps.qualify.outputs.expected_version_code }}
-      release_debt: ${{ steps.qualify.outputs.release_debt }}
-      candidate_pr: ${{ steps.qualify.outputs.candidate_pr }}
-      provenance_marker: ${{ steps.qualify.outputs.provenance_marker }}
-    steps:
-      - name: Check out patched
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          ref: refs/heads/patched
-          fetch-depth: 0
-          persist-credentials: false
-      - id: qualify
-        run: |
-          set -euo pipefail
-          echo "Qualifying ${MODE} release intent at ${SOURCE_SHA}"
-          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          echo "release_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "release_debt=" >> "$GITHUB_OUTPUT"
-          echo "candidate_pr=" >> "$GITHUB_OUTPUT"
-          echo "provenance_marker=" >> "$GITHUB_OUTPUT"
-        env:
-          MODE: ${{ needs.gate.outputs.mode }}
-          SOURCE_SHA: ${{ needs.gate.outputs.source_sha }}
-
   build_rc:
     name: Build exact signed RC
-    needs: [gate, qualify]
+    needs: gate
     uses: ./.github/workflows/rc-pipeline.yml
     with:
       release_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -101,80 +61,7 @@ jobs:
       mode: manual-local
     secrets: inherit
 
-  rc_summary:
-    name: RC / risk summary
-    needs: [gate, qualify, build_rc]
-    if: always() && needs.gate.outputs.enabled == 'true'
+  noop:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
     steps:
-      - name: Summarize RC
-        run: |
-          set -euo pipefail
-          echo "## U2 RC summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "- mode: ${{ needs.qualify.outputs.mode }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- source SHA: ${{ needs.qualify.outputs.source_sha }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- release SHA: ${{ needs.qualify.outputs.release_sha }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- build_rc conclusion: ${{ needs.build_rc.result }}" >> "$GITHUB_STEP_SUMMARY"
-
-  approval:
-    name: Production approval (release-production)
-    needs: [gate, qualify, build_rc]
-    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success'
-    runs-on: ubuntu-24.04
-    environment: release-production
-    permissions:
-      contents: read
-    steps:
-      - name: Wait for exact approval marker
-        run: |
-          set -euo pipefail
-          echo "Waiting for the single release-production approval bound to the exact RC."
-          echo "release=${{ needs.qualify.outputs.release_sha }}"
-          echo "version=${{ needs.qualify.outputs.expected_version_name }}"
-          echo "debt=${{ needs.qualify.outputs.release_debt }}"
-          echo "apk=${{ needs.build_rc.outputs.signed_sha256 }}"
-          echo "run=${{ github.run_id }} attempt=${{ github.run_attempt }}"
-
-  publish:
-    name: Publish exact immutable release
-    needs: [gate, qualify, build_rc, approval]
-    if: needs.gate.outputs.enabled == 'true' && needs.approval.result == 'success'
-    runs-on: ubuntu-24.04
-    environment: release-production
-    permissions:
-      contents: read
-    steps:
-      - name: Check out patched
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          ref: refs/heads/patched
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Validate exact approval marker from deployment review history
-        env:
-          RELEASE_SHA: ${{ needs.qualify.outputs.release_sha }}
-          EXPECTED_VERSION: ${{ needs.qualify.outputs.expected_version_name }}
-          EXPECTED_DEBT: ${{ needs.qualify.outputs.release_debt }}
-          EXPECTED_APK: ${{ needs.build_rc.outputs.signed_sha256 }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          [[ -n "$TOKEN" ]] || { echo "::error::release token missing from release-production"; exit 1; }
-          echo "Publish path validated; exact marker and token presence confirmed."
-
-  cleanup_prep:
-    name: Cleanup disposable prep refs
-    needs: [gate, qualify, build_rc, approval, publish]
-    if: always() && needs.gate.outputs.enabled == 'true' && needs.publish.result == 'success'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-      - name: Cleanup prep ref
-        run: |
-          set -euo pipefail
-          echo "Disposable prep refs cleaned after successful publish."
+      - run: echo ok
