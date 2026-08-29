@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   gate:
@@ -54,12 +55,25 @@ jobs:
   build_rc:
     name: Build exact signed RC
     needs: gate
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/rc-pipeline.yml
+    secrets: inherit
     with:
       release_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       source_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       mode: manual-local
-    secrets: inherit
+      upstream_sha: ''
+      upstream_version: ''
+      upstream_code: ''
+      expected_version_name: ''
+      expected_version_code: ''
+      release_debt: ''
+      candidate_pr: ''
+      provenance_marker: ''
 
   noop:
     runs-on: ubuntu-24.04
