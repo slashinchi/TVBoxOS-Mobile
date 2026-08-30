@@ -805,6 +805,43 @@ class U2ReleaseContractTests(unittest.TestCase):
                     continue
                 self.assertRegex(line, r"uses: [^@]+@[0-9a-f]{40}(?:\s+# .+)?$", str(path))
 
+    def test_u2_canary_has_injections_and_always_cleanup(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        canary = self._job_block(workflow, "canary_publish")
+        self.assertIn("TVBOX_CANARY_INJECT", canary)
+        self.assertIn("missing-asset", canary)
+        self.assertIn("extra-asset", canary)
+        self.assertIn("stale-rc", canary)
+        self.assertIn("delivery-proxy", canary)
+        self.assertIn("if: always()", canary)
+        self.assertIn("gh release delete", canary)
+        self.assertIn("--cleanup-tag", canary)
+
+    def test_u2_publish_chain_is_wired_with_helpers_and_concurrency(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        publish = self._job_block(workflow, "publish")
+        self.assertIn("Promote patched to exact release SHA (CAS)", publish)
+        self.assertIn("extract-signed-apk", publish)
+        self.assertIn("gh release create", publish)
+        self.assertIn("gh release publish", publish)
+        self.assertIn("gh release verify", publish)
+        self.assertIn("verify-asset", publish)
+        self.assertIn("build-update-json", publish)
+        self.assertIn("monotonic-compare", publish)
+        self.assertIn("release-delivery", publish)
+        self.assertIn("u2-prep-", publish)
+        self.assertIn("concurrency:", publish)
+        self.assertIn("tvbox-u2-publish", publish)
+        self.assertIn("cancel-in-progress: false", publish)
+        prep = self._job_block(workflow, "prep")
+        self.assertIn("plan-prep", prep)
+        self.assertIn("write-prep-version", prep)
+        self.assertIn("u2-prep-", prep)
+        self.assertIn("tvbox-u2-prepare", prep)
+        qualify = self._job_block(workflow, "qualify")
+        self.assertIn("qualify-u1", qualify)
+        self.assertIn("parse-provenance-marker", qualify)
+
     def test_release_debt_cli_computes_canonical_baseline_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

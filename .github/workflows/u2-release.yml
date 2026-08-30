@@ -586,7 +586,8 @@ jobs:
         with:
           artifact-ids: ${{ needs.build_rc.outputs.signed_artifact_id }}
           path: ${{ runner.temp }}/signed-output
-      - name: Create draft-only canary release
+      - name: Create draft-only canary release (idempotent)
+        id: canary
         env:
           RELEASE_SHA: ${{ needs.qualify.outputs.release_sha }}
           EXPECTED_VERSION: ${{ needs.qualify.outputs.expected_version_name }}
@@ -594,6 +595,7 @@ jobs:
           EXPECTED_APK: ${{ needs.build_rc.outputs.signed_sha256 }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
+          INJECT: ${{ vars.TVBOX_CANARY_INJECT }}
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
         run: |
           set -euo pipefail
@@ -607,13 +609,105 @@ jobs:
           }
           echo "::notice::canary signed APK digest verified: $actual"
           asset_name="TVBox-Mobile-v${EXPECTED_VERSION}.apk"
-          cp "$signed" "$RUNNER_TEMP/$asset_name"
+          mkdir -p "$RUNNER_TEMP/canary-assets"
+          cp "$signed" "$RUNNER_TEMP/canary-assets/$asset_name"
           tag="u2-canary-${RUN_ID}-attempt${RUN_ATTEMPT}"
-          GH_TOKEN="$TOKEN" gh release create "$tag" \
-            --repo slashinchi/TVBoxOS-Mobile \
-            --draft \
-            --target "$RELEASE_SHA" \
-            --title "U2 canary $tag" \
-            --notes "Draft-only U2 canary. release=$RELEASE_SHA version=$EXPECTED_VERSION debt=${EXPECTED_DEBT:-none} run=$RUN_ID attempt=$RUN_ATTEMPT. Not published; disposable." \
-            "$RUNNER_TEMP/$asset_name"
-          echo "::notice::canary draft created: $tag with asset $asset_name"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
+          # Failure injections (env-gated): missing asset then repair; extra asset then reject.
+          case "${INJECT:-none}" in
+            missing-asset)
+              echo "::notice::injecting missing-asset scenario (draft without APK)"
+              GH_TOKEN="$TOKEN" gh release create "$tag" \
+                --repo slashinchi/TVBoxOS-Mobile \
+                --draft \
+                --target "$RELEASE_SHA" \
+                --title "U2 canary $tag" \
+                --notes "Draft-only U2 canary (missing-asset injection). release=$RELEASE_SHA version=$EXPECTED_VERSION debt=${EXPECTED_DEBT:-none} run=$RUN_ID attempt=$RUN_ATTEMPT. Not published; disposable."
+              state=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json assets --jq '.assets | length')
+              [[ "$state" -eq 0 ]] || { echo "::error::missing-asset injection unexpectedly has assets"; exit 1; }
+              GH_TOKEN="$TOKEN" gh release upload "$tag" \
+                --repo slashinchi/TVBoxOS-Mobile \
+                --clobber \
+                "$RUNNER_TEMP/canary-assets/$asset_name"
+              state=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json assets --jq '.assets | length')
+              [[ "$state" -eq 1 ]] || { echo "::error::repair after missing-asset injection failed"; exit 1; }
+              echo "::notice::missing-asset repair verified (asset count $state)"
+              ;;
+            extra-asset)
+              echo "::notice::injecting extra-asset scenario (draft with stale extra file)"
+              printf 'stale' > "$RUNNER_TEMP/canary-assets/stale.txt"
+              GH_TOKEN="$TOKEN" gh release create "$tag" \
+                --repo slashinchi/TVBoxOS-Mobile \
+                --draft \
+                --target "$RELEASE_SHA" \
+                --title "U2 canary $tag" \
+                --notes "Draft-only U2 canary (extra-asset injection). release=$RELEASE_SHA version=$EXPECTED_VERSION debt=${EXPECTED_DEBT:-none} run=$RUN_ID attempt=$RUN_ATTEMPT. Not published; disposable." \
+                "$RUNNER_TEMP/canary-assets/$asset_name" "$RUNNER_TEMP/canary-assets/stale.txt"
+              names=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json assets --jq '[.assets[].name] | sort | join(",")')
+              [[ "$names" == "$asset_name,stale.txt" || "$names" == "stale.txt,$asset_name" ]] || {
+                echo "::error::extra-asset injection asset set unexpected: $names"; exit 1;
+              }
+              GH_TOKEN="$TOKEN" gh release delete-asset "$tag" \
+                --repo slashinchi/TVBoxOS-Mobile \
+                --yes \
+                --name stale.txt
+              state=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json assets --jq '.assets | length')
+              [[ "$state" -eq 1 ]] || { echo "::error::extra-asset rejection failed"; exit 1; }
+              echo "::notice::extra-asset rejection verified (asset count $state)"
+              ;;
+            stale-rc)
+              echo "::notice::injecting stale-RC scenario (newer merge supersedes this RC)"
+              newer_sha=$(git rev-list --max-count=1 origin/patched 2>/dev/null || echo "")
+              if [[ -n "$newer_sha" && "$newer_sha" != "$RELEASE_SHA" ]]; then
+                echo "::error::stale-RC injection: patched has advanced past this RC; draft must not be created"
+                echo "stale=true" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+              echo "::notice::stale-RC injection not applicable (patched still at release SHA)"
+              ;;
+            delivery-proxy)
+              echo "::notice::injecting delivery-proxy failure scenario (wrong bytes)"
+              apk_url="https://gh.xxooo.cf/slashinchi/TVBoxOS-Mobile/releases/download/${tag}/TVBox-Mobile-v${EXPECTED_VERSION}.apk"
+              if curl -fsSL --connect-timeout 10 --max-time 60 -o "$RUNNER_TEMP/proxy-mismatch.bin" "$apk_url" 2>/dev/null; then
+                bad=$(sha256sum "$RUNNER_TEMP/proxy-mismatch.bin" | awk '{print $1}')
+                verified=$(python3 scripts/u2_publish.py delivery-compare \
+                  --url "$apk_url" \
+                  --expected-sha "$EXPECTED_APK" \
+                  --fetched-sha "$bad" | jq -r '.verified')
+                [[ "$verified" == "true" ]] && {
+                  echo "::error::delivery-proxy injection unexpectedly matched"; exit 1;
+                }
+                echo "::notice::delivery-proxy mismatch detected as expected"
+              else
+                echo "::notice::delivery-proxy injection: proxy unreachable for canary tag (expected while draft-only)"
+              fi
+              ;;
+            *)
+              GH_TOKEN="$TOKEN" gh release create "$tag" \
+                --repo slashinchi/TVBoxOS-Mobile \
+                --draft \
+                --target "$RELEASE_SHA" \
+                --title "U2 canary $tag" \
+                --notes "Draft-only U2 canary. release=$RELEASE_SHA version=$EXPECTED_VERSION debt=${EXPECTED_DEBT:-none} run=$RUN_ID attempt=$RUN_ATTEMPT. Not published; disposable." \
+                "$RUNNER_TEMP/canary-assets/$asset_name"
+              echo "::notice::canary draft created: $tag with asset $asset_name"
+              ;;
+          esac
+
+      - name: Clean up canary draft and tag (always)
+        if: always()
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          tag="u2-canary-${RUN_ID}-attempt${RUN_ATTEMPT}"
+          if GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile >/dev/null 2>&1; then
+            GH_TOKEN="$TOKEN" gh release delete "$tag" --repo slashinchi/TVBoxOS-Mobile --yes --cleanup-tag
+            echo "::notice::canary draft and tag removed: $tag"
+          else
+            echo "::notice::canary draft $tag not found; nothing to clean"
+          fi
