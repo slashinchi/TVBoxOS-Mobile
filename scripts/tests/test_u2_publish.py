@@ -212,16 +212,23 @@ class U2PublishContractTests(unittest.TestCase):
             "verify-published",
         )
 
-    def test_released_identity_decision_repair_published_missing(self):
+    def test_released_identity_decision_rejects_published_missing_assets(self):
+        # A published Release in an immutable repository can never accept new
+        # assets; missing assets are unrecoverable and must fail closed.
         missing_update = _draft([_asset(APK_NAME, f"sha256:{APK_DIGEST}")], is_draft=False)
         self.assertEqual(
             released_identity_decision(missing_update, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
-            "repair-published-missing",
+            "reject-published-missing-asset",
         )
         missing_apk = _draft([_asset("update.json", f"sha256:{UPDATE_DIGEST}")], is_draft=False)
         self.assertEqual(
             released_identity_decision(missing_apk, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
-            "repair-published-missing",
+            "reject-published-missing-asset",
+        )
+        empty_published = _draft([], is_draft=False)
+        self.assertEqual(
+            released_identity_decision(empty_published, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-published-missing-asset",
         )
 
     def test_released_identity_decision_rejects_bad_published(self):
