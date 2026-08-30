@@ -79,9 +79,9 @@ Complete the original post-merge release-management objective in production shap
 - No whole-run concurrency group (30-day approval wait must not block newer RC).
 - Qualification/build/sign/attest may run concurrently; revalidate immutable inputs.
 - Prep-ref mutation: job-level `tvbox-u2-prepare` concurrency.
-- Approval-wait job: not in publish concurrency group.
-- Irreversible post-approval publish: job-level `tvbox-u2-publish` concurrency, `queue: max`, no cancel.
-- Queue order is never release authority; every prep/publish job recomputes canonical state before mutation.
+- Exactly one job references `release-production`: the single `publish` job. A no-environment `rc_summary` job (after `build_rc`) prints the full RC/risk evidence and the exact `TVBOX_RELEASE_APPROVE_V2` marker to the run log before the human approves; the human never needs the marker from inside the protected job.
+- `publish` owns the `tvbox-u2-publish` job-level concurrency (no cancel, `queue: max` permitted); GitHub environment approval reuse across jobs is NOT relied on — each run requires exactly one approved `release-production` review whose comment matches the current-run marker.
+- Queue order is never release authority; every prep/publish job recomputes canonical state before mutation. A stale approved RC that reaches `publish` after `patched` advanced must fail closed during revalidation.
 
 ### 3.8 Trust / permissions
 - Caller jobs invoking `rc-pipeline.yml`: max `contents: read` + `id-token: write` + `attestations: write`; no other scopes.
