@@ -92,8 +92,9 @@ def reconcile_draft_decision(draft, version, expected_tag, expected_target_sha, 
     if tag != expected_tag or target_sha != expected_target_sha:
         return "reject-identity"
     if target not in ("", expected_target_sha):
-        # targetCommitish should be a SHA when U2 created the draft; a branch
-        # name is tolerated only if the authoritative tagTargetSha matches.
+        # targetCommitish must be the exact full SHA (U2 created the draft with
+        # --target <sha>); a branch name or any other ref is never identity and
+        # is rejected even when a tagTargetSha is present.
         return "reject-identity"
     if (draft or {}).get("isDraft", (draft or {}).get("draft")) is not True:
         return "reject-not-draft"

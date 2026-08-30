@@ -725,11 +725,6 @@ class U2ReleaseContractTests(unittest.TestCase):
     def test_whole_repo_has_exactly_one_release_signing_consumer(self):
         consumers = []
         for path in (ROOT / ".github/workflows").glob("*.yml"):
-            # u2-canary-harness.yml is a TEMPORARY disposable canary harness
-            # (removed by the closeout PR); its secrets: inherit references
-            # release-signing in comments only and is not a signer consumer.
-            if path.name == "u2-canary-harness.yml":
-                continue
             text = path.read_text()
             if "environment: release-signing" not in text:
                 continue
@@ -749,18 +744,12 @@ class U2ReleaseContractTests(unittest.TestCase):
             text = path.read_text()
             if path.name in {"u2-release.yml", "rc-pipeline.yml"}:
                 continue
-            # TEMPORARY: the disposable canary harness legitimately uses
-            # TVBOX_RELEASE_TOKEN + release-production (removed by closeout PR).
-            if path.name == "u2-canary-harness.yml":
-                continue
             self.assertNotIn("TVBOX_RELEASE_TOKEN", text, path.name)
             self.assertNotIn("release-production", text, path.name)
         for path in (ROOT / ".github/workflows").glob("*.yml"):
             text = path.read_text()
             if path.name == "u2-release.yml":
                 self.assertIn("gh release", text)
-            elif path.name == "u2-canary-harness.yml":
-                continue  # TEMPORARY disposable harness; removed by closeout PR.
             else:
                 self.assertNotIn("gh release", text, path.name)
         # Whole-repo write enumeration: release writes (contents:write / git push)
