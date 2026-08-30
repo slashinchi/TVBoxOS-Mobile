@@ -1024,6 +1024,58 @@ class U2ReleaseContractTests(unittest.TestCase):
         attach_step = next(s for s in steps if "Attach missing assets" in str(s))
         self.assertNotIn("--clobber", str(attach_step))
 
+    def test_u2_publish_chain_supports_published_recovery_and_preflight_gates(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        publish = tree["jobs"]["publish"]
+        steps = publish["steps"]
+        step_text = "\n".join(str(s) for s in steps)
+        # Published (non-draft) recovery: the create/reconcile step classifies
+        # an existing published Release via released-identity and continues.
+        self.assertIn("released-identity", step_text)
+        self.assertIn("verify-published", step_text)
+        self.assertIn("repair-published-missing", step_text)
+        self.assertIn("conflicting public identity fails closed", step_text)
+        # Publish step must skip already-published releases (retry recovery).
+        publish_step = next(s for s in steps if "Publish verified draft" in str(s))
+        self.assertIn("already published; skipping publish", str(publish_step))
+        # Approval gate: exactly one approved review by slashinchi.
+        approval_step = next(s for s in steps if "Verify exact approval marker" in str(s))
+        approval_text = str(approval_step)
+        self.assertIn("expected exactly one release-production approval", approval_text)
+        self.assertIn("approval actor is", approval_text)
+        self.assertIn('"slashinchi"', approval_text)
+        # Immutable-releases preflight before any mutation.
+        revalidate_step = next(s for s in steps if "Revalidate release identity" in str(s))
+        self.assertIn("immutable-releases", str(revalidate_step))
+        self.assertIn("immutable releases are not enabled", str(revalidate_step))
+        # Independent APK signer/package/version verification.
+        self.assertIn("Independently verify APK signer/package/version", step_text)
+        self.assertIn("apksigner", step_text)
+        self.assertIn("aapt2", step_text)
+        self.assertIn("publish signer fingerprint mismatch", step_text)
+        self.assertIn("publish APK package mismatch", step_text)
+        self.assertIn("publish APK versionName mismatch", step_text)
+        # Metadata step must skip a no-op identical commit on retry recovery.
+        metadata_step = next(s for s in steps if "Reconcile root update.json" in str(s))
+        self.assertIn("already identical", str(metadata_step))
+        # The release-view JSON fields must stay within gh's documented set
+        # (tag_target_sha is not a supported --json field and would make
+        # reconcile unreachable; the shell variable of the same name is fine).
+        for view in ("Create or reconcile draft", "Verify both assets before publish"):
+            view_step = next(s for s in steps if view in str(s))
+            view_run = str(view_step).replace("\\n", "\n")
+            json_line = next(l for l in view_run.splitlines() if "--json" in l)
+            self.assertNotIn("tag_target_sha", json_line)
+        # The tag-ref API call must use --silent so a 404 body is not captured
+        # into tag_target_sha (gh api prints the error body to stdout even on
+        # exit 1, which would poison the identity fallback).
+        draft_step = next(s for s in steps if "Create or reconcile draft" in str(s))
+        draft_run = str(draft_step).replace("\\n", "\n")
+        tag_ref_line = next(l for l in draft_run.splitlines() if "git/ref/tags" in l)
+        self.assertIn("--silent", tag_ref_line)
+        self.assertNotIn("--jq '.object.sha' 2>/dev/null || echo \"\")", tag_ref_line.replace("--silent", ""))
+
     def test_release_debt_cli_computes_canonical_baseline_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

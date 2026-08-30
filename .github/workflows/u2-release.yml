@@ -505,6 +505,16 @@ jobs:
           [[ -n "$approvals" && "$approvals" != "[]" ]] || {
             echo "::error::no release-production approval found for run ${RUN_ID}"; exit 1;
           }
+          # Exactly one approved review, and it must be slashinchi's (the only
+          # configured reviewer). Any other actor or count fails closed.
+          count=$(jq 'length' <<<"$approvals")
+          [[ "$count" -eq 1 ]] || {
+            echo "::error::expected exactly one release-production approval, found $count"; exit 1;
+          }
+          actor=$(jq -r '.[0].user.login // ""' <<<"$approvals")
+          [[ "$actor" == "slashinchi" ]] || {
+            echo "::error::release-production approval actor is $actor, expected slashinchi"; exit 1;
+          }
           matched=false
           while IFS= read -r -d '' comment; do
             check=$(python3 scripts/u2_release.py approval-matches \
@@ -574,6 +584,10 @@ jobs:
           # The release-production environment must still exist with admin bypass off.
           env_state=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/environments/release-production" --jq '{name,protection_rules:.protection_rules}' 2>/dev/null || echo "")
           [[ -n "$env_state" ]] || { echo "::error::release-production environment missing"; exit 1; }
+          # Repository immutable-releases setting must still be enabled BEFORE
+          # any mutation; a public mutable Release must never be created.
+          imm=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/immutable-releases" --jq '.enabled' 2>/dev/null || echo "")
+          [[ "$imm" == "true" ]] || { echo "::error::repository immutable releases are not enabled"; exit 1; }
           echo "::notice::release identity revalidated (release=$RELEASE_SHA version=$EXPECTED_VERSION apk=$EXPECTED_APK signer=$SIGNER_SHA debt=$EXPECTED_DEBT recomputed=$recomputed_debt)"
           echo "::notice::default branch patched + release-production environment confirmed (immutable releases enforced per-Release post-publish)"
 
@@ -658,6 +672,34 @@ jobs:
           }
           echo "::notice::attestations verified for exact signed RC (SLSA v1 + tvbox-release-identity-v2)"
 
+      - name: Independently verify APK signer/package/version (fail-closed)
+        env:
+          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          SIGNER_SHA: ${{ steps.identity.outputs.SIGNER_SHA }}
+        run: |
+          set -euo pipefail
+          signed="${{ steps.assets.outputs.signed_path }}"
+          test -f "$signed" || { echo "::error::signed APK missing for identity verify"; exit 1; }
+          apksigner="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          aapt2="$ANDROID_HOME/build-tools/34.0.0/aapt2"
+          test -x "$apksigner" || { echo "::error::apksigner not found"; exit 1; }
+          test -x "$aapt2" || { echo "::error::aapt2 not found"; exit 1; }
+          # Signer fingerprint must match the approved signer (independent of
+          # attestation; the same apksigner invocation the RC pipeline uses).
+          "$apksigner" verify --verbose --print-certs "$signed" > "$RUNNER_TEMP/publish-verify-signature.txt"
+          signer_sha=$(sed -nE 's/.*certificate SHA-256 digest: ([0-9A-Fa-f:]+).*/\1/p' "$RUNNER_TEMP/publish-verify-signature.txt" | tr -d ':' | tr '[:upper:]' '[:lower:]' | head -n 1)
+          expected_signer=$(printf '%s' "$SIGNER_SHA" | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          [[ "$signer_sha" =~ ^[0-9a-f]{64}$ && "$signer_sha" == "$expected_signer" ]] || {
+            echo "::error::publish signer fingerprint mismatch: $signer_sha != $expected_signer"; exit 1;
+          }
+          # Package name and versionName must match the approved release identity.
+          badging=$("$aapt2" dump badging "$signed")
+          package_name=$(sed -nE "s/^package: name='([^']+)'.*/\1/p" <<<"$badging" | head -n 1)
+          apk_name=$(sed -nE "s/^package:.*versionName='([^']+)'.*/\1/p" <<<"$badging" | head -n 1)
+          [[ "$package_name" == "com.github.tvbox.osc" ]] || { echo "::error::publish APK package mismatch: $package_name"; exit 1; }
+          [[ "$apk_name" == "$EXPECTED_VERSION" ]] || { echo "::error::publish APK versionName mismatch: $apk_name != $EXPECTED_VERSION"; exit 1; }
+          echo "::notice::APK identity independently verified (signer=$signer_sha package=$package_name versionName=$apk_name)"
+
       - name: Create or reconcile draft Release with exact identity
         id: release
         env:
@@ -681,14 +723,14 @@ jobs:
             --output "$update_file"
           update_digest=$(sha256sum "$update_file" | awk '{print $1}')
           existing=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile \
-            --json tagName,targetCommitish,isDraft,assets,tag_target_sha \
+            --json tagName,targetCommitish,isDraft,assets \
             --jq '.' 2>/dev/null || echo "")
           if [[ -n "$existing" ]]; then
             # Resolve the authoritative tag-object commit SHA. Drafts have no
             # tag ref yet, so fall back to targetCommitish when it is a full SHA
             # (gh release create --draft --target stores the SHA); a branch-name
             # targetCommitish with a resolvable tag ref must still match the ref.
-            tag_target_sha=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null || echo "")
+            tag_target_sha=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' --silent 2>/dev/null || echo "")
             if [[ -z "$tag_target_sha" ]]; then
               commitish=$(echo "$existing" | jq -r '.targetCommitish // ""')
               if [[ "$commitish" =~ ^[0-9a-f]{40}$ ]]; then
@@ -698,25 +740,49 @@ jobs:
             if [[ -n "$tag_target_sha" ]]; then
               existing=$(echo "$existing" | jq --arg sha "$tag_target_sha" '.tagTargetSha = $sha')
             fi
-            decision=$(python3 scripts/u2_publish.py reconcile-draft \
-              --draft "$existing" \
-              --version "$EXPECTED_VERSION" \
-              --expected-tag "$tag" \
-              --expected-target-sha "$RELEASE_SHA" \
-              --apk-digest "$EXPECTED_APK" \
-              --update-digest "$update_digest" | jq -r '.decision')
-            case "$decision" in
-              exact-reuse)
-                echo "::notice::reusing identity-exact draft $tag"
-                ;;
-              repair-missing)
-                echo "::notice::repairing identity-exact draft $tag (missing-only, no clobber)"
-                ;;
-              *)
-                echo "::error::existing Release $tag cannot be safely reused (decision=$decision); stale or wrong assets must never be published"
-                exit 1
-                ;;
-            esac
+            is_draft=$(echo "$existing" | jq -r '.isDraft')
+            if [[ "$is_draft" == "true" ]]; then
+              decision=$(python3 scripts/u2_publish.py reconcile-draft \
+                --draft "$existing" \
+                --version "$EXPECTED_VERSION" \
+                --expected-tag "$tag" \
+                --expected-target-sha "$RELEASE_SHA" \
+                --apk-digest "$EXPECTED_APK" \
+                --update-digest "$update_digest" | jq -r '.decision')
+              case "$decision" in
+                exact-reuse)
+                  echo "::notice::reusing identity-exact draft $tag"
+                  ;;
+                repair-missing)
+                  echo "::notice::repairing identity-exact draft $tag (missing-only, no clobber)"
+                  ;;
+                *)
+                  echo "::error::existing Release $tag cannot be safely reused (decision=$decision); stale or wrong assets must never be published"
+                  exit 1
+                  ;;
+              esac
+            else
+              # Already published: a prior run crossed the publish point but
+              # failed later (delivery/metadata/readback). Verify the published
+              # Release identity and continue to post-publish reconciliation.
+              released_decision=$(python3 scripts/u2_publish.py released-identity \
+                --release "$existing" \
+                --version "$EXPECTED_VERSION" \
+                --expected-tag "$tag" \
+                --expected-target-sha "$RELEASE_SHA" \
+                --apk-digest "$EXPECTED_APK" \
+                --update-digest "$update_digest" | jq -r '.decision')
+              case "$released_decision" in
+                verify-published|repair-published-missing)
+                  echo "::notice::published Release $tag identity-exact (state=$released_decision); continuing post-publish verification"
+                  decision="published"
+                  ;;
+                *)
+                  echo "::error::published Release $tag cannot be safely continued (decision=$released_decision); conflicting public identity fails closed"
+                  exit 1
+                  ;;
+              esac
+            fi
           else
             run_url="https://github.com/slashinchi/TVBoxOS-Mobile/actions/runs/${{ github.run_id }}"
             notes=$(printf '%s\n' \
@@ -753,7 +819,7 @@ jobs:
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
           tag="${{ steps.release.outputs.tag }}"
           decision="${{ steps.release.outputs.decision }}"
-          [[ "$decision" == "repair-missing" || "$decision" == "created" ]] || {
+          [[ "$decision" == "repair-missing" || "$decision" == "created" || "$decision" == "repair-published-missing" ]] || {
             echo "::notice::no asset attach needed (decision=$decision)"
             exit 0
           }
@@ -810,6 +876,11 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.release.outputs.tag }}"
+          decision="${{ steps.release.outputs.decision }}"
+          if [[ "$decision" == "published" || "$decision" == "verify-published" ]]; then
+            echo "::notice::Release $tag already published; skipping publish"
+            exit 0
+          fi
           GH_TOKEN="$TOKEN" gh release publish "$tag" --repo slashinchi/TVBoxOS-Mobile
           echo "::notice::Release $tag published"
 
@@ -932,6 +1003,10 @@ jobs:
             --version "$cand_version" \
             --apk-url "$apk_url" \
             --output update.json
+          if [[ -n "$remote_content" ]] && cmp -s update.json <(printf '%s' "$remote_content"); then
+            echo "::notice::remote update.json already identical to v${cand_version}; no commit needed"
+            exit 0
+          fi
           git config user.name "TVBox U2 Publish"
           git config user.email "u2-publish@users.noreply.github.com"
           git add update.json

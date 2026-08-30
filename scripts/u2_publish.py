@@ -138,6 +138,63 @@ def immutable_verified(state, expected_tag=None, expected_target=None):
     return True
 
 
+def released_identity_decision(release, version, expected_tag, expected_target_sha, apk_digest, update_digest):
+    """Classify an already-published (non-draft) Release for retry recovery.
+
+    Returns one of:
+      verify-published        — the published Release is identity-exact at the
+                                expected tag + target SHA with exact two-asset
+                                digests (or missing-only assets that can be
+                                repaired before metadata reconciliation).
+      reject-published-*      — identity-mismatch | digest-mismatch |
+                                extra-asset | empty-digest | invalid-shape.
+    Never returns a decision that would publish unverified bytes. This path is
+    reached only when a prior run already crossed the publish point (e.g. the
+    Release is immutable/published but delivery, metadata or readback failed).
+    """
+    if not VERSION_RE.fullmatch(version or ""):
+        return "reject-version"
+    if not RELEASE_TAG_RE.fullmatch(expected_tag or ""):
+        return "reject-version"
+    if not expected_tag.startswith("v"):
+        return "reject-version"
+    _require_full_sha(expected_target_sha, "expected target SHA")
+    _require_hex64(apk_digest, "APK digest")
+    _require_hex64(update_digest, "update digest")
+
+    if not isinstance(release, dict):
+        return "reject-published-invalid-shape"
+    tag = release.get("tagName") or release.get("tag_name")
+    target = release.get("targetCommitish") or release.get("target_commitish")
+    # The tag object SHA is the identity authority for a published Release
+    # (target_commitish may be a branch name after publish; never trust it alone).
+    target_sha = release.get("tagTargetSha") or release.get("tag_target_sha") or ""
+    if not target_sha and target:
+        if FULL_SHA_RE.fullmatch(target or ""):
+            target_sha = target
+    if tag != expected_tag or target_sha != expected_target_sha:
+        return "reject-published-identity"
+    if (release.get("isDraft", release.get("draft", False)) is True):
+        return "reject-published-is-draft"
+    expected = expected_asset_set(version)
+    assets = {(item.get("name") or ""): _asset_digest(item) for item in release.get("assets") or []}
+    names = set(assets)
+    if names - expected:
+        return "reject-published-extra-asset"
+    if any(not HEX64_RE.fullmatch(digest) for digest in assets.values()):
+        return "reject-published-digest-mismatch"
+    apk_name = f"TVBox-Mobile-v{version}.apk"
+    present_apk = assets.get(apk_name, "")
+    present_update = assets.get("update.json", "")
+    apk_ok = (present_apk == "" or present_apk == apk_digest)
+    update_ok = (present_update == "" or present_update == update_digest)
+    if not apk_ok or not update_ok:
+        return "reject-published-digest-mismatch"
+    if names == expected:
+        return "verify-published"
+    return "repair-published-missing"
+
+
 def verify_release_assets(release, version, expected_digests, download_dir):
     """Verify API-reported digests and actual downloaded bytes for both assets.
 
@@ -307,6 +364,14 @@ def main(argv=None):
     verify_meta.add_argument("--expected-version", required=True)
     verify_meta.add_argument("--expected-apk-url", required=True)
 
+    released = subparsers.add_parser("released-identity")
+    released.add_argument("--release", required=True)
+    released.add_argument("--version", required=True)
+    released.add_argument("--expected-tag", required=True)
+    released.add_argument("--expected-target-sha", required=True)
+    released.add_argument("--apk-digest", required=True)
+    released.add_argument("--update-digest", required=True)
+
     incident = subparsers.add_parser("incident-key")
     incident.add_argument("--mode", required=True)
     incident.add_argument("--source-sha", required=True)
@@ -359,6 +424,17 @@ def main(argv=None):
             args.expected_version,
             args.expected_apk_url,
         ), sort_keys=True))
+    elif args.command == "released-identity":
+        release = json.loads(args.release)
+        decision = released_identity_decision(
+            release,
+            args.version,
+            args.expected_tag,
+            args.expected_target_sha,
+            args.apk_digest,
+            args.update_digest,
+        )
+        print(json.dumps({"decision": decision}, sort_keys=True))
     elif args.command == "incident-key":
         print(json.dumps({"key": incident_key(args.mode, args.source_sha, args.version, args.debt)}, sort_keys=True))
     return 0
