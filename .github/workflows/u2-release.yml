@@ -616,8 +616,17 @@ jobs:
             --json tagName,targetCommitish,isDraft,assets,tag_target_sha \
             --jq '.' 2>/dev/null || echo "")
           if [[ -n "$existing" ]]; then
-            # Resolve the authoritative tag-object commit SHA.
+            # Resolve the authoritative tag-object commit SHA. Drafts have no
+            # tag ref yet, so fall back to targetCommitish when it is a full SHA
+            # (gh release create --draft --target stores the SHA); a branch-name
+            # targetCommitish with a resolvable tag ref must still match the ref.
             tag_target_sha=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null || echo "")
+            if [[ -z "$tag_target_sha" ]]; then
+              commitish=$(echo "$existing" | jq -r '.targetCommitish // ""')
+              if [[ "$commitish" =~ ^[0-9a-f]{40}$ ]]; then
+                tag_target_sha="$commitish"
+              fi
+            fi
             if [[ -n "$tag_target_sha" ]]; then
               existing=$(echo "$existing" | jq --arg sha "$tag_target_sha" '.tagTargetSha = $sha')
             fi
@@ -712,7 +721,10 @@ jobs:
             --pattern "*" \
             --dir "$RUNNER_TEMP/pre-publish-verify" --clobber
           mv "$RUNNER_TEMP/update.json" "$RUNNER_TEMP/pre-publish-verify/update.json" 2>/dev/null || true
-          state=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/releases/tags/${tag}" --jq '.')
+          state=$(GH_TOKEN="$TOKEN" gh release view "$tag" \
+            --repo slashinchi/TVBoxOS-Mobile \
+            --json tagName,targetCommitish,isDraft,assets \
+            --jq '.')
           result=$(python3 scripts/u2_publish.py verify-release-assets \
             --release "$state" \
             --version "${{ steps.identity.outputs.EXPECTED_VERSION }}" \
