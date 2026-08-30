@@ -160,6 +160,21 @@ class U2PublishContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reconcile_draft_decision(draft, VERSION, TAG, TARGET, APK_DIGEST, "")
 
+    def test_reconcile_decision_requires_standard_tag_unless_allowed(self):
+        canary_tag = "u2-canary-123-attempt1"
+        draft = _draft([_asset(APK_NAME, f"sha256:{APK_DIGEST}"), _asset("update.json", f"sha256:{UPDATE_DIGEST}")], tag=canary_tag)
+        # Production path (default) must reject the nonstandard tag.
+        self.assertEqual(
+            reconcile_draft_decision(draft, VERSION, canary_tag, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-version",
+        )
+        # Harness path (explicit opt-in) allows it and still checks identity.
+        self.assertEqual(
+            reconcile_draft_decision(draft, VERSION, canary_tag, TARGET, APK_DIGEST, UPDATE_DIGEST,
+                                     allow_nonstandard_tag=True),
+            "exact-reuse",
+        )
+
     def test_immutable_verified_requires_exact_state(self):
         tag = TAG
         target = TARGET

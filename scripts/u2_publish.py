@@ -56,7 +56,7 @@ def reconcile_draft_assets(draft, version, expected_digests=None):
     return "exact"
 
 
-def reconcile_draft_decision(draft, version, expected_tag, expected_target_sha, apk_digest, update_digest):
+def reconcile_draft_decision(draft, version, expected_tag, expected_target_sha, apk_digest, update_digest, allow_nonstandard_tag=False):
     """Classify a draft for recovery.
 
     Returns one of:
@@ -71,7 +71,9 @@ def reconcile_draft_decision(draft, version, expected_tag, expected_target_sha, 
     """
     if not VERSION_RE.fullmatch(version or ""):
         return "reject-version"
-    if not RELEASE_TAG_RE.fullmatch(expected_tag or ""):
+    if not allow_nonstandard_tag and not RELEASE_TAG_RE.fullmatch(expected_tag or ""):
+        return "reject-version"
+    if not allow_nonstandard_tag and not expected_tag.startswith("v"):
         return "reject-version"
     _require_full_sha(expected_target_sha, "expected target SHA")
     _require_hex64(apk_digest, "APK digest")
@@ -284,6 +286,8 @@ def main(argv=None):
     reconcile.add_argument("--expected-target-sha", required=True)
     reconcile.add_argument("--apk-digest", required=True)
     reconcile.add_argument("--update-digest", required=True)
+    reconcile.add_argument("--allow-nonstandard-tag", action="store_true",
+                           help="allow u2-canary-* tags (disposable harness only; production stays strict)")
 
     verify_assets = subparsers.add_parser("verify-release-assets")
     verify_assets.add_argument("--release", required=True)
@@ -332,6 +336,7 @@ def main(argv=None):
             args.expected_target_sha,
             args.apk_digest,
             args.update_digest,
+            allow_nonstandard_tag=args.allow_nonstandard_tag,
         )
         print(json.dumps({"decision": decision, "reuse": decision == "exact-reuse"}, sort_keys=True))
     elif args.command == "verify-release-assets":
