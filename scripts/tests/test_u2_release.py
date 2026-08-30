@@ -1061,12 +1061,20 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("cannot read current patched/update.json from remote", metadata_text)
         self.assertIn("refusing to proceed on an unknown baseline", metadata_text)
         self.assertIn("no readable version", metadata_text)
-        # Approval gate: exactly one approved review by slashinchi.
+        # Metadata push must survive a concurrent patched push (TOCTOU): it
+        # rebuilds the single update.json commit on the new remote HEAD.
+        self.assertIn("patched moved during publish", metadata_text)
+        self.assertIn("rebuilding update.json commit on remote HEAD", metadata_text)
+        # Approval gate: every approved review must be slashinchi, and exactly
+        # one record must carry the current-attempt marker (re-run history from
+        # older attempts is tolerated, so retry recovery is not blocked).
         approval_step = next(s for s in steps if "Verify exact approval marker" in str(s))
         approval_text = str(approval_step)
-        self.assertIn("expected exactly one release-production approval", approval_text)
-        self.assertIn("approval actor is", approval_text)
-        self.assertIn('"slashinchi"', approval_text)
+        self.assertIn("actor is not slashinchi", approval_text)
+        self.assertIn(".user.login //", approval_text)
+        self.assertIn("actor_ok", approval_text)
+        self.assertIn("expected exactly one approval marker matching this run/attempt", approval_text)
+        self.assertNotIn("expected exactly one release-production approval, found", approval_text)
         # Immutable-releases preflight before any mutation.
         revalidate_step = next(s for s in steps if "Revalidate release identity" in str(s))
         self.assertIn("immutable-releases", str(revalidate_step))
