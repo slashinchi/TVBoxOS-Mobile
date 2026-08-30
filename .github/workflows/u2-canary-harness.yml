@@ -115,9 +115,11 @@ jobs:
       expected_version_name: ${{ needs.qualify.outputs.expected_version_name }}
       expected_version_code: ${{ needs.qualify.outputs.expected_version_code }}
       release_debt: ${{ needs.qualify.outputs.release_debt }}
-    # No secrets: inherit — same rule as production. The signer inside
-    # rc-pipeline resolves its signing secrets from its own release-signing
-    # Environment; TVBOX_RELEASE_TOKEN must never enter the RC build chain.
+    # secrets: inherit is required (GitHub actions/runner#4453) for the called
+    # workflow's job-level `environment: release-signing` secrets to resolve;
+    # without it env-scoped secrets arrive empty. TEMPORARY for the disposable
+    # canary harness ONLY — production u2-release.yml must never add this.
+    secrets: inherit
 
   rc_summary:
     name: Canary evidence and approval marker
