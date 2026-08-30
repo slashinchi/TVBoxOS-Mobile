@@ -605,11 +605,15 @@ jobs:
             echo "::notice::patched already at release SHA; no promote needed"
           elif git merge-base --is-ancestor "$RELEASE_SHA" "$current"; then
             # Recovery: patched advanced past release SHA is only valid when the
-            # formal tag already exists (metadata commit or resumed publish).
-            if GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json id --jq '.id' >/dev/null 2>&1; then
-              echo "::notice::recovery: patched advanced past release SHA but tag $tag exists; continuing"
+            # formal TAG OBJECT already exists (metadata commit or resumed
+            # publish). A draft is NOT a tag: drafts have no git tag ref, so a
+            # draft must never satisfy this recovery — otherwise a stale RC
+            # could be published after patched moved forward.
+            tag_ref=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' --silent 2>/dev/null || echo "")
+            if [[ -n "$tag_ref" && "$tag_ref" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::notice::recovery: patched advanced past release SHA but tag object $tag exists ($tag_ref); continuing"
             else
-              echo "::error::patched advanced past the release SHA and tag $tag does not exist; pending RC is stale"
+              echo "::error::patched advanced past the release SHA and formal tag $tag does not exist; pending RC is stale"
               exit 1
             fi
           else
@@ -773,12 +777,12 @@ jobs:
                 --apk-digest "$EXPECTED_APK" \
                 --update-digest "$update_digest" | jq -r '.decision')
               case "$released_decision" in
-                verify-published|repair-published-missing)
-                  echo "::notice::published Release $tag identity-exact (state=$released_decision); continuing post-publish verification"
+                verify-published)
+                  echo "::notice::published Release $tag identity-exact; continuing post-publish verification"
                   decision="published"
                   ;;
                 *)
-                  echo "::error::published Release $tag cannot be safely continued (decision=$released_decision); conflicting public identity fails closed"
+                  echo "::error::published Release $tag cannot be safely continued (decision=$released_decision); conflicting public identity or unrecoverable missing assets fail closed"
                   exit 1
                   ;;
               esac
@@ -819,7 +823,7 @@ jobs:
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
           tag="${{ steps.release.outputs.tag }}"
           decision="${{ steps.release.outputs.decision }}"
-          [[ "$decision" == "repair-missing" || "$decision" == "created" || "$decision" == "repair-published-missing" ]] || {
+          [[ "$decision" == "repair-missing" || "$decision" == "created" ]] || {
             echo "::notice::no asset attach needed (decision=$decision)"
             exit 0
           }
@@ -881,8 +885,10 @@ jobs:
             echo "::notice::Release $tag already published; skipping publish"
             exit 0
           fi
-          GH_TOKEN="$TOKEN" gh release publish "$tag" --repo slashinchi/TVBoxOS-Mobile
-          echo "::notice::Release $tag published"
+          # gh has no `release publish` command; publishing a draft means
+          # flipping the draft flag off with `gh release edit --draft=false`.
+          GH_TOKEN="$TOKEN" gh release edit "$tag" --repo slashinchi/TVBoxOS-Mobile --draft=false
+          echo "::notice::Release $tag published (draft=false)"
 
       - name: Verify immutable Release and assets
         env:
@@ -991,9 +997,22 @@ jobs:
           cand_version="$EXPECTED_VERSION"
           # Read the CURRENT root update.json from the remote patched branch,
           # never from local HEAD (which may be ahead of or behind remote).
-          remote_content=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
-            --jq '.content' | base64 -d 2>/dev/null || echo "")
+          remote_b64=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
+            --jq '.content' --silent 2>/dev/null || echo "")
+          [[ -n "$remote_b64" ]] || {
+            echo "::error::cannot read current patched/update.json from remote; refusing to guess (a transient API failure must never be treated as an empty baseline)"
+            exit 1
+          }
+          remote_content=$(printf '%s' "$remote_b64" | base64 -d 2>/dev/null || echo "")
+          [[ -n "$remote_content" ]] || {
+            echo "::error::remote update.json base64 decode failed or is empty; refusing to proceed on an unknown baseline"
+            exit 1
+          }
           current_version=$(jq -r '.version // ""' <<<"$remote_content" 2>/dev/null || echo "")
+          [[ -n "$current_version" ]] || {
+            echo "::error::remote update.json has no readable version; refusing to proceed on an unknown baseline"
+            exit 1
+          }
           newer=$(python3 scripts/u2_publish.py monotonic-compare \
             --current-version "$current_version" \
             --candidate-version "$cand_version" | jq -r '.newer')
@@ -1003,7 +1022,7 @@ jobs:
             --version "$cand_version" \
             --apk-url "$apk_url" \
             --output update.json
-          if [[ -n "$remote_content" ]] && cmp -s update.json <(printf '%s' "$remote_content"); then
+          if cmp -s update.json <(printf '%s' "$remote_content"); then
             echo "::notice::remote update.json already identical to v${cand_version}; no commit needed"
             exit 0
           fi

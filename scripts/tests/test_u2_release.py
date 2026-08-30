@@ -970,7 +970,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("--clobber", str(attach_step))
         self.assertIn("Verify both assets before publish (API digest + download bytes)", step_text)
         self.assertIn("verify-release-assets", step_text)
-        self.assertIn("gh release publish", step_text)
+        self.assertIn('gh release edit "$tag" --repo slashinchi/TVBoxOS-Mobile --draft=false', step_text)
+        self.assertNotIn("gh release publish", step_text)
         self.assertIn('gh release verify "$tag"', step_text)
         self.assertIn("verify-asset", step_text)
         self.assertIn("gh release download \"$tag\"", step_text)
@@ -1031,14 +1032,35 @@ class U2ReleaseContractTests(unittest.TestCase):
         steps = publish["steps"]
         step_text = "\n".join(str(s) for s in steps)
         # Published (non-draft) recovery: the create/reconcile step classifies
-        # an existing published Release via released-identity and continues.
+        # an existing published Release via released-identity and continues
+        # ONLY on verify-published; any other decision (incl. missing assets,
+        # which are unrecoverable on an immutable Release) fails closed.
         self.assertIn("released-identity", step_text)
         self.assertIn("verify-published", step_text)
-        self.assertIn("repair-published-missing", step_text)
-        self.assertIn("conflicting public identity fails closed", step_text)
-        # Publish step must skip already-published releases (retry recovery).
+        self.assertIn("conflicting public identity or unrecoverable missing assets fail closed", step_text)
+        self.assertNotIn("repair-published-missing", step_text)
+        # Publish step must skip already-published releases (retry recovery)
+        # and must use the real gh draft-publication mechanism
+        # (gh release edit --draft=false; `gh release publish` does not exist).
         publish_step = next(s for s in steps if "Publish verified draft" in str(s))
-        self.assertIn("already published; skipping publish", str(publish_step))
+        publish_text = str(publish_step)
+        self.assertIn("already published; skipping publish", publish_text)
+        self.assertIn('gh release edit "$tag" --repo slashinchi/TVBoxOS-Mobile --draft=false', publish_text)
+        self.assertNotIn("gh release publish", publish_text)
+        # Promote recovery must require the formal TAG OBJECT, never a draft
+        # (drafts have no git tag ref; gh release view succeeds for drafts).
+        promote_step = next(s for s in steps if "Promote patched to exact release SHA" in str(s))
+        promote_text = str(promote_step)
+        self.assertIn("git/ref/tags/${tag}", promote_text)
+        self.assertIn("tag object $tag exists", promote_text)
+        self.assertNotIn('gh release view "$tag"', promote_text)
+        # Metadata reconciliation must fail closed when the remote baseline
+        # cannot be read (never treat an empty current as "may advance").
+        metadata_step = next(s for s in steps if "Reconcile root update.json" in str(s))
+        metadata_text = str(metadata_step)
+        self.assertIn("cannot read current patched/update.json from remote", metadata_text)
+        self.assertIn("refusing to proceed on an unknown baseline", metadata_text)
+        self.assertIn("no readable version", metadata_text)
         # Approval gate: exactly one approved review by slashinchi.
         approval_step = next(s for s in steps if "Verify exact approval marker" in str(s))
         approval_text = str(approval_step)

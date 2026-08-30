@@ -192,7 +192,11 @@ def released_identity_decision(release, version, expected_tag, expected_target_s
         return "reject-published-digest-mismatch"
     if names == expected:
         return "verify-published"
-    return "repair-published-missing"
+    # A published Release in an immutable repository can never accept new
+    # assets: `gh release upload` fails on immutable published Releases.
+    # Missing assets on a published Release are therefore unrecoverable and
+    # must fail closed (never "repair" a public immutable Release).
+    return "reject-published-missing-asset"
 
 
 def verify_release_assets(release, version, expected_digests, download_dir):
