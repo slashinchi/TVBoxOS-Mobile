@@ -821,7 +821,7 @@ class U2ReleaseContractTests(unittest.TestCase):
     def test_u2_publish_chain_is_wired_with_helpers_and_concurrency(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
         publish = self._job_block(workflow, "publish")
-        self.assertNotIn("environment: release-production", publish)
+        self.assertIn("environment: release-production", publish)
         self.assertIn("Promote patched to exact release SHA (CAS)", publish)
         self.assertIn("extract-signed-apk", publish)
         self.assertIn("gh release create", publish)

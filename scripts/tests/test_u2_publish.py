@@ -142,20 +142,20 @@ class U2PublishContractTests(unittest.TestCase):
                 capture_output=True,
             )
         good = json.dumps({
-            "tag_name": "v2.1.27.1",
-            "target_commitish": "a" * 40,
+            "tagName": "v2.1.27.1",
+            "targetCommitish": "a" * 40,
             "assets": [
-                {"name": "TVBox-Mobile-v2.1.27.1.apk", "digest": "b" * 64},
-                {"name": "update.json", "digest": "c" * 64},
+                {"name": "TVBox-Mobile-v2.1.27.1.apk", "digest": f"sha256:{'b' * 64}"},
+                {"name": "update.json", "digest": f"sha256:{'c' * 64}"},
             ],
         })
         self.assertEqual(json.loads(run(good).stdout)["reuse"], True)
-        wrong_tag = json.dumps({"tag_name": "v2.1.26.1", "target_commitish": "a" * 40, "assets": []})
+        wrong_tag = json.dumps({"tagName": "v2.1.26.1", "targetCommitish": "a" * 40, "assets": []})
         self.assertEqual(json.loads(run(wrong_tag).stdout)["reason"], "identity-mismatch")
         missing_asset = json.dumps({
-            "tag_name": "v2.1.27.1",
-            "target_commitish": "a" * 40,
-            "assets": [{"name": "update.json", "digest": "c" * 64}],
+            "tagName": "v2.1.27.1",
+            "targetCommitish": "a" * 40,
+            "assets": [{"name": "update.json", "digest": f"sha256:{'c' * 64}"}],
         })
         self.assertEqual(json.loads(run(missing_asset).stdout)["reason"], "asset-mismatch")
 
