@@ -295,7 +295,8 @@ jobs:
                 --expected-tag "$tag" \
                 --expected-target-sha "$RELEASE_SHA" \
                 --apk-digest "$EXPECTED_APK" \
-                --update-digest "$update_digest" | jq -r '.decision')
+                --update-digest "$update_digest" \
+                --allow-nonstandard-tag | jq -r '.decision')
               [[ "$decision" == "exact-reuse" ]] || { echo "::error::expected exact-reuse, got $decision"; exit 1; }
               echo "scenario_result=two-asset-ok" >> "$GITHUB_OUTPUT"
               ;;
@@ -315,7 +316,8 @@ jobs:
                 --expected-tag "$tag" \
                 --expected-target-sha "$RELEASE_SHA" \
                 --apk-digest "$EXPECTED_APK" \
-                --update-digest "$update_digest" | jq -r '.decision')
+                --update-digest "$update_digest" \
+                --allow-nonstandard-tag | jq -r '.decision')
               [[ "$decision" == "repair-missing" ]] || { echo "::error::expected repair-missing, got $decision"; exit 1; }
               # Missing-only attach (no clobber).
               GH_TOKEN="$TOKEN" gh release upload "$tag" \
@@ -328,7 +330,8 @@ jobs:
                 --expected-tag "$tag" \
                 --expected-target-sha "$RELEASE_SHA" \
                 --apk-digest "$EXPECTED_APK" \
-                --update-digest "$update_digest" | jq -r '.decision')
+                --update-digest "$update_digest" \
+                --allow-nonstandard-tag | jq -r '.decision')
               [[ "$decision2" == "exact-reuse" ]] || { echo "::error::expected exact-reuse after repair, got $decision2"; exit 1; }
               echo "scenario_result=missing-repair-ok" >> "$GITHUB_OUTPUT"
               ;;
@@ -349,7 +352,8 @@ jobs:
                 --expected-tag "$tag" \
                 --expected-target-sha "$RELEASE_SHA" \
                 --apk-digest "$EXPECTED_APK" \
-                --update-digest "$update_digest" | jq -r '.decision')
+                --update-digest "$update_digest" \
+                --allow-nonstandard-tag | jq -r '.decision')
               [[ "$decision" == "reject-extra-asset" ]] || { echo "::error::expected reject-extra-asset, got $decision"; exit 1; }
               # No mutation: asset count must still be 3.
               count=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json assets --jq '.assets | length')
