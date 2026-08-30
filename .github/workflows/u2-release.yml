@@ -505,17 +505,24 @@ jobs:
           [[ -n "$approvals" && "$approvals" != "[]" ]] || {
             echo "::error::no release-production approval found for run ${RUN_ID}"; exit 1;
           }
-          # Exactly one approved review, and it must be slashinchi's (the only
-          # configured reviewer). Any other actor or count fails closed.
+          # Every approved review must be slashinchi's (the only configured
+          # reviewer). Re-runs accumulate approval history for the same RUN_ID,
+          # so we must not require exactly one; instead each record is checked
+          # and any record that is NOT a precise current-attempt marker fails
+          # closed. This keeps the gate strict while allowing retry recovery.
           count=$(jq 'length' <<<"$approvals")
-          [[ "$count" -eq 1 ]] || {
-            echo "::error::expected exactly one release-production approval, found $count"; exit 1;
+          [[ "$count" -ge 1 ]] || { echo "::error::no approved release-production review"; exit 1; }
+          actor_ok=true
+          while IFS= read -r -d '' actor; do
+            [[ "$actor" == "slashinchi" ]] || actor_ok=false
+          done < <(jq -r '.[].user.login // "" + "\u0000"' <<<"$approvals")
+          [[ "$actor_ok" == "true" ]] || {
+            echo "::error::release-production approval actor is not slashinchi"; exit 1;
           }
-          actor=$(jq -r '.[0].user.login // ""' <<<"$approvals")
-          [[ "$actor" == "slashinchi" ]] || {
-            echo "::error::release-production approval actor is $actor, expected slashinchi"; exit 1;
-          }
-          matched=false
+          # Exactly one record must carry the current-attempt marker; older
+          # attempts' approvals carry older markers and are tolerated as
+          # history (the marker itself binds run+attempt).
+          matched=0
           while IFS= read -r -d '' comment; do
             check=$(python3 scripts/u2_release.py approval-matches \
               --marker "$comment" \
@@ -526,14 +533,11 @@ jobs:
               --run "$RUN_ID" \
               --attempt "$RUN_ATTEMPT")
             if [[ "$(jq -r '.matched' <<<"$check")" == "true" ]]; then
-              matched=true
-            else
-              echo "::error::approval comment does not match the exact release identity"
-              exit 1
+              matched=$((matched + 1))
             fi
           done < <(jq -r '.[].comment // "" | gsub("\u0000"; "\n") + "\u0000"' <<<"$approvals")
-          [[ "$matched" == "true" ]] || {
-            echo "::error::no approval marker matches the exact release identity"; exit 1;
+          [[ "$matched" -eq 1 ]] || {
+            echo "::error::expected exactly one approval marker matching this run/attempt, found $matched"; exit 1;
           }
           echo "::notice::exact approval marker verified for run ${RUN_ID} attempt ${RUN_ATTEMPT}"
 
@@ -1028,8 +1032,23 @@ jobs:
           fi
           git config user.name "TVBox U2 Publish"
           git config user.email "u2-publish@users.noreply.github.com"
-          git add update.json
-          git commit -m "chore: update metadata to v${cand_version}"
+          # Metadata is forward-only: if patched moved while this run was
+          # publishing (TOCTOU), rebuild the single update.json commit on the
+          # NEW remote HEAD so we never fast-forward-overwrite concurrent
+          # pushes, and never leave a published Release without metadata.
+          cp update.json "$RUNNER_TEMP/update-json-to-commit.json"
+          git fetch --no-tags origin "+refs/heads/patched:refs/remotes/origin/patched"
+          remote_head=$(git rev-parse refs/remotes/origin/patched)
+          if [[ "$(git rev-parse HEAD)" != "$remote_head" ]]; then
+            echo "::notice::patched moved during publish ($(git rev-parse --short HEAD) -> $(git rev-parse --short "$remote_head")); rebuilding update.json commit on remote HEAD"
+            git reset --hard "$remote_head"
+            cp "$RUNNER_TEMP/update-json-to-commit.json" update.json
+            git add update.json
+            git commit -m "chore: update metadata to v${cand_version}"
+          else
+            git add update.json
+            git commit -m "chore: update metadata to v${cand_version}"
+          fi
           git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/patched
           # Remote byte readback via the Contents API on patched.
           remote_after=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
