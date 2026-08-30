@@ -154,15 +154,18 @@ def main(argv=None):
                 for item in (draft.get("assets") or [])
             }
             expected = expected_asset_set(args.version)
-            apk_ok = assets.get(f"TVBox-Mobile-v{args.version}.apk", "") == args.apk_digest.lower()
-            if args.update_digest:
-                update_ok = assets.get("update.json", "") == args.update_digest.lower()
-            else:
-                update_ok = "update.json" in assets
-            if set(assets) != expected or not apk_ok or not update_ok:
+            names = set(assets)
+            if names - expected:
                 print(json.dumps({"reuse": False, "reason": "asset-mismatch"}, sort_keys=True))
+            elif names == expected:
+                apk_ok = assets.get(f"TVBox-Mobile-v{args.version}.apk", "") == args.apk_digest.lower()
+                update_ok = assets.get("update.json", "") == args.update_digest.lower() if args.update_digest else True
+                if apk_ok and update_ok:
+                    print(json.dumps({"reuse": True, "reason": "exact"}, sort_keys=True))
+                else:
+                    print(json.dumps({"reuse": False, "reason": "incomplete"}, sort_keys=True))
             else:
-                print(json.dumps({"reuse": True, "reason": "exact"}, sort_keys=True))
+                print(json.dumps({"reuse": False, "reason": "incomplete"}, sort_keys=True))
     return 0
 
 

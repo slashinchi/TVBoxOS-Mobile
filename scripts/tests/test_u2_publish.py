@@ -157,7 +157,17 @@ class U2PublishContractTests(unittest.TestCase):
             "targetCommitish": "a" * 40,
             "assets": [{"name": "update.json", "digest": f"sha256:{'c' * 64}"}],
         })
-        self.assertEqual(json.loads(run(missing_asset).stdout)["reason"], "asset-mismatch")
+        self.assertEqual(json.loads(run(missing_asset).stdout)["reason"], "incomplete")
+        extra_asset = json.dumps({
+            "tagName": "v2.1.27.1",
+            "targetCommitish": "a" * 40,
+            "assets": [
+                {"name": "TVBox-Mobile-v2.1.27.1.apk", "digest": f"sha256:{'b' * 64}"},
+                {"name": "update.json", "digest": f"sha256:{'c' * 64}"},
+                {"name": "stale.txt", "digest": "d" * 64},
+            ],
+        })
+        self.assertEqual(json.loads(run(extra_asset).stdout)["reason"], "asset-mismatch")
 
     def test_monotonic_compare_cli(self):
         def run(cur, cand):

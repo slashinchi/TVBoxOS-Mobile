@@ -183,11 +183,15 @@ def qualify_u1_merge(
         return {"qualified": False, "reason": "push-actor-mismatch"}
     if not isinstance(pr, dict):
         return {"qualified": False, "reason": "missing-associated-pr"}
+    base_ref = pr.get("base")
+    if isinstance(base_ref, dict):
+        base_ref = base_ref.get("ref")
+    merged_at = pr.get("merged_at")
     if any(
         (
             pr.get("state") != "closed",
-            pr.get("merged_at") is None,
-            pr.get("base") != "patched",
+            not merged_at or merged_at == "",
+            base_ref != "patched",
             pr.get("merged_by") != "slashinchi",
             pr.get("author") != "github-actions[bot]",
             pr.get("head_repository") != repository,
@@ -732,7 +736,15 @@ def main(argv=None):
         print(json.dumps(result, sort_keys=True))
     elif args.command == "plan-prep":
         if args.upstream_name:
-            planned = plan_version(args.upstream_name, args.upstream_code, json.loads(Path(args.published_file).read_text()))
+            published = json.loads(Path(args.published_file).read_text())
+            pairs = []
+            for item in published:
+                if isinstance(item, dict):
+                    if item.get("versionName") and item.get("versionCode"):
+                        pairs.append((item["versionName"], item["versionCode"]))
+                elif isinstance(item, (list, tuple)) and len(item) == 2:
+                    pairs.append(tuple(item))
+            planned = plan_version(args.upstream_name, args.upstream_code, pairs)
         else:
             name, code = parse_app_version(Path("app/build.gradle").read_text())
             planned = {"versionName": name, "versionCode": code}

@@ -817,6 +817,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("if: always()", canary)
         self.assertIn("gh release delete", canary)
         self.assertIn("--cleanup-tag", canary)
+        self.assertIn("approval-matches", canary)
+        self.assertIn("canary approval marker verified", canary)
 
     def test_u2_publish_chain_is_wired_with_helpers_and_concurrency(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
@@ -826,8 +828,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("extract-signed-apk", publish)
         self.assertIn("gh release create", publish)
         self.assertIn("gh release publish", publish)
-        self.assertIn("gh release verify", publish)
-        self.assertIn("verify-asset", publish)
+        self.assertIn("releases/tags/${tag}", publish)
+        self.assertIn("immutable:.immutable", publish)
         self.assertIn("build-update-json", publish)
         self.assertIn("monotonic-compare", publish)
         self.assertIn("release-delivery", publish)
@@ -974,6 +976,36 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn(f"TVBox-U2-Source: {source}", parsed["trailers"])
         self.assertIn(f"TVBox-U2-Debt: {debt}", parsed["trailers"])
         self.assertEqual(parsed["spec"]["parent"], source)
+
+    def test_plan_prep_cli_accepts_canonical_release_dicts(self):
+        published = [
+            {"tag": "v2.1.26.1", "versionName": "2.1.26.1", "versionCode": 23601, "verified": True},
+            {"tag": "v2.1.27.1", "versionName": "2.1.27.1", "versionCode": 23701, "verified": True},
+        ]
+        with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as f:
+            json.dump(published, f)
+            published_path = f.name
+        result = subprocess.run(
+            [
+                "python3", "scripts/u2_release.py", "plan-prep",
+                "--upstream-name", "2.1.27",
+                "--upstream-code", "237",
+                "--published-file", published_path,
+                "--source", "a" * 40,
+                "--mode", "auto-upstream",
+                "--upstream", "c" * 40,
+                "--debt", "b" * 64,
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+        import os
+        os.unlink(published_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = json.loads(result.stdout)
+        self.assertEqual(parsed["versionName"], "2.1.27.2")
+        self.assertEqual(parsed["versionCode"], 23702)
 
     def test_write_prep_version_rewrites_only_version_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -50,6 +50,11 @@ jobs:
               echo "enabled=false" >> "$GITHUB_OUTPUT"
               exit 1
             }
+            [[ "$REF" == "refs/heads/patched" ]] || {
+              echo "::error::manual dispatch must target current live patched HEAD"
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            }
             [[ "${U2_ENABLED:-}" == "true" ]] || {
               echo "U2 is disabled (TVBOX_U2_ENABLED is not 'true'). Canary and manual release are both gated."
               echo "enabled=false" >> "$GITHUB_OUTPUT"
@@ -129,7 +134,7 @@ jobs:
               if [[ "$classification" == "docs-only" ]]; then
                 return 0
               fi
-              local title="local-release-debt: ${baseline} -> ${SOURCE_SHA} (${classification})"
+              local title="local-release-debt: ${baseline} -> patched (${classification})"
               local existing
               existing=$(gh issue list --repo "$REPO" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
               if [[ -n "$existing" ]]; then
@@ -164,8 +169,7 @@ jobs:
               echo "canary=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            pr_json=$(echo "$pr" | jq -c '{number,state,merged_at:(.merged_at // ""),base:{ref:.base.ref},merged_by:(.merged_by.login // ""),author:(.user.login // ""),head_repository:(.head.repo.full_name // ""),head:(.head.ref // ""),head_sha:(.head.sha // ""),merge_commit_sha:.merge_commit_sha}')
-            # Derive upstream SHA from PR base: the merge-base of the candidate with main.
+            pr_json=$(echo "$pr" | jq -c '{number,state,merged_at:.merged_at,base:(.base // {}),merged_by:(.merged_by.login // ""),author:(.user.login // ""),head_repository:(.head.repo.full_name // ""),head:(.head.ref // ""),head_sha:(.head.sha // ""),merge_commit_sha:.merge_commit_sha}')
             # For provenance, read the marker embedded in the PR body.
             marker=$(echo "$pr" | jq -r '.body // ""' | grep -o '<!-- tvbox-upstream-candidate-v2 .* -->' | head -1)
             parsed=$(python3 scripts/u2_release.py parse-provenance-marker --marker "$marker" 2>/dev/null || echo "")
@@ -183,10 +187,11 @@ jobs:
             upstream_version=$(jq -r '.upstreamVersion' <<<"$parsed")
             upstream_code=$(jq -r '.upstreamCode' <<<"$parsed")
             upstream_is_ancestor=false
-            if git merge-base --is-ancestor "$upstream_sha" "$PUSH_BEFORE" 2>/dev/null; then
+            if git merge-base --is-ancestor "$upstream_sha" "$candidate" 2>/dev/null; then
               upstream_is_ancestor=true
             fi
             replay_tree="$candidate_tree"
+            actual_tree=$(git rev-parse "${PUSH_AFTER}^{tree}")
             result=$(python3 scripts/u2_release.py qualify-u1 \
               --before "$PUSH_BEFORE" \
               --after "$PUSH_AFTER" \
@@ -200,7 +205,7 @@ jobs:
               --upstream-ancestor "$upstream_is_ancestor" \
               --replay-status clean \
               --replay-tree "$replay_tree" \
-              --replay-actual-tree "$replay_tree")
+              --replay-actual-tree "$actual_tree")
             if [[ "$(jq -r '.qualified' <<<"$result")" != "true" ]]; then
               reason=$(jq -r '.reason' <<<"$result")
               echo "::error::auto-upstream qualification failed: $reason"
@@ -232,7 +237,6 @@ jobs:
     needs: [gate, qualify]
     if: needs.gate.outputs.enabled == 'true' && needs.qualify.outputs.qualified == 'true'
     runs-on: ubuntu-24.04
-    environment: release-production
     permissions:
       contents: write
     concurrency:
@@ -259,7 +263,6 @@ jobs:
           RELEASE_DEBT: ${{ needs.qualify.outputs.release_debt }}
           CANDIDATE_PR: ${{ needs.qualify.outputs.candidate_pr }}
           CANARY: ${{ needs.qualify.outputs.canary }}
-          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -272,6 +275,16 @@ jobs:
             echo "expected_version_name=$(jq -r '.versionName' <<<"$version_json")" >> "$GITHUB_OUTPUT"
             echo "expected_version_code=$(jq -r '.versionCode' <<<"$version_json")" >> "$GITHUB_OUTPUT"
             echo "::notice::canary prep: using source SHA $SOURCE_SHA as release SHA"
+            exit 0
+          fi
+          if [[ "$MODE" == "manual-local" ]]; then
+            # Manual-local: rc-pipeline requires release_sha == source_sha == patched;
+            # the version is already present in the working tree. No prep commit.
+            version_json=$(python3 scripts/u2_release.py parse-app-version --file app/build.gradle)
+            echo "release_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+            echo "expected_version_name=$(jq -r '.versionName' <<<"$version_json")" >> "$GITHUB_OUTPUT"
+            echo "expected_version_code=$(jq -r '.versionCode' <<<"$version_json")" >> "$GITHUB_OUTPUT"
+            echo "::notice::manual-local prep: using source SHA $SOURCE_SHA as release SHA (version from working tree)"
             exit 0
           fi
           if [[ "$MODE" == "auto-upstream" ]]; then
@@ -301,10 +314,10 @@ jobs:
           # Reuse an existing exact prep ref when its identity matches, so
           # re-runs never produce a divergent prep SHA.
           existing_sha=""
-          if git ls-remote --exit-code "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/u2-prep-${SOURCE_SHA}" >/dev/null 2>&1; then
-            existing_sha=$(git ls-remote "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/u2-prep-${SOURCE_SHA}" | awk '{print $1}')
+          if git ls-remote --exit-code "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/u2-prep-${SOURCE_SHA}" >/dev/null 2>&1; then
+            existing_sha=$(git ls-remote "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/u2-prep-${SOURCE_SHA}" | awk '{print $1}')
             existing_trailers=""
-            if git cat-file -e "$existing_sha" 2>/dev/null; then
+            if git cat-file -e "$existing_sha" 2>/dev/null || git fetch --no-tags origin "+refs/heads/u2-prep-${SOURCE_SHA}:refs/remotes/origin/u2-prep-${SOURCE_SHA}" 2>/dev/null; then
               existing_trailers=$(git log -1 --format=%B "$existing_sha" | grep -E '^TVBox-U2-' || true)
             fi
             if [[ -n "$existing_trailers" && "$existing_trailers" == "$trailers" ]]; then
@@ -315,7 +328,7 @@ jobs:
               exit 0
             fi
             echo "::warning::existing prep ref identity mismatch; replacing with fresh prep"
-            git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
               ":refs/heads/u2-prep-${SOURCE_SHA}" 2>/dev/null || true
           fi
           # Rewrite exactly the two version fields in app/build.gradle.
@@ -333,8 +346,8 @@ jobs:
           echo "expected_version_name=$version_name" >> "$GITHUB_OUTPUT"
           echo "expected_version_code=$version_code" >> "$GITHUB_OUTPUT"
           # Publish the disposable prep ref so rc-pipeline can check out release_sha.
-          [[ -n "$TOKEN" ]] || { echo "::error::release token missing for prep ref push"; exit 1; }
-          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/u2-prep-${SOURCE_SHA}"
+          [[ -n "$GITHUB_TOKEN" ]] || { echo "::error::GITHUB_TOKEN missing for prep ref push"; exit 1; }
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/u2-prep-${SOURCE_SHA}"
           echo "::notice::prep commit created at ${prep_sha} (version ${version_name} code ${version_code})"
 
   build_rc:
@@ -448,15 +461,27 @@ jobs:
           }
           echo "::notice::exact approval marker verified for run ${RUN_ID} attempt ${RUN_ATTEMPT}"
 
-      - name: Record explicit human rejection
-        if: failure()
+  watch_approval:
+    name: Record explicit human rejection
+    needs: [gate, qualify, prep, build_rc, approval]
+    if: always() && needs.gate.outputs.enabled == 'true' && needs.qualify.outputs.canary != 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - name: Scan for rejected reviews and open human-blocked issue
         env:
           RUN_ID: ${{ github.run_id }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          approvals=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/approvals" --jq '[.[] | select(.state=="rejected" and .environments[]?.name=="release-production")]')
-          [[ -n "$approvals" && "$approvals" != "[]" ]] || exit 0
+          approvals=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/approvals" --jq '[.[] | select(.state=="rejected" and .environments[]?.name=="release-production" and .user.login=="slashinchi")]')
+          [[ -n "$approvals" && "$approvals" != "[]" ]] || {
+            echo "::notice::no explicit rejection by slashinchi; nothing to record"
+            exit 0
+          }
           comment=$(jq -r '.[0].comment // ""' <<<"$approvals")
           title="human-blocked: release-production rejected for run ${RUN_ID}"
           existing=$(gh issue list --repo "$REPO" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
@@ -465,7 +490,7 @@ jobs:
           else
             gh issue create --repo "$REPO" \
               --title "$title" \
-              --body "release-production review was explicitly rejected for run ${RUN_ID}. Comment: ${comment:-<empty>}. This is a user rejection (human-blocked), not an operational failure."
+              --body "release-production review was explicitly rejected by slashinchi for run ${RUN_ID}. Comment: ${comment:-<empty>}. This is a user rejection (human-blocked), not an operational failure."
           fi
 
   publish:
@@ -500,16 +525,24 @@ jobs:
       - name: Promote patched to exact release SHA (CAS)
         env:
           RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
+          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
         run: |
           set -euo pipefail
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
           current=$(git rev-parse refs/heads/patched)
+          tag="v${EXPECTED_VERSION}"
           if [[ "$current" == "$RELEASE_SHA" ]]; then
             echo "::notice::patched already at release SHA; no promote needed"
           elif git merge-base --is-ancestor "$RELEASE_SHA" "$current"; then
-            echo "::error::patched advanced past the release SHA; pending RC is stale and must not publish"
-            exit 1
+            # Recovery: patched advanced past release SHA is only valid when the
+            # formal tag already exists (metadata commit or resumed publish).
+            if GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json id --jq '.id' >/dev/null 2>&1; then
+              echo "::notice::recovery: patched advanced past release SHA but tag $tag exists; continuing"
+            else
+              echo "::error::patched advanced past the release SHA and tag $tag does not exist; pending RC is stale"
+              exit 1
+            fi
           else
             git fetch --no-tags origin "+refs/heads/patched:refs/remotes/origin/patched"
             remote=$(git rev-parse refs/remotes/origin/patched)
@@ -560,7 +593,8 @@ jobs:
           tag="v${EXPECTED_VERSION}"
           existing=$(gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json tagName,targetCommitish,assets --jq '.' 2>/dev/null || echo "")
           if [[ -n "$existing" ]]; then
-            # Recovery: reuse an identity-exact draft, otherwise fail closed.
+            # Recovery: identity must match exactly; incomplete asset sets are
+            # repaired by the normal upload steps (update.json upload --clobber).
             check=$(python3 scripts/u2_publish.py reconcile-draft \
               --draft "$existing" \
               --version "$EXPECTED_VERSION" \
@@ -568,11 +602,16 @@ jobs:
               --expected-target "$RELEASE_SHA" \
               --apk-digest "$EXPECTED_APK" \
               --update-digest "")
-            if [[ "$(jq -r '.reuse' <<<"$check")" != "true" ]]; then
-              echo "::error::existing Release $tag does not match exact identity: $(jq -r '.reason' <<<"$check")"
+            reason=$(jq -r '.reason' <<<"$check")
+            if [[ "$reason" == "identity-mismatch" ]]; then
+              echo "::error::existing Release $tag does not match the exact release identity"
               exit 1
             fi
-            echo "::notice::reusing identity-exact draft $tag"
+            if [[ "$reason" == "asset-mismatch" ]]; then
+              echo "::warning::existing draft $tag has unexpected assets; will not auto-repair"
+              exit 1
+            fi
+            echo "::notice::reusing identity-exact draft $tag (reason=$reason)"
             echo "tag=$tag" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -633,29 +672,18 @@ jobs:
           set -euo pipefail
           tag="${{ steps.release.outputs.tag }}"
           expected_apk="${{ steps.identity.outputs.EXPECTED_APK }}"
-          if GH_TOKEN="$TOKEN" gh release verify "$tag" --repo slashinchi/TVBoxOS-Mobile 2>/dev/null; then
-            echo "::notice::release attestation verified for $tag"
-          else
-            # Release-level attestation may not exist yet for the first release;
-            # fall back to explicit tag/target/assets digest verification.
-            echo "::warning::gh release verify unavailable (no release attestation yet); verifying identity manually"
-            state=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json tagName,targetCommitish,assets --jq '{tag:.tagName,target:.targetCommitish,assets:[.assets[].name]}')
-            [[ "$(jq -r '.tag' <<<"$state")" == "$tag" ]] || { echo "::error::release tag mismatch"; exit 1; }
-            [[ "$(jq -r '.target' <<<"$state")" == "${{ steps.identity.outputs.RELEASE_SHA }}" ]] || { echo "::error::release target SHA mismatch"; exit 1; }
-            names=$(jq -r '.assets | sort | join(",")' <<<"$state")
-            expected_names="${{ steps.assets.outputs.asset_name }},update.json"
-            [[ "$names" == "$expected_names" ]] || { echo "::error::release asset set mismatch: $names"; exit 1; }
-          fi
-          if GH_TOKEN="$TOKEN" gh release verify-asset "$tag" \
-            --repo slashinchi/TVBoxOS-Mobile \
-            "$RUNNER_TEMP/assets/${{ steps.assets.outputs.asset_name }}" 2>/dev/null; then
-            echo "::notice::asset attestation verified for $tag"
-          else
-            actual=$(sha256sum "$RUNNER_TEMP/assets/${{ steps.assets.outputs.asset_name }}" | awk '{print $1}')
-            [[ "$actual" == "$expected_apk" ]] || { echo "::error::signed APK digest mismatch after publish"; exit 1; }
-            echo "::warning::asset attestation unavailable; digest verified manually ($actual)"
-          fi
-          echo "::notice::immutable verification passed for $tag"
+          # Strict immutable verification: read the published Release state and
+          # require immutable=true, exact tag, exact target SHA and exact assets.
+          state=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/releases/tags/${tag}" --jq '{immutable:.immutable,tag:.tag_name,target:.target_commitish,assets:[.assets[].name]}')
+          [[ "$(jq -r '.immutable' <<<"$state")" == "true" ]] || { echo "::error::release immutable flag is not true for $tag"; exit 1; }
+          [[ "$(jq -r '.tag' <<<"$state")" == "$tag" ]] || { echo "::error::release tag mismatch"; exit 1; }
+          [[ "$(jq -r '.target' <<<"$state")" == "${{ steps.identity.outputs.RELEASE_SHA }}" ]] || { echo "::error::release target SHA mismatch"; exit 1; }
+          names=$(jq -r '.assets | sort | join(",")' <<<"$state")
+          expected_names="${{ steps.assets.outputs.asset_name }},update.json"
+          [[ "$names" == "$expected_names" ]] || { echo "::error::release asset set mismatch: $names"; exit 1; }
+          actual=$(sha256sum "$RUNNER_TEMP/assets/${{ steps.assets.outputs.asset_name }}" | awk '{print $1}')
+          [[ "$actual" == "$expected_apk" ]] || { echo "::error::signed APK digest mismatch after publish"; exit 1; }
+          echo "::notice::immutable verification passed for $tag (immutable=true, exact tag/target/assets/digest)"
 
       - name: Delivery check against proxy URL
         env:
@@ -709,7 +737,7 @@ jobs:
           git config user.email "u2-publish@users.noreply.github.com"
           git add update.json
           git commit -m "chore: update metadata to v${cand_version}"
-          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/patched
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/patched
           [[ "$(git show HEAD:update.json | jq -r '.version')" == "$cand_version" ]] || {
             echo "::error::update.json readback mismatch after commit"; exit 1;
           }
@@ -722,7 +750,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
-          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             ":refs/heads/u2-prep-${SOURCE_SHA}" 2>/dev/null || true
           echo "::notice::prep ref u2-prep-${SOURCE_SHA} cleaned"
 
@@ -747,6 +775,35 @@ jobs:
         with:
           artifact-ids: ${{ needs.build_rc.outputs.signed_artifact_id }}
           path: ${{ runner.temp }}/signed-output
+      - name: Verify approval marker binding (canary proves the production gate)
+        id: canary_approval
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          approvals=$(gh api "repos/slashinchi/TVBoxOS-Mobile/actions/runs/${RUN_ID}/approvals" --jq '[.[] | select(.state=="approved" and .environments[]?.name=="release-production")]')
+          [[ -n "$approvals" && "$approvals" != "[]" ]] || {
+            echo "::error::no release-production approval found for canary run ${RUN_ID}"; exit 1;
+          }
+          matched=false
+          while read -r comment; do
+            check=$(python3 scripts/u2_release.py approval-matches \
+              --marker "$comment" \
+              --release-sha "${{ needs.qualify.outputs.release_sha }}" \
+              --debt "${{ needs.qualify.outputs.release_debt }}" \
+              --version "${{ needs.qualify.outputs.expected_version_name }}" \
+              --apk "${{ needs.build_rc.outputs.signed_sha256 }}" \
+              --run "${{ github.run_id }}" \
+              --attempt "${{ github.run_attempt }}")
+            if [[ "$(jq -r '.matched' <<<"$check")" == "true" ]]; then
+              matched=true
+              break
+            fi
+          done < <(jq -r '.[].comment // ""' <<<"$approvals")
+          [[ "$matched" == "true" ]] || {
+            echo "::error::canary approval marker does not match the exact release identity"; exit 1;
+          }
+          echo "::notice::canary approval marker verified (proves approval binding)"
       - name: Create draft-only canary release (idempotent)
         id: canary
         env:
