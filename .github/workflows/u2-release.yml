@@ -320,14 +320,19 @@ jobs:
             if git cat-file -e "$existing_sha" 2>/dev/null || git fetch --no-tags origin "+refs/heads/u2-prep-${SOURCE_SHA}:refs/remotes/origin/u2-prep-${SOURCE_SHA}" 2>/dev/null; then
               existing_trailers=$(git log -1 --format=%B "$existing_sha" | grep -E '^TVBox-U2-' || true)
             fi
-            if [[ -n "$existing_trailers" && "$existing_trailers" == "$trailers" ]]; then
+            # Reuse only when the prep is an exact version-only child of the
+            # source SHA: parent == SOURCE_SHA and no other path changed.
+            prep_parent=$(git rev-parse "${existing_sha}^" 2>/dev/null || echo "")
+            changed_paths=$(git diff-tree --no-commit-id --name-only -r "$existing_sha" 2>/dev/null | tr '\n' ' ' || echo "")
+            if [[ -n "$existing_trailers" && "$existing_trailers" == "$trailers" \
+              && "$prep_parent" == "$SOURCE_SHA" && "$changed_paths" == "app/build.gradle " ]]; then
               echo "::notice::reusing exact prep ref u2-prep-${SOURCE_SHA} at ${existing_sha}"
               echo "release_sha=$existing_sha" >> "$GITHUB_OUTPUT"
               echo "expected_version_name=$version_name" >> "$GITHUB_OUTPUT"
               echo "expected_version_code=$version_code" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "::error::existing prep ref u2-prep-${SOURCE_SHA} identity mismatch; refusing to delete or replace a divergent prep"
+            echo "::error::existing prep ref u2-prep-${SOURCE_SHA} identity mismatch (parent=$prep_parent paths=$changed_paths); refusing to delete or replace a divergent prep"
             exit 1
           fi
           # Rewrite exactly the two version fields in app/build.gradle.
@@ -371,7 +376,9 @@ jobs:
       release_debt: ${{ needs.qualify.outputs.release_debt }}
       candidate_pr: ${{ needs.qualify.outputs.candidate_pr }}
       provenance_marker: ${{ needs.qualify.outputs.provenance_marker }}
-    secrets: inherit
+    # No secrets: inherit. The signer inside rc-pipeline resolves its signing
+    # secrets from its own `release-signing` Environment; caller secrets (e.g.
+    # TVBOX_RELEASE_TOKEN) must never be passed into the RC build chain.
 
   approval:
     name: Production approval gate (exact marker)
@@ -442,7 +449,7 @@ jobs:
             echo "::error::no release-production approval found for run ${RUN_ID}"; exit 1;
           }
           matched=false
-          while read -r comment; do
+          while IFS= read -r -d '' comment; do
             check=$(python3 scripts/u2_release.py approval-matches \
               --marker "$comment" \
               --release-sha "${{ steps.identity.outputs.RELEASE_SHA }}" \
@@ -457,7 +464,7 @@ jobs:
               echo "::error::approval comment does not match the exact release identity"
               exit 1
             fi
-          done < <(jq -r '.[].comment // ""' <<<"$approvals")
+          done < <(jq -r '.[].comment // "" | gsub("\u0000"; "\n") + "\u0000"' <<<"$approvals")
           [[ "$matched" == "true" ]] || {
             echo "::error::no approval marker matches the exact release identity"; exit 1;
           }
@@ -505,6 +512,7 @@ jobs:
     concurrency:
       group: tvbox-u2-publish
       cancel-in-progress: false
+      # Up to 100 queued publish attempts are allowed before GitHub rejects.
     permissions:
       contents: read
       actions: read
@@ -563,6 +571,7 @@ jobs:
         env:
           EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
           EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/assets"
@@ -590,11 +599,12 @@ jobs:
           EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
           SIGNER_SHA: ${{ steps.identity.outputs.SIGNER_SHA }}
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
           tag="v${EXPECTED_VERSION}"
-          existing=$(gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json tagName,targetCommitish,assets --jq '.' 2>/dev/null || echo "")
+          existing=$(gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json tagName,targetCommitish,isDraft,assets --jq '.' 2>/dev/null || echo "")
           if [[ -n "$existing" ]]; then
             # Recovery: reuse is allowed only for an identity-exact draft whose
             # APK digest already matches the approved RC; anything else fails
@@ -620,6 +630,8 @@ jobs:
           notes=$(printf '%s\n' \
             "## Build / Release Evidence" \
             "- Mode: ${{ needs.qualify.outputs.mode }}" \
+            "- Source PR: ${{ needs.qualify.outputs.candidate_pr || 'manual-local' }}" \
+            "- Upstream SHA: ${{ needs.qualify.outputs.upstream_sha || 'n/a (manual-local)' }}" \
             "- Release SHA: $RELEASE_SHA" \
             "- Version: $EXPECTED_VERSION" \
             "- Debt fingerprint: $EXPECTED_DEBT" \
@@ -808,7 +820,7 @@ jobs:
             echo "::error::no release-production approval found for canary run ${RUN_ID}"; exit 1;
           }
           matched=false
-          while read -r comment; do
+          while IFS= read -r -d '' comment; do
             check=$(python3 scripts/u2_release.py approval-matches \
               --marker "$comment" \
               --release-sha "${{ needs.qualify.outputs.release_sha }}" \
@@ -823,7 +835,7 @@ jobs:
               echo "::error::canary approval comment does not match the exact release identity"
               exit 1
             fi
-          done < <(jq -r '.[].comment // ""' <<<"$approvals")
+          done < <(jq -r '.[].comment // "" | gsub("\u0000"; "\n") + "\u0000"' <<<"$approvals")
           [[ "$matched" == "true" ]] || {
             echo "::error::canary approval marker does not match the exact release identity"; exit 1;
           }

@@ -144,17 +144,26 @@ class U2PublishContractTests(unittest.TestCase):
         good = json.dumps({
             "tagName": "v2.1.27.1",
             "targetCommitish": "a" * 40,
+            "isDraft": True,
             "assets": [
                 {"name": "TVBox-Mobile-v2.1.27.1.apk", "digest": f"sha256:{'b' * 64}"},
                 {"name": "update.json", "digest": f"sha256:{'c' * 64}"},
             ],
         })
         self.assertEqual(json.loads(run(good).stdout)["reuse"], True)
-        wrong_tag = json.dumps({"tagName": "v2.1.26.1", "targetCommitish": "a" * 40, "assets": []})
+        published = json.loads(good)
+        published["isDraft"] = False
+        self.assertEqual(json.loads(run(json.dumps(published)).stdout)["reason"], "not-draft")
+        self.assertFalse(json.loads(run(json.dumps(published)).stdout)["reuse"])
+        missing_draft_flag = json.loads(good)
+        missing_draft_flag.pop("isDraft", None)
+        self.assertEqual(json.loads(run(json.dumps(missing_draft_flag)).stdout)["reason"], "not-draft")
+        wrong_tag = json.dumps({"tagName": "v2.1.26.1", "targetCommitish": "a" * 40, "isDraft": True, "assets": []})
         self.assertEqual(json.loads(run(wrong_tag).stdout)["reason"], "identity-mismatch")
         missing_asset = json.dumps({
             "tagName": "v2.1.27.1",
             "targetCommitish": "a" * 40,
+            "isDraft": True,
             "assets": [{"name": "update.json", "digest": f"sha256:{'c' * 64}"}],
         })
         self.assertEqual(json.loads(run(missing_asset).stdout)["reason"], "incomplete")
@@ -162,6 +171,7 @@ class U2PublishContractTests(unittest.TestCase):
         extra_asset = json.dumps({
             "tagName": "v2.1.27.1",
             "targetCommitish": "a" * 40,
+            "isDraft": True,
             "assets": [
                 {"name": "TVBox-Mobile-v2.1.27.1.apk", "digest": f"sha256:{'b' * 64}"},
                 {"name": "update.json", "digest": f"sha256:{'c' * 64}"},

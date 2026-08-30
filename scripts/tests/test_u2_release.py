@@ -752,6 +752,19 @@ class U2ReleaseContractTests(unittest.TestCase):
                 self.assertIn("gh release", text)
             else:
                 self.assertNotIn("gh release", text, path.name)
+        # Whole-repo write enumeration: release writes (contents:write / git push)
+        # must live only in u2-release.yml (prep ref + publish) or in the
+        # separately authorized U1 upstream-mirror workflow (upstream-monitor.yml,
+        # whose write jobs only fast-forward main / push candidate branches).
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            text = path.read_text()
+            if path.name == "u2-release.yml":
+                self.assertIn("contents: write", text)
+                continue
+            if path.name == "upstream-monitor.yml":
+                continue
+            self.assertNotIn("git push", text, path.name)
+            self.assertNotIn("contents: write", text, path.name)
         qualify = (ROOT / "scripts/u2_qualify.sh").read_text()
         self.assertIn("release-debt", qualify)
         self.assertIn("verified-releases.json", qualify)
@@ -831,11 +844,13 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("git push \"https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git\" \\", publish)
         self.assertIn('$RELEASE_SHA:refs/heads/patched', publish)
         self.assertIn("gh api \"repos/slashinchi/TVBoxOS-Mobile/actions/artifacts/${{ needs.build_rc.outputs.signed_artifact_id }}/zip\"", publish)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", publish)
         self.assertIn("extract-signed-apk", publish)
         self.assertIn("sha256sum \"$signed\"", publish)
         self.assertIn('gh release create', publish)
         self.assertIn("--draft", publish)
         self.assertIn("--target \"$RELEASE_SHA\"", publish)
+        self.assertIn("isDraft", publish)
         self.assertIn("gh release upload", publish)
         self.assertIn("gh release publish", publish)
         self.assertIn('gh release verify "$tag"', publish)
@@ -852,6 +867,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("concurrency:", publish)
         self.assertIn("tvbox-u2-publish", publish)
         self.assertIn("cancel-in-progress: false", publish)
+        self.assertIn("Source PR", publish)
+        self.assertIn("Upstream SHA", publish)
         approval = self._job_block(workflow, "approval")
         self.assertIn("environment: release-production", approval)
         self.assertIn("GH_TOKEN: ${{ github.token }}", approval)
@@ -869,6 +886,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("tvbox-u2-prepare", prep)
         self.assertNotIn("replacing with fresh prep", prep)
         self.assertIn("refusing to delete or replace a divergent prep", prep)
+        self.assertIn("diff-tree", prep)
+        self.assertIn("app/build.gradle ", prep)
         qualify = self._job_block(workflow, "qualify")
         self.assertIn("qualify-u1", qualify)
         self.assertIn("parse-provenance-marker", qualify)

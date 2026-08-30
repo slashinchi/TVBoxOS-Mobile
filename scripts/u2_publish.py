@@ -151,8 +151,11 @@ def main(argv=None):
         draft = json.loads(args.draft)
         tag = draft.get("tagName") or draft.get("tag_name")
         target = draft.get("targetCommitish") or draft.get("target_commitish")
+        is_draft = draft.get("isDraft", draft.get("draft"))
         if tag != args.expected_tag or target != args.expected_target:
             print(json.dumps({"reuse": False, "reason": "identity-mismatch"}, sort_keys=True))
+        elif is_draft is not True:
+            print(json.dumps({"reuse": False, "reason": "not-draft"}, sort_keys=True))
         else:
             assets = {
                 item["name"]: (item.get("digest") or "").removeprefix("sha256:").lower()
