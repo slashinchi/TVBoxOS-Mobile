@@ -114,7 +114,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         marker = build_provenance_marker(upstream, candidate, tree, "2.1.27", 237)
         pr = {
             "number": 7,
-            "state": "MERGED",
+            "state": "closed",
+            "merged_at": "2026-08-28T00:00:00Z",
             "base": "patched",
             "merged_by": "slashinchi",
             "author": "github-actions[bot]",
@@ -820,6 +821,7 @@ class U2ReleaseContractTests(unittest.TestCase):
     def test_u2_publish_chain_is_wired_with_helpers_and_concurrency(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
         publish = self._job_block(workflow, "publish")
+        self.assertNotIn("environment: release-production", publish)
         self.assertIn("Promote patched to exact release SHA (CAS)", publish)
         self.assertIn("extract-signed-apk", publish)
         self.assertIn("gh release create", publish)
@@ -833,6 +835,10 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("concurrency:", publish)
         self.assertIn("tvbox-u2-publish", publish)
         self.assertIn("cancel-in-progress: false", publish)
+        approval = self._job_block(workflow, "approval")
+        self.assertIn("environment: release-production", approval)
+        self.assertIn("approval-matches", approval)
+        self.assertNotIn("tvbox-u2-publish", approval)
         prep = self._job_block(workflow, "prep")
         self.assertIn("plan-prep", prep)
         self.assertIn("write-prep-version", prep)
@@ -898,7 +904,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         marker = build_provenance_marker(upstream, candidate, tree, "2.1.27", 237)
         pr = json.dumps({
             "number": 7,
-            "state": "MERGED",
+            "state": "closed",
+            "merged_at": "2026-08-28T00:00:00Z",
             "base": "patched",
             "merged_by": "slashinchi",
             "author": "github-actions[bot]",

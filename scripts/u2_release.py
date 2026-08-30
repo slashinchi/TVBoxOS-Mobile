@@ -185,7 +185,8 @@ def qualify_u1_merge(
         return {"qualified": False, "reason": "missing-associated-pr"}
     if any(
         (
-            pr.get("state") != "MERGED",
+            pr.get("state") != "closed",
+            pr.get("merged_at") is None,
             pr.get("base") != "patched",
             pr.get("merged_by") != "slashinchi",
             pr.get("author") != "github-actions[bot]",

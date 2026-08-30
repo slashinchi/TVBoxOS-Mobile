@@ -124,6 +124,7 @@ jobs:
             pr=$(gh api "repos/${REPO}/commits/${PUSH_AFTER}/pulls" --jq '.[0] // empty' 2>/dev/null || echo "")
             if [[ -z "$pr" || -z "$candidate" ]]; then
               echo "::error::auto-upstream requires an associated U1 PR and merge parents"
+              sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
               echo "qualified=false" >> "$GITHUB_OUTPUT"
               echo "canary=false" >> "$GITHUB_OUTPUT"
               exit 0
@@ -136,6 +137,7 @@ jobs:
             parsed=$(python3 scripts/u2_release.py parse-provenance-marker --marker "$marker" 2>/dev/null || echo "")
             if [[ -z "$parsed" ]]; then
               echo "::error::auto-upstream PR missing valid v2 provenance marker"
+              sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
               echo "qualified=false" >> "$GITHUB_OUTPUT"
               echo "canary=false" >> "$GITHUB_OUTPUT"
               exit 0
@@ -167,6 +169,7 @@ jobs:
             if [[ "$(jq -r '.qualified' <<<"$result")" != "true" ]]; then
               reason=$(jq -r '.reason' <<<"$result")
               echo "::error::auto-upstream qualification failed: $reason"
+              sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
               echo "qualified=false" >> "$GITHUB_OUTPUT"
               echo "canary=false" >> "$GITHUB_OUTPUT"
               exit 0
@@ -249,6 +252,26 @@ jobs:
           version_name=$(jq -r '.versionName' <<<"$plan")
           version_code=$(jq -r '.versionCode' <<<"$plan")
           trailers=$(jq -r '.trailers' <<<"$plan")
+          # Reuse an existing exact prep ref when its identity matches, so
+          # re-runs never produce a divergent prep SHA.
+          existing_sha=""
+          if git ls-remote --exit-code "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/u2-prep-${SOURCE_SHA}" >/dev/null 2>&1; then
+            existing_sha=$(git ls-remote "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/u2-prep-${SOURCE_SHA}" | awk '{print $1}')
+            existing_trailers=""
+            if git cat-file -e "$existing_sha" 2>/dev/null; then
+              existing_trailers=$(git log -1 --format=%B "$existing_sha" | grep -E '^TVBox-U2-' || true)
+            fi
+            if [[ -n "$existing_trailers" && "$existing_trailers" == "$trailers" ]]; then
+              echo "::notice::reusing exact prep ref u2-prep-${SOURCE_SHA} at ${existing_sha}"
+              echo "release_sha=$existing_sha" >> "$GITHUB_OUTPUT"
+              echo "expected_version_name=$version_name" >> "$GITHUB_OUTPUT"
+              echo "expected_version_code=$version_code" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::existing prep ref identity mismatch; replacing with fresh prep"
+            git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              ":refs/heads/u2-prep-${SOURCE_SHA}" 2>/dev/null || true
+          fi
           # Rewrite exactly the two version fields in app/build.gradle.
           python3 scripts/u2_release.py write-prep-version \
             --file app/build.gradle \
@@ -292,18 +315,21 @@ jobs:
       provenance_marker: ${{ needs.qualify.outputs.provenance_marker }}
     secrets: inherit
 
-  publish:
-    name: Production approval and exact immutable publish
+  approval:
+    name: Production approval gate (exact marker)
     needs: [gate, qualify, prep, build_rc]
     if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.qualify.outputs.canary != 'true'
     runs-on: ubuntu-24.04
     environment: release-production
-    concurrency:
-      group: tvbox-u2-publish
-      cancel-in-progress: false
     permissions:
       contents: read
       actions: read
+    outputs:
+      RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
+      EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+      EXPECTED_DEBT: ${{ steps.identity.outputs.EXPECTED_DEBT }}
+      EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
+      SIGNER_SHA: ${{ steps.identity.outputs.SIGNER_SHA }}
     steps:
       - name: Check out patched
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -373,6 +399,34 @@ jobs:
           }
           echo "::notice::exact approval marker verified for run ${RUN_ID} attempt ${RUN_ATTEMPT}"
 
+  publish:
+    name: Exact immutable publish
+    needs: [gate, qualify, prep, build_rc, approval]
+    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.qualify.outputs.canary != 'true' && needs.approval.result == 'success'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: tvbox-u2-publish
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - name: Check out patched
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: refs/heads/patched
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Load release identity
+        id: identity
+        run: |
+          echo "RELEASE_SHA=${{ needs.approval.outputs.RELEASE_SHA }}" >> "$GITHUB_OUTPUT"
+          echo "EXPECTED_VERSION=${{ needs.approval.outputs.EXPECTED_VERSION }}" >> "$GITHUB_OUTPUT"
+          echo "EXPECTED_DEBT=${{ needs.approval.outputs.EXPECTED_DEBT }}" >> "$GITHUB_OUTPUT"
+          echo "EXPECTED_APK=${{ needs.approval.outputs.EXPECTED_APK }}" >> "$GITHUB_OUTPUT"
+          echo "SIGNER_SHA=${{ needs.approval.outputs.SIGNER_SHA }}" >> "$GITHUB_OUTPUT"
+
       - name: Promote patched to exact release SHA (CAS)
         env:
           RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
@@ -384,7 +438,8 @@ jobs:
           if [[ "$current" == "$RELEASE_SHA" ]]; then
             echo "::notice::patched already at release SHA; no promote needed"
           elif git merge-base --is-ancestor "$RELEASE_SHA" "$current"; then
-            echo "::notice::patched is a descendant of release SHA; promotion already applied"
+            echo "::error::patched advanced past the release SHA; pending RC is stale and must not publish"
+            exit 1
           else
             git fetch --no-tags origin "+refs/heads/patched:refs/remotes/origin/patched"
             remote=$(git rev-parse refs/remotes/origin/patched)
@@ -393,6 +448,9 @@ jobs:
               "$RELEASE_SHA:refs/heads/patched"
             echo "::notice::patched fast-forwarded to release SHA $RELEASE_SHA"
           fi
+          # Sync local refs so subsequent metadata push is a fast-forward.
+          git fetch --no-tags origin "+refs/heads/patched:refs/heads/patched"
+          git reset --hard refs/heads/patched
 
       - name: Download exact signed RC and build release assets
         id: assets
@@ -521,7 +579,7 @@ jobs:
             echo "::error::delivery proxy bytes do not match signed RC ($actual != $expected)";
             gh issue create --repo slashinchi/TVBoxOS-Mobile \
               --title "release-delivery: v${{ steps.identity.outputs.EXPECTED_VERSION }} proxy digest mismatch" \
-              --body "Release tag $tag. Expected $expected, got $actual." 2>/dev/null || true
+              --body "Release tag $tag. Expected $expected, got $actual."
             exit 1
           }
           echo "::notice::delivery proxy verified for $tag"
