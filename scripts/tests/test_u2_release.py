@@ -852,6 +852,52 @@ class U2ReleaseContractTests(unittest.TestCase):
             self.assertEqual(len(parsed["fingerprint"]), 64)
             self.assertEqual(parsed["path_count"], 1)
 
+    def test_qualify_u1_cli_accepts_valid_merge_and_rejects_bad_parents(self):
+        upstream = "a" * 40
+        candidate = "b" * 40
+        tree = "c" * 40
+        before = "d" * 40
+        after = "e" * 40
+        marker = build_provenance_marker(upstream, candidate, tree, "2.1.27", 237)
+        pr = json.dumps({
+            "number": 7,
+            "state": "MERGED",
+            "base": "patched",
+            "merged_by": "slashinchi",
+            "author": "github-actions[bot]",
+            "head_repository": "slashinchi/TVBoxOS-Mobile",
+            "head": candidate_branch_name(upstream),
+            "head_sha": candidate,
+            "merge_commit_sha": after,
+        })
+        base = [
+            "python3", "scripts/u2_release.py", "qualify-u1",
+            "--before", before,
+            "--after", after,
+            "--parents", before, candidate,
+            "--actor", "slashinchi",
+            "--pr", pr,
+            "--repository", "slashinchi/TVBoxOS-Mobile",
+            "--upstream", upstream,
+            "--marker", marker,
+            "--candidate-tree", tree,
+            "--upstream-ancestor", "true",
+            "--replay-status", "clean",
+            "--replay-tree", tree,
+            "--replay-actual-tree", tree,
+        ]
+        ok = subprocess.run(base, cwd=ROOT, text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(json.loads(ok.stdout)["qualified"], True)
+        bad = subprocess.run(
+            base + ["--parents", before, "f" * 40],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(bad.returncode, 0, bad.stderr)
+        self.assertEqual(json.loads(bad.stdout)["reason"], "merge-parent-mismatch")
+
     @staticmethod
     def _git(repo, *args):
         return subprocess.run(

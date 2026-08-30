@@ -618,6 +618,21 @@ def main(argv=None):
     approval_parser.add_argument("--run", required=True)
     approval_parser.add_argument("--attempt", required=True)
 
+    qualify_parser = subparsers.add_parser("qualify-u1")
+    qualify_parser.add_argument("--before", required=True)
+    qualify_parser.add_argument("--after", required=True)
+    qualify_parser.add_argument("--parents", nargs="+", required=True)
+    qualify_parser.add_argument("--actor", required=True)
+    qualify_parser.add_argument("--pr", required=True)
+    qualify_parser.add_argument("--repository", required=True)
+    qualify_parser.add_argument("--upstream", required=True)
+    qualify_parser.add_argument("--marker", required=True)
+    qualify_parser.add_argument("--candidate-tree", required=True)
+    qualify_parser.add_argument("--upstream-ancestor", required=True, choices=["true", "false"])
+    qualify_parser.add_argument("--replay-status", required=True)
+    qualify_parser.add_argument("--replay-tree", required=True)
+    qualify_parser.add_argument("--replay-actual-tree", required=True)
+
     args = parser.parse_args(argv)
     if args.command == "parse-app-version":
         print(json.dumps(dict(zip(("versionName", "versionCode"), parse_app_version(Path(args.file).read_text())))))
@@ -682,6 +697,23 @@ def main(argv=None):
             print(json.dumps({"matched": True}, sort_keys=True))
         else:
             print(json.dumps({"matched": False}, sort_keys=True))
+    elif args.command == "qualify-u1":
+        pr = json.loads(args.pr)
+        replay = (args.replay_status, args.replay_tree, args.replay_actual_tree)
+        result = qualify_u1_merge(
+            before=args.before,
+            after=args.after,
+            parents=args.parents,
+            push_actor=args.actor,
+            pr=pr,
+            repository=args.repository,
+            upstream_sha=args.upstream,
+            marker=args.marker,
+            candidate_tree=args.candidate_tree,
+            upstream_is_ancestor=(args.upstream_ancestor == "true"),
+            replay=replay,
+        )
+        print(json.dumps(result, sort_keys=True))
     return 0
 
 

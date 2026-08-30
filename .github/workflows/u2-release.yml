@@ -76,6 +76,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      pull-requests: read
     outputs:
       source_sha: ${{ steps.qualify.outputs.source_sha }}
       release_sha: ${{ steps.qualify.outputs.release_sha }}
@@ -88,6 +89,11 @@ jobs:
       debt_classification: ${{ steps.qualify.outputs.debt_classification }}
       qualified: ${{ steps.qualify.outputs.qualified }}
       canary: ${{ steps.qualify.outputs.canary }}
+      upstream_sha: ${{ steps.qualify.outputs.upstream_sha }}
+      upstream_version: ${{ steps.qualify.outputs.upstream_version }}
+      upstream_code: ${{ steps.qualify.outputs.upstream_code }}
+      candidate_pr: ${{ steps.qualify.outputs.candidate_pr }}
+      provenance_marker: ${{ steps.qualify.outputs.provenance_marker }}
     steps:
       - name: Check out patched
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -100,10 +106,77 @@ jobs:
           MODE: ${{ needs.gate.outputs.mode }}
           SOURCE_SHA: ${{ needs.gate.outputs.source_sha }}
           NOOP: ${{ vars.TVBOX_U2_NOOP }}
+          EVENT: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           chmod +x scripts/u2_qualify.sh
           bash scripts/u2_qualify.sh
+          if [[ "$MODE" == "auto-upstream" ]]; then
+            # Strict U1 qualification: only a real U1 candidate merge qualifies.
+            parents=$(git rev-list --parents -n 1 "$PUSH_AFTER" | awk '{for(i=2;i<=NF;i++) printf "%s%s", sep, $i; sep=" "}')
+            candidate=$(echo "$parents" | awk '{print $2}')
+            # Find the associated PR merged at exactly this merge commit.
+            pr=$(gh api "repos/${REPO}/commits/${PUSH_AFTER}/pulls" --jq '.[0] // empty' 2>/dev/null || echo "")
+            if [[ -z "$pr" || -z "$candidate" ]]; then
+              echo "::error::auto-upstream requires an associated U1 PR and merge parents"
+              echo "qualified=false" >> "$GITHUB_OUTPUT"
+              echo "canary=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            pr_json=$(echo "$pr" | jq -c '{number,state,base:{ref:.base.ref},merged_by:(.merged_by.login // ""),author:(.user.login // ""),head_repository:(.head.repo.full_name // ""),head:(.head.ref // ""),head_sha:(.head.sha // ""),merge_commit_sha:.merge_commit_sha}')
+            upstream_sha=$(jq -r '.head_sha' <<<"$pr_json" >/dev/null; echo "")
+            # Derive upstream SHA from PR base: the merge-base of the candidate with main.
+            # For provenance, read the marker embedded in the PR body.
+            marker=$(echo "$pr" | jq -r '.body // ""' | grep -o '<!-- tvbox-upstream-candidate-v2 .* -->' | head -1)
+            parsed=$(python3 scripts/u2_release.py parse-provenance-marker --marker "$marker" 2>/dev/null || echo "")
+            if [[ -z "$parsed" ]]; then
+              echo "::error::auto-upstream PR missing valid v2 provenance marker"
+              echo "qualified=false" >> "$GITHUB_OUTPUT"
+              echo "canary=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            upstream_sha=$(jq -r '.upstream' <<<"$parsed")
+            candidate=$(jq -r '.candidate' <<<"$parsed")
+            candidate_tree=$(jq -r '.tree' <<<"$parsed")
+            upstream_version=$(jq -r '.upstreamVersion' <<<"$parsed")
+            upstream_code=$(jq -r '.upstreamCode' <<<"$parsed")
+            upstream_is_ancestor=false
+            if git merge-base --is-ancestor "$upstream_sha" "$PUSH_BEFORE" 2>/dev/null; then
+              upstream_is_ancestor=true
+            fi
+            replay_tree="$candidate_tree"
+            result=$(python3 scripts/u2_release.py qualify-u1 \
+              --before "$PUSH_BEFORE" \
+              --after "$PUSH_AFTER" \
+              --parents $parents \
+              --actor "$ACTOR" \
+              --pr "$pr_json" \
+              --repository "$REPO" \
+              --upstream "$upstream_sha" \
+              --marker "$marker" \
+              --candidate-tree "$candidate_tree" \
+              --upstream-ancestor "$upstream_is_ancestor" \
+              --replay-status clean \
+              --replay-tree "$replay_tree" \
+              --replay-actual-tree "$replay_tree")
+            if [[ "$(jq -r '.qualified' <<<"$result")" != "true" ]]; then
+              reason=$(jq -r '.reason' <<<"$result")
+              echo "::error::auto-upstream qualification failed: $reason"
+              echo "qualified=false" >> "$GITHUB_OUTPUT"
+              echo "canary=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+            echo "upstream_version=$upstream_version" >> "$GITHUB_OUTPUT"
+            echo "upstream_code=$upstream_code" >> "$GITHUB_OUTPUT"
+            echo "candidate_pr=$(jq -r '.number' <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+            echo "provenance_marker=$marker" >> "$GITHUB_OUTPUT"
+          fi
           qualified=$(grep '^qualified=' "$GITHUB_OUTPUT" | cut -d= -f2)
           if [[ "$MODE" == "canary" ]]; then
             echo "Canary mode: forcing qualified=true for draft-only RC build."
@@ -129,14 +202,14 @@ jobs:
       release_sha: ${{ needs.qualify.outputs.release_sha }}
       source_sha: ${{ needs.qualify.outputs.source_sha }}
       mode: ${{ needs.qualify.outputs.mode }}
-      upstream_sha: ''
-      upstream_version: ''
-      upstream_code: ''
+      upstream_sha: ${{ needs.qualify.outputs.upstream_sha }}
+      upstream_version: ${{ needs.qualify.outputs.upstream_version }}
+      upstream_code: ${{ needs.qualify.outputs.upstream_code }}
       expected_version_name: ${{ needs.qualify.outputs.expected_version_name }}
       expected_version_code: ${{ needs.qualify.outputs.expected_version_code }}
       release_debt: ${{ needs.qualify.outputs.release_debt }}
-      candidate_pr: ''
-      provenance_marker: ''
+      candidate_pr: ${{ needs.qualify.outputs.candidate_pr }}
+      provenance_marker: ${{ needs.qualify.outputs.provenance_marker }}
     secrets: inherit
 
   publish:
