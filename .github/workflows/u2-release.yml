@@ -488,9 +488,23 @@ jobs:
           set -euo pipefail
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
           tag="v${EXPECTED_VERSION}"
-          existing=$(gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json id --jq '.id' 2>/dev/null || echo "")
+          existing=$(gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json id,tag_name,target_commitish,assets --jq '.' 2>/dev/null || echo "")
           if [[ -n "$existing" ]]; then
-            echo "::error::formal tag $tag already exists; refusing to overwrite"; exit 1;
+            # Recovery: reuse an identity-exact draft, otherwise fail closed.
+            check=$(python3 scripts/u2_publish.py reconcile-draft \
+              --draft "$existing" \
+              --version "$EXPECTED_VERSION" \
+              --expected-tag "$tag" \
+              --expected-target "$RELEASE_SHA" \
+              --apk-digest "$EXPECTED_APK" \
+              --update-digest "")
+            if [[ "$(jq -r '.reuse' <<<"$check")" != "true" ]]; then
+              echo "::error::existing Release $tag does not match exact identity: $(jq -r '.reason' <<<"$check")"
+              exit 1
+            fi
+            echo "::notice::reusing identity-exact draft $tag"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           run_url="https://github.com/slashinchi/TVBoxOS-Mobile/actions/runs/${{ github.run_id }}"
           notes=$(printf '%s\n' \

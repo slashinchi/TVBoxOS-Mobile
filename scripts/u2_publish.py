@@ -119,6 +119,14 @@ def main(argv=None):
     delivery.add_argument("--expected-sha", required=True)
     delivery.add_argument("--fetched-sha", required=True)
 
+    reconcile = subparsers.add_parser("reconcile-draft")
+    reconcile.add_argument("--draft", required=True)
+    reconcile.add_argument("--version", required=True)
+    reconcile.add_argument("--expected-tag", required=True)
+    reconcile.add_argument("--expected-target", required=True)
+    reconcile.add_argument("--apk-digest", required=True)
+    reconcile.add_argument("--update-digest", required=True)
+
     args = parser.parse_args(argv)
     if args.command == "extract-signed-apk":
         print(extract_signed_apk(args.zip, args.output_dir))
@@ -134,6 +142,22 @@ def main(argv=None):
         print(json.dumps({"newer": cand >= cur, "current": args.current_version, "candidate": args.candidate_version}, sort_keys=True))
     elif args.command == "delivery-compare":
         print(json.dumps({"verified": verify_delivery_url(args.url, args.expected_sha, args.fetched_sha)}, sort_keys=True))
+    elif args.command == "reconcile-draft":
+        draft = json.loads(args.draft)
+        if draft.get("tag_name") != args.expected_tag or draft.get("target_commitish") != args.expected_target:
+            print(json.dumps({"reuse": False, "reason": "identity-mismatch"}, sort_keys=True))
+        else:
+            assets = {item["name"]: item.get("digest") or "" for item in (draft.get("assets") or [])}
+            expected = expected_asset_set(args.version)
+            apk_ok = assets.get(f"TVBox-Mobile-v{args.version}.apk", "").lower() == args.apk_digest.lower()
+            if args.update_digest:
+                update_ok = assets.get("update.json", "").lower() == args.update_digest.lower()
+            else:
+                update_ok = "update.json" in assets
+            if set(assets) != expected or not apk_ok or not update_ok:
+                print(json.dumps({"reuse": False, "reason": "asset-mismatch"}, sort_keys=True))
+            else:
+                print(json.dumps({"reuse": True, "reason": "exact"}, sort_keys=True))
     return 0
 
 

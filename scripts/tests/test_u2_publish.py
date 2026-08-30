@@ -125,6 +125,40 @@ class U2PublishContractTests(unittest.TestCase):
             self.assertEqual(signed.returncode, 0, signed.stderr)
             self.assertTrue(Path(signed.stdout.strip()).is_file())
 
+    def test_reconcile_draft_cli(self):
+        def run(draft_json, version="2.1.27.1", update_digest=""):
+            return subprocess.run(
+                [
+                    "python3", "scripts/u2_publish.py", "reconcile-draft",
+                    "--draft", draft_json,
+                    "--version", version,
+                    "--expected-tag", f"v{version}",
+                    "--expected-target", "a" * 40,
+                    "--apk-digest", "b" * 64,
+                    "--update-digest", update_digest,
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+        good = json.dumps({
+            "tag_name": "v2.1.27.1",
+            "target_commitish": "a" * 40,
+            "assets": [
+                {"name": "TVBox-Mobile-v2.1.27.1.apk", "digest": "b" * 64},
+                {"name": "update.json", "digest": "c" * 64},
+            ],
+        })
+        self.assertEqual(json.loads(run(good).stdout)["reuse"], True)
+        wrong_tag = json.dumps({"tag_name": "v2.1.26.1", "target_commitish": "a" * 40, "assets": []})
+        self.assertEqual(json.loads(run(wrong_tag).stdout)["reason"], "identity-mismatch")
+        missing_asset = json.dumps({
+            "tag_name": "v2.1.27.1",
+            "target_commitish": "a" * 40,
+            "assets": [{"name": "update.json", "digest": "c" * 64}],
+        })
+        self.assertEqual(json.loads(run(missing_asset).stdout)["reason"], "asset-mismatch")
+
     def test_monotonic_compare_cli(self):
         def run(cur, cand):
             return subprocess.run(
