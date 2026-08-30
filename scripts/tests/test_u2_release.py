@@ -898,6 +898,67 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertEqual(bad.returncode, 0, bad.stderr)
         self.assertEqual(json.loads(bad.stdout)["reason"], "merge-parent-mismatch")
 
+    def test_plan_prep_cli_derives_version_and_trailers(self):
+        published = [["2.1.26.1", 23601], ["2.1.27.1", 23701]]
+        with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as f:
+            json.dump(published, f)
+            published_path = f.name
+        source = "a" * 40
+        debt = "b" * 64
+        result = subprocess.run(
+            [
+                "python3", "scripts/u2_release.py", "plan-prep",
+                "--upstream-name", "2.1.27",
+                "--upstream-code", "237",
+                "--published-file", published_path,
+                "--source", source,
+                "--mode", "auto-upstream",
+                "--upstream", "c" * 40,
+                "--debt", debt,
+                "--pr", "7",
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+        import os
+        os.unlink(published_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = json.loads(result.stdout)
+        self.assertEqual(parsed["versionName"], "2.1.27.2")
+        self.assertEqual(parsed["versionCode"], 23702)
+        self.assertIn(f"TVBox-U2-Source: {source}", parsed["trailers"])
+        self.assertIn(f"TVBox-U2-Debt: {debt}", parsed["trailers"])
+        self.assertEqual(parsed["spec"]["parent"], source)
+
+    def test_write_prep_version_rewrites_only_version_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "build.gradle"
+            path.write_text(
+                "apply plugin: 'com.android.application'\n"
+                "versionCode 23601\n"
+                "versionName '2.1.26.1'\n"
+                "compileSdkVersion 35\n"
+            )
+            result = subprocess.run(
+                [
+                    "python3", "scripts/u2_release.py", "write-prep-version",
+                    "--file", str(path),
+                    "--version-name", "2.1.27.1",
+                    "--version-code", "23701",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["versionName"], "2.1.27.1")
+            text = path.read_text()
+            self.assertIn("versionCode 23701", text)
+            self.assertIn("versionName '2.1.27.1'", text)
+            self.assertIn("compileSdkVersion 35", text)
+            self.assertNotIn("versionCode 23601", text)
+
     @staticmethod
     def _git(repo, *args):
         return subprocess.run(

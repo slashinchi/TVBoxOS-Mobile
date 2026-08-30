@@ -188,9 +188,89 @@ jobs:
           # u2_qualify.sh emits the rc-pipeline-compatible mode
           # (canary -> manual-local; auto-upstream/manual-local preserved).
 
+  prep:
+    name: Derive version and create prep commit
+    needs: [gate, qualify]
+    if: needs.gate.outputs.enabled == 'true' && needs.qualify.outputs.qualified == 'true' && needs.qualify.outputs.canary != 'true'
+    runs-on: ubuntu-24.04
+    environment: release-production
+    permissions:
+      contents: write
+    concurrency:
+      group: tvbox-u2-prepare
+      cancel-in-progress: false
+    outputs:
+      release_sha: ${{ steps.prep.outputs.release_sha }}
+      expected_version_name: ${{ steps.prep.outputs.expected_version_name }}
+      expected_version_code: ${{ steps.prep.outputs.expected_version_code }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.qualify.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: prep
+        env:
+          SOURCE_SHA: ${{ needs.qualify.outputs.source_sha }}
+          MODE: ${{ needs.qualify.outputs.mode }}
+          UPSTREAM_SHA: ${{ needs.qualify.outputs.upstream_sha }}
+          UPSTREAM_VERSION: ${{ needs.qualify.outputs.upstream_version }}
+          UPSTREAM_CODE: ${{ needs.qualify.outputs.upstream_code }}
+          RELEASE_DEBT: ${{ needs.qualify.outputs.release_debt }}
+          CANDIDATE_PR: ${{ needs.qualify.outputs.candidate_pr }}
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SOURCE_SHA" && -n "$MODE" ]] || { echo "::error::prep requires source and mode"; exit 1; }
+          [[ -n "$RELEASE_DEBT" && "$RELEASE_DEBT" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::prep requires a valid debt fingerprint"; exit 1; }
+          if [[ "$MODE" == "auto-upstream" ]]; then
+            [[ -n "$UPSTREAM_SHA" && -n "$UPSTREAM_VERSION" && -n "$UPSTREAM_CODE" ]] || { echo "::error::auto-upstream prep requires upstream identity"; exit 1; }
+            plan=$(python3 scripts/u2_release.py plan-prep \
+              --upstream-name "$UPSTREAM_VERSION" \
+              --upstream-code "$UPSTREAM_CODE" \
+              --published-file gradle/verified-releases.json \
+              --source "$SOURCE_SHA" \
+              --mode "$MODE" \
+              --upstream "$UPSTREAM_SHA" \
+              --debt "$RELEASE_DEBT" \
+              ${CANDIDATE_PR:+--pr "$CANDIDATE_PR"})
+          else
+            plan=$(python3 scripts/u2_release.py plan-prep \
+              --upstream-name "" \
+              --upstream-code 0 \
+              --published-file gradle/verified-releases.json \
+              --source "$SOURCE_SHA" \
+              --mode "$MODE" \
+              --upstream "${UPSTREAM_SHA:-0000000000000000000000000000000000000000}" \
+              --debt "$RELEASE_DEBT")
+          fi
+          version_name=$(jq -r '.versionName' <<<"$plan")
+          version_code=$(jq -r '.versionCode' <<<"$plan")
+          trailers=$(jq -r '.trailers' <<<"$plan")
+          # Rewrite exactly the two version fields in app/build.gradle.
+          python3 scripts/u2_release.py write-prep-version \
+            --file app/build.gradle \
+            --version-name "$version_name" \
+            --version-code "$version_code"
+          git diff -- app/build.gradle
+          git config user.name "TVBox U2 Prep"
+          git config user.email "u2-prep@users.noreply.github.com"
+          git add app/build.gradle
+          git commit -m "chore: version-only prep commit for ${version_name} (${version_code})" -m "$trailers"
+          prep_sha=$(git rev-parse HEAD)
+          echo "release_sha=$prep_sha" >> "$GITHUB_OUTPUT"
+          echo "expected_version_name=$version_name" >> "$GITHUB_OUTPUT"
+          echo "expected_version_code=$version_code" >> "$GITHUB_OUTPUT"
+          # Publish the disposable prep ref so rc-pipeline can check out release_sha.
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing for prep ref push"; exit 1; }
+          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/u2-prep-${SOURCE_SHA}"
+          echo "::notice::prep commit created at ${prep_sha} (version ${version_name} code ${version_code})"
+
   build_rc:
     name: Build exact signed RC
-    needs: [gate, qualify]
+    needs: [gate, qualify, prep]
     if: needs.gate.outputs.enabled == 'true' && needs.qualify.outputs.qualified == 'true'
     permissions:
       contents: read
@@ -199,14 +279,14 @@ jobs:
       attestations: write
     uses: ./.github/workflows/rc-pipeline.yml
     with:
-      release_sha: ${{ needs.qualify.outputs.release_sha }}
+      release_sha: ${{ needs.qualify.outputs.canary == 'true' && needs.qualify.outputs.release_sha || needs.prep.outputs.release_sha }}
       source_sha: ${{ needs.qualify.outputs.source_sha }}
       mode: ${{ needs.qualify.outputs.mode }}
       upstream_sha: ${{ needs.qualify.outputs.upstream_sha }}
       upstream_version: ${{ needs.qualify.outputs.upstream_version }}
       upstream_code: ${{ needs.qualify.outputs.upstream_code }}
-      expected_version_name: ${{ needs.qualify.outputs.expected_version_name }}
-      expected_version_code: ${{ needs.qualify.outputs.expected_version_code }}
+      expected_version_name: ${{ needs.qualify.outputs.canary == 'true' && needs.qualify.outputs.expected_version_name || needs.prep.outputs.expected_version_name }}
+      expected_version_code: ${{ needs.qualify.outputs.canary == 'true' && needs.qualify.outputs.expected_version_code || needs.prep.outputs.expected_version_code }}
       release_debt: ${{ needs.qualify.outputs.release_debt }}
       candidate_pr: ${{ needs.qualify.outputs.candidate_pr }}
       provenance_marker: ${{ needs.qualify.outputs.provenance_marker }}

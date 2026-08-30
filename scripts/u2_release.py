@@ -633,6 +633,21 @@ def main(argv=None):
     qualify_parser.add_argument("--replay-tree", required=True)
     qualify_parser.add_argument("--replay-actual-tree", required=True)
 
+    plan_prep_parser = subparsers.add_parser("plan-prep")
+    plan_prep_parser.add_argument("--upstream-name", required=True)
+    plan_prep_parser.add_argument("--upstream-code", required=True, type=int)
+    plan_prep_parser.add_argument("--published-file", required=True)
+    plan_prep_parser.add_argument("--source", required=True)
+    plan_prep_parser.add_argument("--mode", required=True, choices=["auto-upstream", "manual-local"])
+    plan_prep_parser.add_argument("--upstream", required=True)
+    plan_prep_parser.add_argument("--debt", required=True)
+    plan_prep_parser.add_argument("--pr", type=int)
+
+    write_prep_parser = subparsers.add_parser("write-prep-version")
+    write_prep_parser.add_argument("--file", required=True)
+    write_prep_parser.add_argument("--version-name", required=True)
+    write_prep_parser.add_argument("--version-code", required=True)
+
     args = parser.parse_args(argv)
     if args.command == "parse-app-version":
         print(json.dumps(dict(zip(("versionName", "versionCode"), parse_app_version(Path(args.file).read_text())))))
@@ -714,6 +729,40 @@ def main(argv=None):
             replay=replay,
         )
         print(json.dumps(result, sort_keys=True))
+    elif args.command == "plan-prep":
+        if args.upstream_name:
+            planned = plan_version(args.upstream_name, args.upstream_code, json.loads(Path(args.published_file).read_text()))
+        else:
+            name, code = parse_app_version(Path("app/build.gradle").read_text())
+            planned = {"versionName": name, "versionCode": code}
+        trailers = build_release_trailers(
+            args.source,
+            args.mode,
+            args.upstream,
+            planned["versionName"],
+            args.debt,
+            pr_number=args.pr,
+            version_code=planned["versionCode"],
+        )
+        spec = prep_commit_spec(
+            args.source,
+            ["app/build.gradle"],
+            trailers,
+            planned["versionName"],
+            planned["versionCode"],
+            args.debt,
+        )
+        print(json.dumps({
+            "versionName": planned["versionName"],
+            "versionCode": planned["versionCode"],
+            "trailers": trailers,
+            "spec": spec,
+        }, sort_keys=True))
+    elif args.command == "write-prep-version":
+        path = Path(args.file)
+        replaced, _ = _replace_version_fields(path.read_text(), args.version_name, args.version_code)
+        path.write_text(replaced)
+        print(json.dumps({"versionName": args.version_name, "versionCode": int(args.version_code)}, sort_keys=True))
     return 0
 
 
