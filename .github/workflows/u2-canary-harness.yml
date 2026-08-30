@@ -428,8 +428,12 @@ jobs:
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
           tag="u2-canary-${RUN_ID}-attempt${RUN_ATTEMPT}"
           if GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile >/dev/null 2>&1; then
-            GH_TOKEN="$TOKEN" gh release delete "$tag" --repo slashinchi/TVBoxOS-Mobile --yes --cleanup-tag
-            echo "::notice::canary draft and tag removed: $tag"
+            # Drafts have no tag ref, so --cleanup-tag would 422; delete the
+            # release first, then best-effort delete the tag ref if present.
+            GH_TOKEN="$TOKEN" gh release delete "$tag" --repo slashinchi/TVBoxOS-Mobile --yes
+            echo "::notice::canary release removed: $tag"
           else
-            echo "::notice::canary draft $tag not found; nothing to clean"
+            echo "::notice::canary release $tag not found; nothing to delete"
           fi
+          GH_TOKEN="$TOKEN" gh api -X DELETE "repos/slashinchi/TVBoxOS-Mobile/git/refs/tags/${tag}" >/dev/null 2>&1 || true
+          echo "::notice::canary tag ref cleanup done (if any): $tag"
