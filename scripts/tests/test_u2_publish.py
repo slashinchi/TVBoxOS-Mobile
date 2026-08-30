@@ -158,6 +158,7 @@ class U2PublishContractTests(unittest.TestCase):
             "assets": [{"name": "update.json", "digest": f"sha256:{'c' * 64}"}],
         })
         self.assertEqual(json.loads(run(missing_asset).stdout)["reason"], "incomplete")
+        self.assertFalse(json.loads(run(missing_asset).stdout)["reuse"])
         extra_asset = json.dumps({
             "tagName": "v2.1.27.1",
             "targetCommitish": "a" * 40,
