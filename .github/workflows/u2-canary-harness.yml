@@ -81,11 +81,20 @@ jobs:
         run: |
           set -euo pipefail
           version_json=$(python3 scripts/u2_release.py parse-app-version --file app/build.gradle)
-          debt=$(python3 scripts/u2_release.py release-debt-cli --baseline v2.1.26.1 2>/dev/null || echo "0000000000000000000000000000000000000000000000000000000000000000")
+          debt_json=$(python3 scripts/u2_release.py release-debt \
+            --repo "$PWD" \
+            --releases-file gradle/verified-releases.json \
+            --current "$SOURCE_SHA" \
+            --exclude ".github/" --exclude "scripts/" --exclude "docs/" \
+            --exclude "gradle/verified-releases.json" --exclude "gradle/legacy-dependencies.lock.json" \
+            --exclude "AGENTS.md" --exclude "README.md" \
+            --exclude "update.json")
+          debt=$(jq -r '.fingerprint' <<<"$debt_json")
+          classification=$(jq -r '.classification' <<<"$debt_json")
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "release_debt=${debt:-0000000000000000000000000000000000000000000000000000000000000000}" >> "$GITHUB_OUTPUT"
-          echo "debt_classification=clean" >> "$GITHUB_OUTPUT"
+          echo "release_debt=$debt" >> "$GITHUB_OUTPUT"
+          echo "debt_classification=$classification" >> "$GITHUB_OUTPUT"
           echo "expected_version_name=$(jq -r '.versionName' <<<"$version_json")" >> "$GITHUB_OUTPUT"
           echo "expected_version_code=$(jq -r '.versionCode' <<<"$version_json")" >> "$GITHUB_OUTPUT"
 
@@ -93,6 +102,11 @@ jobs:
     name: Build canary RC (same rc-pipeline as production)
     needs: [gate, qualify]
     if: needs.gate.outputs.enabled == 'true'
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/rc-pipeline.yml
     with:
       release_sha: ${{ needs.gate.outputs.source_sha }}
