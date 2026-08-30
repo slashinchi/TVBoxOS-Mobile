@@ -11,6 +11,7 @@ from scripts.u2_publish import (
     reconcile_draft_assets,
     reconcile_draft_decision,
     immutable_verified,
+    released_identity_decision,
     verify_release_assets,
     verify_remote_metadata,
     monotonic_metadata_next,
@@ -203,6 +204,58 @@ class U2PublishContractTests(unittest.TestCase):
         self.assertFalse(immutable_verified({**base, "asset_count": 3}, tag, target))
         self.assertFalse(immutable_verified(base, "v2.1.27.2", target))
         self.assertFalse(immutable_verified(base, tag, "f" * 40))
+
+    def test_released_identity_decision_verify_published(self):
+        published = _draft([_asset(APK_NAME, f"sha256:{APK_DIGEST}"), _asset("update.json", f"sha256:{UPDATE_DIGEST}")], is_draft=False)
+        self.assertEqual(
+            released_identity_decision(published, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "verify-published",
+        )
+
+    def test_released_identity_decision_repair_published_missing(self):
+        missing_update = _draft([_asset(APK_NAME, f"sha256:{APK_DIGEST}")], is_draft=False)
+        self.assertEqual(
+            released_identity_decision(missing_update, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "repair-published-missing",
+        )
+        missing_apk = _draft([_asset("update.json", f"sha256:{UPDATE_DIGEST}")], is_draft=False)
+        self.assertEqual(
+            released_identity_decision(missing_apk, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "repair-published-missing",
+        )
+
+    def test_released_identity_decision_rejects_bad_published(self):
+        wrong_tag = _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST)], is_draft=False, tag="v2.1.26.1")
+        self.assertEqual(
+            released_identity_decision(wrong_tag, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-published-identity",
+        )
+        wrong_sha = _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST)], is_draft=False, tag_target_sha="f" * 40)
+        self.assertEqual(
+            released_identity_decision(wrong_sha, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-published-identity",
+        )
+        wrong_digest = _draft([_asset(APK_NAME, "f" * 64), _asset("update.json", UPDATE_DIGEST)], is_draft=False)
+        self.assertEqual(
+            released_identity_decision(wrong_digest, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-published-digest-mismatch",
+        )
+        extra = _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST), _asset("stale.txt", "d" * 64)], is_draft=False)
+        self.assertEqual(
+            released_identity_decision(extra, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-published-extra-asset",
+        )
+        # A draft must never be classified as published-verify.
+        draft = _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST)], is_draft=True)
+        self.assertEqual(
+            released_identity_decision(draft, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-published-is-draft",
+        )
+        with self.assertRaises(ValueError):
+            released_identity_decision(
+                _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST)], is_draft=False),
+                VERSION, TAG, TARGET, APK_DIGEST, "",
+            )
 
     def test_verify_release_assets_checks_api_digests_and_download_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -438,6 +491,43 @@ class U2PublishContractTests(unittest.TestCase):
             )
             self.assertEqual(key.returncode, 0, key.stderr)
             self.assertEqual(json.loads(key.stdout)["key"], f"manual-local:{TARGET}:{VERSION}:{APK_DIGEST}")
+
+    def test_released_identity_cli(self):
+        published = json.dumps(_draft([_asset(APK_NAME, f"sha256:{APK_DIGEST}"), _asset("update.json", f"sha256:{UPDATE_DIGEST}")], is_draft=False))
+        result = subprocess.run(
+            [
+                "python3", "scripts/u2_publish.py", "released-identity",
+                "--release", published,
+                "--version", VERSION,
+                "--expected-tag", TAG,
+                "--expected-target-sha", TARGET,
+                "--apk-digest", APK_DIGEST,
+                "--update-digest", UPDATE_DIGEST,
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["decision"], "verify-published")
+        draft = json.loads(published)
+        draft["isDraft"] = True
+        result_draft = subprocess.run(
+            [
+                "python3", "scripts/u2_publish.py", "released-identity",
+                "--release", json.dumps(draft),
+                "--version", VERSION,
+                "--expected-tag", TAG,
+                "--expected-target-sha", TARGET,
+                "--apk-digest", APK_DIGEST,
+                "--update-digest", UPDATE_DIGEST,
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result_draft.returncode, 0, result_draft.stderr)
+        self.assertEqual(json.loads(result_draft.stdout)["decision"], "reject-published-is-draft")
 
     def test_monotonic_compare_cli(self):
         def run(cur, cand):
