@@ -84,6 +84,11 @@ def reconcile_draft_decision(draft, version, expected_tag, expected_target_sha, 
     # Identity authority: the resolved tag-object commit SHA. A bare
     # targetCommitish that is a branch name (e.g. "main") is not identity.
     target_sha = (draft or {}).get("tagTargetSha") or (draft or {}).get("tag_target_sha") or ""
+    if not target_sha and target:
+        # Drafts have no tag ref; GitHub stores the exact --target SHA in
+        # target_commitish when the release was created with a full SHA.
+        if FULL_SHA_RE.fullmatch(target or ""):
+            target_sha = target
     if tag != expected_tag or target_sha != expected_target_sha:
         return "reject-identity"
     if target not in ("", expected_target_sha):
