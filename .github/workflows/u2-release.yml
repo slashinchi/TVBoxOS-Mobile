@@ -545,13 +545,15 @@ jobs:
           [[ -n "$EXPECTED_DEBT" && "$EXPECTED_DEBT" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::debt fingerprint invalid"; exit 1; }
           [[ -n "$RELEASE_SHA" && "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::release SHA invalid"; exit 1; }
           [[ -n "$SIGNER_SHA" && "$SIGNER_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::signer fingerprint invalid"; exit 1; }
-          # Recompute cumulative release debt from canonical baseline and require
-          # exact equality with the approved marker — a newer merge or changed
-          # tree invalidates the approval before any mutation.
+          # Recompute cumulative release debt from canonical baseline against the
+          # SOURCE tree (same tree the approved marker was computed on; prep only
+          # touches app/build.gradle on top of it) with the SAME excludes as
+          # qualify — a newer merge or changed tree invalidates the approval
+          # before any mutation.
           debt_json=$(python3 scripts/u2_release.py release-debt \
             --repo "$PWD" \
             --releases-file gradle/verified-releases.json \
-            --current "$RELEASE_SHA" \
+            --current "$SOURCE_SHA" \
             --exclude ".github/" --exclude "scripts/" --exclude "docs/" \
             --exclude "gradle/verified-releases.json" --exclude "gradle/legacy-dependencies.lock.json" \
             --exclude "AGENTS.md" --exclude "README.md" \
@@ -572,18 +574,6 @@ jobs:
           # The release-production environment must still exist with admin bypass off.
           env_state=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/environments/release-production" --jq '{name,protection_rules:.protection_rules}' 2>/dev/null || echo "")
           [[ -n "$env_state" ]] || { echo "::error::release-production environment missing"; exit 1; }
-          # Attestations: both the default build provenance and the custom
-          # release-identity attestation must verify for the exact signed RC.
-          attest_input="$RUNNER_TEMP/attest-input"
-          mkdir -p "$attest_input"
-          cp "$RUNNER_TEMP/signed-output/signed.apk" "$attest_input/signed.apk" 2>/dev/null || true
-          if [[ -f "$attest_input/signed.apk" ]]; then
-            GH_TOKEN="$TOKEN" gh attestation verify "$attest_input/signed.apk" \
-              --repo slashinchi/TVBoxOS-Mobile \
-              --predicate-type https://slsa.dev/provenance/v1 >/dev/null 2>&1 || {
-              echo "::error::default attestation verification failed for signed RC"; exit 1;
-            }
-          fi
           echo "::notice::release identity revalidated (release=$RELEASE_SHA version=$EXPECTED_VERSION apk=$EXPECTED_APK signer=$SIGNER_SHA debt=$EXPECTED_DEBT recomputed=$recomputed_debt)"
           echo "::notice::default branch patched + release-production environment confirmed (immutable releases enforced per-Release post-publish)"
 
@@ -643,6 +633,30 @@ jobs:
           cp "$signed" "$RUNNER_TEMP/assets/$asset_name"
           echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
           echo "signed_path=$signed" >> "$GITHUB_OUTPUT"
+
+      - name: Verify attestations for the exact signed RC (fail-closed)
+        env:
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          signed="${{ steps.assets.outputs.signed_path }}"
+          test -f "$signed" || { echo "::error::signed APK missing for attestation verify"; exit 1; }
+          # Default build provenance (SLSA v1) must verify.
+          GH_TOKEN="$TOKEN" gh attestation verify "$signed" \
+            --repo slashinchi/TVBoxOS-Mobile \
+            --predicate-type https://slsa.dev/provenance/v1 >/dev/null || {
+            echo "::error::default attestation verification failed for signed RC"; exit 1;
+          }
+          # Custom release-identity attestation (tvbox-release-identity-v2) must
+          # verify against the exact signed bytes.
+          GH_TOKEN="$TOKEN" gh attestation verify "$signed" \
+            --repo slashinchi/TVBoxOS-Mobile \
+            --predicate-type https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v2 >/dev/null 2>&1 || {
+            echo "::error::release-identity attestation verification failed for signed RC"; exit 1;
+          }
+          echo "::notice::attestations verified for exact signed RC (SLSA v1 + tvbox-release-identity-v2)"
 
       - name: Create or reconcile draft Release with exact identity
         id: release
