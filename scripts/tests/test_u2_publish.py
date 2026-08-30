@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -8,15 +9,41 @@ from pathlib import Path
 from scripts.u2_publish import (
     expected_asset_set,
     reconcile_draft_assets,
+    reconcile_draft_decision,
     immutable_verified,
+    verify_release_assets,
+    verify_remote_metadata,
     monotonic_metadata_next,
     verify_delivery_url,
     build_update_json,
     extract_signed_apk,
+    incident_key,
+    incident_satisfied,
     RELEASE_TAG_RE,
 )
 
 ROOT = Path(__file__).parents[2]
+
+VERSION = "2.1.27.1"
+TAG = f"v{VERSION}"
+TARGET = "a" * 40
+APK_DIGEST = "b" * 64
+UPDATE_DIGEST = "c" * 64
+APK_NAME = f"TVBox-Mobile-v{VERSION}.apk"
+
+
+def _draft(assets, is_draft=True, tag=TAG, tag_target_sha=TARGET, target_commitish=TARGET):
+    return {
+        "tagName": tag,
+        "targetCommitish": target_commitish,
+        "tagTargetSha": tag_target_sha,
+        "isDraft": is_draft,
+        "assets": assets,
+    }
+
+
+def _asset(name, digest):
+    return {"name": name, "digest": digest}
 
 
 class U2PublishContractTests(unittest.TestCase):
@@ -31,29 +58,111 @@ class U2PublishContractTests(unittest.TestCase):
             expected_asset_set("2.1.27")
 
     def test_reconcile_draft_assets_fails_closed_on_any_deviation(self):
-        digests = {
-            "TVBox-Mobile-v2.1.27.1.apk": "a" * 64,
-            "update.json": "b" * 64,
-        }
-        draft = {"tag_name": "v2.1.27.1", "assets": [
-            {"name": "TVBox-Mobile-v2.1.27.1.apk", "digest": "a" * 64},
-            {"name": "update.json", "digest": "b" * 64},
+        digests = {APK_NAME: APK_DIGEST, "update.json": UPDATE_DIGEST}
+        draft = {"tag_name": TAG, "assets": [
+            _asset(APK_NAME, APK_DIGEST),
+            _asset("update.json", UPDATE_DIGEST),
         ]}
-        self.assertEqual(reconcile_draft_assets(draft, "2.1.27.1", digests), "exact")
-        missing = {"tag_name": "v2.1.27.1", "assets": draft["assets"][:1]}
-        self.assertEqual(reconcile_draft_assets(missing, "2.1.27.1", digests), "incomplete")
-        extra = {"tag_name": "v2.1.27.1", "assets": draft["assets"] + [{"name": "stale.txt", "digest": "c" * 64}]}
-        self.assertEqual(reconcile_draft_assets(extra, "2.1.27.1", digests), "unexpected-asset")
-        wrong = {"tag_name": "v2.1.27.1", "assets": [
-            {"name": "TVBox-Mobile-v2.1.27.1.apk", "digest": "f" * 64},
-            {"name": "update.json", "digest": "b" * 64},
+        self.assertEqual(reconcile_draft_assets(draft, VERSION, digests), "exact")
+        missing = {"tag_name": TAG, "assets": draft["assets"][:1]}
+        self.assertEqual(reconcile_draft_assets(missing, VERSION, digests), "incomplete")
+        extra = {"tag_name": TAG, "assets": draft["assets"] + [_asset("stale.txt", "d" * 64)]}
+        self.assertEqual(reconcile_draft_assets(extra, VERSION, digests), "unexpected-asset")
+        wrong = {"tag_name": TAG, "assets": [
+            _asset(APK_NAME, "f" * 64),
+            _asset("update.json", UPDATE_DIGEST),
         ]}
-        self.assertEqual(reconcile_draft_assets(wrong, "2.1.27.1", digests), "digest-mismatch")
-        self.assertEqual(reconcile_draft_assets({}, "2.1.27.1", digests), "incomplete")
+        self.assertEqual(reconcile_draft_assets(wrong, VERSION, digests), "digest-mismatch")
+        self.assertEqual(reconcile_draft_assets({}, VERSION, digests), "incomplete")
+
+    def test_reconcile_decision_exact_reuse(self):
+        draft = _draft([_asset(APK_NAME, f"sha256:{APK_DIGEST}"), _asset("update.json", f"sha256:{UPDATE_DIGEST}")])
+        self.assertEqual(
+            reconcile_draft_decision(draft, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "exact-reuse",
+        )
+
+    def test_reconcile_decision_repair_missing_any_expected_asset(self):
+        missing_apk = _draft([_asset("update.json", f"sha256:{UPDATE_DIGEST}")])
+        self.assertEqual(
+            reconcile_draft_decision(missing_apk, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "repair-missing",
+        )
+        missing_update = _draft([_asset(APK_NAME, f"sha256:{APK_DIGEST}")])
+        self.assertEqual(
+            reconcile_draft_decision(missing_update, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "repair-missing",
+        )
+        empty_draft = _draft([])
+        self.assertEqual(
+            reconcile_draft_decision(empty_draft, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "repair-missing",
+        )
+
+    def test_reconcile_decision_rejects_bad_identity(self):
+        wrong_tag = _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST)], tag="v2.1.26.1")
+        self.assertEqual(
+            reconcile_draft_decision(wrong_tag, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-identity",
+        )
+        wrong_sha = _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST)], tag_target_sha="f" * 40)
+        self.assertEqual(
+            reconcile_draft_decision(wrong_sha, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-identity",
+        )
+        branch_target = _draft(
+            [_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST)],
+            tag_target_sha=TARGET,
+            target_commitish="main",
+        )
+        self.assertEqual(
+            reconcile_draft_decision(branch_target, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-identity",
+        )
+
+    def test_reconcile_decision_rejects_not_draft(self):
+        published = _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST)], is_draft=False)
+        self.assertEqual(
+            reconcile_draft_decision(published, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-not-draft",
+        )
+        missing_flag = _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST)])
+        missing_flag.pop("isDraft", None)
+        self.assertEqual(
+            reconcile_draft_decision(missing_flag, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-not-draft",
+        )
+
+    def test_reconcile_decision_rejects_wrong_or_extra_assets(self):
+        wrong_apk = _draft([_asset(APK_NAME, "f" * 64), _asset("update.json", UPDATE_DIGEST)])
+        self.assertEqual(
+            reconcile_draft_decision(wrong_apk, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-digest-mismatch",
+        )
+        wrong_update = _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", "f" * 64)])
+        self.assertEqual(
+            reconcile_draft_decision(wrong_update, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-digest-mismatch",
+        )
+        extra = _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST), _asset("stale.txt", "d" * 64)])
+        self.assertEqual(
+            reconcile_draft_decision(extra, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-extra-asset",
+        )
+        malformed = _draft([_asset(APK_NAME, "zz"), _asset("update.json", UPDATE_DIGEST)])
+        self.assertEqual(
+            reconcile_draft_decision(malformed, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-digest-mismatch",
+        )
+
+    def test_reconcile_decision_rejects_empty_update_digest(self):
+        draft = _draft([_asset(APK_NAME, APK_DIGEST), _asset("update.json", UPDATE_DIGEST)])
+        with self.assertRaises(ValueError):
+            reconcile_draft_decision(draft, VERSION, TAG, TARGET, APK_DIGEST, "")
 
     def test_immutable_verified_requires_exact_state(self):
-        tag = "v2.1.27.1"
-        target = "a" * 40
+        tag = TAG
+        target = TARGET
         base = {"immutable": True, "tag": tag, "target": target, "asset_count": 2}
         self.assertTrue(immutable_verified(base, tag, target))
         self.assertFalse(immutable_verified({**base, "immutable": False}, tag, target))
@@ -62,6 +171,45 @@ class U2PublishContractTests(unittest.TestCase):
         self.assertFalse(immutable_verified({**base, "asset_count": 3}, tag, target))
         self.assertFalse(immutable_verified(base, "v2.1.27.2", target))
         self.assertFalse(immutable_verified(base, tag, "f" * 40))
+
+    def test_verify_release_assets_checks_api_digests_and_download_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / APK_NAME).write_bytes(b"apk")
+            (out / "update.json").write_bytes(b"update")
+            apk_local = hashlib.sha256(b"apk").hexdigest()
+            update_local = hashlib.sha256(b"update").hexdigest()
+            release = {"assets": [
+                _asset(APK_NAME, f"sha256:{apk_local}"),
+                _asset("update.json", f"sha256:{update_local}"),
+            ]}
+            result = verify_release_assets(release, VERSION, {APK_NAME: apk_local, "update.json": update_local}, tmp)
+            self.assertTrue(result["verified"])
+            self.assertEqual(set(result["checked"]), {APK_NAME, "update.json"})
+
+            # API digest mismatch
+            bad_api = {"assets": [_asset(APK_NAME, f"sha256:{'f' * 64}"), _asset("update.json", f"sha256:{update_local}")]}
+            self.assertFalse(verify_release_assets(bad_api, VERSION, {APK_NAME: apk_local, "update.json": update_local}, tmp)["verified"])
+
+            # Downloaded bytes mismatch
+            (out / APK_NAME).write_bytes(b"different-bytes")
+            self.assertFalse(verify_release_assets(release, VERSION, {APK_NAME: apk_local, "update.json": update_local}, tmp)["verified"])
+
+            # Missing asset set
+            missing = {"assets": [_asset(APK_NAME, f"sha256:{apk_local}")]}
+            self.assertFalse(verify_release_assets(missing, VERSION, {APK_NAME: apk_local, "update.json": update_local}, tmp)["verified"])
+
+            # Missing digest field
+            nodigest = {"assets": [_asset(APK_NAME, ""), _asset("update.json", f"sha256:{update_local}")]}
+            self.assertFalse(verify_release_assets(nodigest, VERSION, {APK_NAME: apk_local, "update.json": update_local}, tmp)["verified"])
+
+    def test_verify_remote_metadata_is_byte_exact(self):
+        url = "https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/v2.1.27.1/TVBox-Mobile-v2.1.27.1.apk"
+        canonical = (json.dumps(build_update_json(VERSION, url), sort_keys=True) + "\n").encode()
+        self.assertTrue(verify_remote_metadata(canonical, VERSION, url)["verified"])
+        self.assertFalse(verify_remote_metadata(b"not json", VERSION, url)["verified"])
+        self.assertFalse(verify_remote_metadata(canonical.replace(b"2.1.27.1", b"2.1.26.1"), VERSION, url)["verified"])
+        self.assertFalse(verify_remote_metadata(canonical + b"\n", VERSION, url)["verified"])
 
     def test_monotonic_metadata_never_rolls_back(self):
         current = {"version": "2.1.26.1", "apk_url": "https://example.invalid/old"}
@@ -82,6 +230,32 @@ class U2PublishContractTests(unittest.TestCase):
             fetched_sha256="f" * 64,
         ))
 
+    def test_incident_key_is_identity_bound(self):
+        key = incident_key("manual-local", TARGET, VERSION, APK_DIGEST)
+        self.assertEqual(key, f"manual-local:{TARGET}:{VERSION}:{APK_DIGEST}")
+        with self.assertRaises(ValueError):
+            incident_key("BAD", TARGET, VERSION, APK_DIGEST)
+        with self.assertRaises(ValueError):
+            incident_key("manual-local", "short", VERSION, APK_DIGEST)
+        with self.assertRaises(ValueError):
+            incident_key("manual-local", TARGET, "2.1.27", APK_DIGEST)
+        with self.assertRaises(ValueError):
+            incident_key("manual-local", TARGET, VERSION, "zz")
+
+    def test_incident_satisfied_closes_only_when_condition_met(self):
+        incident = {
+            "kind": "release-delivery",
+            "release_tag": TAG,
+            "release_target_sha": TARGET,
+            "version": VERSION,
+            "debt": APK_DIGEST,
+        }
+        self.assertTrue(incident_satisfied(incident, TAG, TARGET, VERSION, APK_DIGEST, True))
+        self.assertFalse(incident_satisfied(incident, TAG, TARGET, VERSION, APK_DIGEST, False))
+        self.assertFalse(incident_satisfied(incident, "v2.1.26.1", TARGET, VERSION, APK_DIGEST, True))
+        other = {"kind": "stale-rc", "release_tag": TAG, "release_target_sha": TARGET, "version": VERSION, "debt": APK_DIGEST}
+        self.assertTrue(incident_satisfied(other, TAG, TARGET, VERSION, APK_DIGEST, None))
+
     def test_release_tag_re_is_strict(self):
         self.assertTrue(RELEASE_TAG_RE.fullmatch("v2.1.26.1"))
         self.assertTrue(RELEASE_TAG_RE.fullmatch("v2.1.27.10"))
@@ -96,7 +270,7 @@ class U2PublishContractTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     "python3", "scripts/u2_publish.py", "build-update-json",
-                    "--version", "2.1.27.1",
+                    "--version", VERSION,
                     "--apk-url", "https://gh.xxooo.cf/slashinchi/TVBoxOS-Mobile/releases/download/v2.1.27.1/TVBox-Mobile-v2.1.27.1.apk",
                     "--output", str(update_out),
                 ],
@@ -106,7 +280,7 @@ class U2PublishContractTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(update_out.read_text())
-            self.assertEqual(payload["version"], "2.1.27.1")
+            self.assertEqual(payload["version"], VERSION)
             zip_path = tmp_path / "artifact.zip"
             with zipfile.ZipFile(zip_path, "w") as z:
                 z.writestr("signed-output/signed.apk", b"apk-bytes")
@@ -126,59 +300,112 @@ class U2PublishContractTests(unittest.TestCase):
             self.assertTrue(Path(signed.stdout.strip()).is_file())
 
     def test_reconcile_draft_cli(self):
-        def run(draft_json, version="2.1.27.1", update_digest=""):
+        def run(draft_json, version=VERSION, update_digest=UPDATE_DIGEST):
             return subprocess.run(
                 [
                     "python3", "scripts/u2_publish.py", "reconcile-draft",
                     "--draft", draft_json,
                     "--version", version,
-                    "--expected-tag", f"v{version}",
-                    "--expected-target", "a" * 40,
-                    "--apk-digest", "b" * 64,
+                    "--expected-tag", TAG,
+                    "--expected-target-sha", TARGET,
+                    "--apk-digest", APK_DIGEST,
                     "--update-digest", update_digest,
                 ],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
             )
-        good = json.dumps({
-            "tagName": "v2.1.27.1",
-            "targetCommitish": "a" * 40,
-            "isDraft": True,
-            "assets": [
-                {"name": "TVBox-Mobile-v2.1.27.1.apk", "digest": f"sha256:{'b' * 64}"},
-                {"name": "update.json", "digest": f"sha256:{'c' * 64}"},
-            ],
-        })
+        good = json.dumps(_draft([_asset(APK_NAME, f"sha256:{APK_DIGEST}"), _asset("update.json", f"sha256:{UPDATE_DIGEST}")]))
+        self.assertEqual(json.loads(run(good).stdout)["decision"], "exact-reuse")
         self.assertEqual(json.loads(run(good).stdout)["reuse"], True)
         published = json.loads(good)
         published["isDraft"] = False
-        self.assertEqual(json.loads(run(json.dumps(published)).stdout)["reason"], "not-draft")
-        self.assertFalse(json.loads(run(json.dumps(published)).stdout)["reuse"])
-        missing_draft_flag = json.loads(good)
-        missing_draft_flag.pop("isDraft", None)
-        self.assertEqual(json.loads(run(json.dumps(missing_draft_flag)).stdout)["reason"], "not-draft")
-        wrong_tag = json.dumps({"tagName": "v2.1.26.1", "targetCommitish": "a" * 40, "isDraft": True, "assets": []})
-        self.assertEqual(json.loads(run(wrong_tag).stdout)["reason"], "identity-mismatch")
-        missing_asset = json.dumps({
-            "tagName": "v2.1.27.1",
-            "targetCommitish": "a" * 40,
-            "isDraft": True,
-            "assets": [{"name": "update.json", "digest": f"sha256:{'c' * 64}"}],
-        })
-        self.assertEqual(json.loads(run(missing_asset).stdout)["reason"], "incomplete")
-        self.assertFalse(json.loads(run(missing_asset).stdout)["reuse"])
-        extra_asset = json.dumps({
-            "tagName": "v2.1.27.1",
-            "targetCommitish": "a" * 40,
-            "isDraft": True,
-            "assets": [
-                {"name": "TVBox-Mobile-v2.1.27.1.apk", "digest": f"sha256:{'b' * 64}"},
-                {"name": "update.json", "digest": f"sha256:{'c' * 64}"},
-                {"name": "stale.txt", "digest": "d" * 64},
+        self.assertEqual(json.loads(run(json.dumps(published)).stdout)["decision"], "reject-not-draft")
+        wrong_tag = json.dumps(_draft([], tag="v2.1.26.1"))
+        self.assertEqual(json.loads(run(wrong_tag).stdout)["decision"], "reject-identity")
+        missing_apk = json.dumps(_draft([_asset("update.json", f"sha256:{UPDATE_DIGEST}")]))
+        self.assertEqual(json.loads(run(missing_apk).stdout)["decision"], "repair-missing")
+        self.assertEqual(json.loads(run(missing_apk).stdout)["reuse"], False)
+        extra_asset = json.dumps(_draft([
+            _asset(APK_NAME, f"sha256:{APK_DIGEST}"),
+            _asset("update.json", f"sha256:{UPDATE_DIGEST}"),
+            _asset("stale.txt", "d" * 64),
+        ]))
+        self.assertEqual(json.loads(run(extra_asset).stdout)["decision"], "reject-extra-asset")
+        empty_update = subprocess.run(
+            [
+                "python3", "scripts/u2_publish.py", "reconcile-draft",
+                "--draft", good,
+                "--version", VERSION,
+                "--expected-tag", TAG,
+                "--expected-target-sha", TARGET,
+                "--apk-digest", APK_DIGEST,
+                "--update-digest", "",
             ],
-        })
-        self.assertEqual(json.loads(run(extra_asset).stdout)["reason"], "asset-mismatch")
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(empty_update.returncode, 0)
+
+    def test_verify_release_assets_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            apk_bytes = b"cli-apk"
+            update_bytes = b"cli-update"
+            (out / APK_NAME).write_bytes(apk_bytes)
+            (out / "update.json").write_bytes(update_bytes)
+            apk_local = hashlib.sha256(apk_bytes).hexdigest()
+            update_local = hashlib.sha256(update_bytes).hexdigest()
+            release = json.dumps({"assets": [_asset(APK_NAME, f"sha256:{apk_local}"), _asset("update.json", f"sha256:{update_local}")]})
+            result = subprocess.run(
+                [
+                    "python3", "scripts/u2_publish.py", "verify-release-assets",
+                    "--release", release,
+                    "--version", VERSION,
+                    "--apk-digest", apk_local,
+                    "--update-digest", update_local,
+                    "--download-dir", tmp,
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(json.loads(result.stdout)["verified"])
+
+    def test_verify_remote_metadata_cli_and_incident_key_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            url = "https://gh.xxooo.cf/slashinchi/TVBoxOS-Mobile/releases/download/v2.1.27.1/TVBox-Mobile-v2.1.27.1.apk"
+            meta = Path(tmp) / "update.json"
+            meta.write_text(json.dumps(build_update_json(VERSION, url), sort_keys=True) + "\n")
+            result = subprocess.run(
+                [
+                    "python3", "scripts/u2_publish.py", "verify-remote-metadata",
+                    "--metadata-file", str(meta),
+                    "--expected-version", VERSION,
+                    "--expected-apk-url", url,
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(json.loads(result.stdout)["verified"])
+            key = subprocess.run(
+                [
+                    "python3", "scripts/u2_publish.py", "incident-key",
+                    "--mode", "manual-local",
+                    "--source-sha", TARGET,
+                    "--version", VERSION,
+                    "--debt", APK_DIGEST,
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(key.returncode, 0, key.stderr)
+            self.assertEqual(json.loads(key.stdout)["key"], f"manual-local:{TARGET}:{VERSION}:{APK_DIGEST}")
 
     def test_monotonic_compare_cli(self):
         def run(cur, cand):

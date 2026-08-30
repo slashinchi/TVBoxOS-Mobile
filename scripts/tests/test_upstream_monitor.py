@@ -482,6 +482,7 @@ class U1aContractTests(unittest.TestCase):
         self.assertNotIn("needs: fixture_tests", date_block)
         self.assertIn("needs: date_gate", fixture_block)
         self.assertIn("fetch-depth: 1", date_block)
+        self.assertIn("fetch-depth: 0", fixture_block)
         self.assertIn("sparse-checkout:", date_block)
         self.assertIn("anchor:", date_block)
         self.assertIn("forced:", date_block)

@@ -781,6 +781,97 @@ class U2ReleaseContractTests(unittest.TestCase):
             raise AssertionError(f"missing workflow job: {job_id}")
         return match.group(0)
 
+    @staticmethod
+    def _yaml_tree(text):
+        """Minimal indentation-based YAML block parser (pure stdlib).
+
+        Returns nested dicts/lists for the subset used by GitHub workflow
+        structure assertions (jobs, steps, needs, permissions, environment,
+        concurrency, run blocks). No external dependencies.
+        """
+        import collections
+        lines = text.splitlines()
+
+        def parse_block(idx, indent):
+            node = collections.OrderedDict()
+            while idx < len(lines):
+                line = lines[idx]
+                if not line.strip() or line.lstrip().startswith("#"):
+                    idx += 1
+                    continue
+                cur_indent = len(line) - len(line.lstrip(" "))
+                if cur_indent < indent:
+                    break
+                if cur_indent > indent:
+                    raise AssertionError(f"unexpected indent {cur_indent} > {indent}: {line!r}")
+                stripped = line.strip()
+                if stripped.startswith("- "):
+                    seq = node.setdefault("__seq__", [])
+                    body = stripped[2:]
+                    nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
+                    child_indent = len(nxt) - len(nxt.lstrip(" ")) if nxt.strip() else -1
+                    has_children = child_indent > cur_indent
+                    if ":" in body:
+                        key, _, value = body.partition(":")
+                        value = value.strip()
+                        item = {key: value} if value else {}
+                        if has_children:
+                            child, idx = parse_block(idx + 1, cur_indent + 2)
+                            if isinstance(child, collections.OrderedDict):
+                                item.update(child)
+                            else:
+                                item[key] = child
+                        else:
+                            idx += 1
+                        seq.append(item)
+                    else:
+                        seq.append(body)
+                        idx += 1
+                    continue
+                key, sep, value = stripped.partition(":")
+                if not sep:
+                    raise AssertionError(f"expected key: value, got {stripped!r}")
+                value = value.strip()
+                if value in ("|", ">", "|-", ">-"):
+                    # Literal/folded block scalar: capture following indented lines.
+                    buf = []
+                    idx += 1
+                    block_indent = None
+                    while idx < len(lines):
+                        line = lines[idx]
+                        if not line.strip():
+                            buf.append("")
+                            idx += 1
+                            continue
+                        line_indent = len(line) - len(line.lstrip(" "))
+                        if block_indent is None:
+                            block_indent = line_indent
+                        if line_indent < block_indent:
+                            break
+                        buf.append(line[block_indent:] if line_indent >= block_indent else "")
+                        idx += 1
+                    node[key] = "\n".join(buf)
+                    continue
+                if value:
+                    node[key] = value
+                    idx += 1
+                    continue
+                child, idx = parse_block(idx + 1, cur_indent + 2)
+                node[key] = child
+            return node, idx
+
+        def normalize(node):
+            if isinstance(node, collections.OrderedDict):
+                if "__seq__" in node and len(node) == 1:
+                    return node["__seq__"]
+                return {k: normalize(v) for k, v in node.items()}
+            if isinstance(node, list):
+                return [normalize(item) for item in node]
+            return node
+
+        tree, _ = parse_block(0, 0)
+        return normalize(tree)
+
     def test_rc_identity_creates_evidence_directory_before_writing(self):
         recipe = (ROOT / "scripts/u2_build_evidence.sh").read_text()
         self.assertIn("mkdir -p build/evidence", recipe)
@@ -819,86 +910,119 @@ class U2ReleaseContractTests(unittest.TestCase):
                     continue
                 self.assertRegex(line, r"uses: [^@]+@[0-9a-f]{40}(?:\s+# .+)?$", str(path))
 
-    def test_u2_canary_has_injections_and_always_cleanup(self):
+    def test_u2_single_environment_publish_topology(self):
+        """Parsed-YAML structural contract: exactly one job references
+        release-production; rc_summary has no environment and prints the exact
+        marker; no canary bypass remains."""
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
-        canary = self._job_block(workflow, "canary_publish")
-        self.assertIn("TVBOX_CANARY_INJECT", canary)
-        self.assertIn("missing-asset", canary)
-        self.assertIn("extra-asset", canary)
-        self.assertIn("stale-rc", canary)
-        self.assertIn("delivery-proxy", canary)
-        self.assertIn("if: always()", canary)
-        self.assertIn("gh release delete", canary)
-        self.assertIn("--cleanup-tag", canary)
-        self.assertIn("GH_TOKEN: ${{ github.token }}", canary)
-        self.assertIn("approval-matches", canary)
-        self.assertIn("canary approval marker verified", canary)
+        tree = self._yaml_tree(workflow)
+        jobs = tree["jobs"]
+        self.assertIsInstance(jobs, dict)
+        self.assertIn("rc_summary", jobs)
+        self.assertIn("publish", jobs)
+        self.assertNotIn("approval", jobs)
+        self.assertNotIn("canary_publish", jobs)
+        # Exactly one environment consumer: publish.
+        env_jobs = [name for name, job in jobs.items()
+                    if isinstance(job, dict) and job.get("environment")]
+        self.assertEqual(env_jobs, ["publish"], f"release-production consumers: {env_jobs}")
+        self.assertNotIn("environment", jobs["rc_summary"])
+        # rc_summary must print the exact marker to the run log.
+        rc_steps = jobs["rc_summary"].get("steps") or []
+        rc_text = "\n".join(str(s) for s in rc_steps)
+        self.assertIn("TVBOX_RELEASE_APPROVE_V2", rc_text)
+        self.assertIn("EXPECTED_MARKER", rc_text)
+        self.assertNotIn("secrets.TVBOX_RELEASE_TOKEN", rc_text)
+        # No persistent canary bypass.
+        self.assertNotIn("canary_mode", workflow)
+        self.assertNotIn("TVBOX_CANARY_INJECT", workflow)
+        # gate must not force qualified=true.
+        gate_steps = jobs["gate"].get("steps") or []
+        gate_text = "\n".join(str(s) for s in gate_steps)
+        self.assertNotIn("qualified=true", gate_text)
+        # publish owns job-level concurrency with queue: max.
+        publish_concurrency = jobs["publish"].get("concurrency") or {}
+        self.assertEqual(publish_concurrency.get("group"), "tvbox-u2-publish")
+        self.assertEqual(publish_concurrency.get("cancel-in-progress"), "false")
+        self.assertEqual(publish_concurrency.get("queue"), "max")
+        # rc_summary and publish ordering: publish needs rc_summary.
+        publish_needs = jobs["publish"].get("needs")
+        self.assertIn("rc_summary", str(publish_needs))
 
     def test_u2_publish_chain_is_wired_with_helpers_and_concurrency(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
-        publish = self._job_block(workflow, "publish")
-        self.assertIn("environment: release-production", publish)
-        self.assertIn("Promote patched to exact release SHA (CAS)", publish)
-        # Real call chain: promotion, exact-RC download, draft creation, metadata,
-        # publish, GitHub immutable verification, delivery, monotonic metadata.
-        self.assertIn("git push \"https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git\" \\", publish)
-        self.assertIn('$RELEASE_SHA:refs/heads/patched', publish)
-        self.assertIn("gh api \"repos/slashinchi/TVBoxOS-Mobile/actions/artifacts/${{ needs.build_rc.outputs.signed_artifact_id }}/zip\"", publish)
-        self.assertIn("GH_TOKEN: ${{ github.token }}", publish)
-        self.assertIn("extract-signed-apk", publish)
-        self.assertIn("sha256sum \"$signed\"", publish)
-        self.assertIn('gh release create', publish)
-        self.assertIn("--draft", publish)
-        self.assertIn("--target \"$RELEASE_SHA\"", publish)
-        self.assertIn("isDraft", publish)
-        self.assertIn("gh release upload", publish)
-        self.assertIn("gh release publish", publish)
-        self.assertIn('gh release verify "$tag"', publish)
-        self.assertIn("verify-asset", publish)
-        self.assertIn("gh release download \"$tag\"", publish)
-        self.assertIn("--pattern \"${{ steps.assets.outputs.asset_name }}\"", publish)
-        self.assertIn("releases/tags/${tag}", publish)
-        self.assertIn("immutable:.immutable", publish)
-        self.assertIn("refs/tags/${tag}^{commit}", publish)
-        self.assertIn("build-update-json", publish)
-        self.assertIn("monotonic-compare", publish)
-        self.assertIn("release-delivery", publish)
-        self.assertIn("u2-prep-", publish)
-        self.assertIn("concurrency:", publish)
-        self.assertIn("tvbox-u2-publish", publish)
-        self.assertIn("cancel-in-progress: false", publish)
-        self.assertIn("Source PR", publish)
-        self.assertIn("Upstream SHA", publish)
-        approval = self._job_block(workflow, "approval")
-        self.assertIn("environment: release-production", approval)
-        self.assertIn("GH_TOKEN: ${{ github.token }}", approval)
-        self.assertIn("approval-matches", approval)
-        self.assertIn("actions/runs/${RUN_ID}/approvals", approval)
-        self.assertIn('[[ "$matched" == "true" ]] || {', approval)
-        self.assertIn("no approval marker matches the exact release identity", approval)
-        self.assertIn("approval comment does not match the exact release identity", approval)
-        self.assertNotIn("break", approval)
-        self.assertNotIn("tvbox-u2-publish", approval)
-        prep = self._job_block(workflow, "prep")
-        self.assertIn("plan-prep", prep)
-        self.assertIn("write-prep-version", prep)
-        self.assertIn("u2-prep-", prep)
-        self.assertIn("tvbox-u2-prepare", prep)
-        self.assertNotIn("replacing with fresh prep", prep)
-        self.assertIn("refusing to delete or replace a divergent prep", prep)
-        self.assertIn("diff-tree", prep)
-        self.assertIn("app/build.gradle ", prep)
-        qualify = self._job_block(workflow, "qualify")
-        self.assertIn("qualify-u1", qualify)
-        self.assertIn("parse-provenance-marker", qualify)
+        tree = self._yaml_tree(workflow)
+        publish = tree["jobs"]["publish"]
+        steps = publish["steps"]
+        step_text = "\n".join(str(s) for s in steps)
+        self.assertIn("Promote patched to exact release SHA (CAS)", step_text)
+        self.assertIn('$RELEASE_SHA:refs/heads/patched', step_text)
+        self.assertIn("actions/artifacts/${{ needs.build_rc.outputs.signed_artifact_id }}/zip", step_text)
+        self.assertIn("extract-signed-apk", step_text)
+        self.assertIn("gh release create", step_text)
+        self.assertIn("--draft", step_text)
+        self.assertIn("reconcile-draft", step_text)
+        self.assertIn("--expected-target-sha", step_text)
+        self.assertIn("--update-digest", step_text)
+        self.assertIn("Attach missing assets only (no clobber)", step_text)
+        # The upload step itself must never use --clobber; downloads may.
+        attach_step = next(s for s in steps if "Attach missing assets" in str(s))
+        self.assertNotIn("--clobber", str(attach_step))
+        self.assertIn("Verify both assets before publish (API digest + download bytes)", step_text)
+        self.assertIn("verify-release-assets", step_text)
+        self.assertIn("gh release publish", step_text)
+        self.assertIn('gh release verify "$tag"', step_text)
+        self.assertIn("verify-asset", step_text)
+        self.assertIn("gh release download \"$tag\"", step_text)
+        self.assertIn("refs/tags/${tag}^{commit}", step_text)
+        self.assertIn("immutable:.immutable", step_text)
+        self.assertIn("monotonic-compare", step_text)
+        self.assertIn("verify-remote-metadata", step_text)
+        self.assertIn("release-delivery", step_text)
+        self.assertIn("incident-key", step_text)
+        self.assertIn("u2-prep-", step_text)
+        self.assertIn("concurrency", publish)
+        self.assertEqual(publish["concurrency"]["group"], "tvbox-u2-publish")
+        self.assertEqual(publish["concurrency"]["queue"], "max")
+        self.assertIn("Source PR", step_text)
+        self.assertIn("Upstream SHA", step_text)
+        # approval-marker verification must live inside publish.
+        self.assertIn("Verify exact approval marker from current-run review history", step_text)
+        self.assertIn("approval-matches", step_text)
+        self.assertIn("actions/runs/${RUN_ID}/approvals", step_text)
+        approval_step = next(s for s in steps if "Verify exact approval marker" in str(s))
+        self.assertNotIn("break", str(approval_step))
+        # prep and qualify structural checks.
+        prep = tree["jobs"]["prep"]
+        prep_text = "\n".join(str(s) for s in (prep.get("steps") or []))
+        self.assertIn("plan-prep", prep_text)
+        self.assertIn("write-prep-version", prep_text)
+        self.assertIn("u2-prep-", prep_text)
+        self.assertNotIn("replacing with fresh prep", prep_text)
+        self.assertIn("refusing to delete or replace a divergent prep", prep_text)
+        qualify = tree["jobs"]["qualify"]
+        qualify_text = "\n".join(str(s) for s in (qualify.get("steps") or []))
+        self.assertIn("qualify-u1", qualify_text)
+        self.assertIn("parse-provenance-marker", qualify_text)
+        # watch_approval identity-bound.
+        watch = tree["jobs"]["watch_approval"]
+        watch_text = "\n".join(str(s) for s in (watch.get("steps") or []))
+        self.assertIn("incident-key", watch_text)
+        self.assertIn("human-blocked", watch_text)
 
     def test_u2_publish_chain_fails_closed_on_unreusable_draft(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
-        publish = self._job_block(workflow, "publish")
-        self.assertIn("reconcile-draft", publish)
-        self.assertIn(".reuse", publish)
-        self.assertIn("cannot be safely reused", publish)
-        self.assertIn("never auto-repaired or published", publish)
+        tree = self._yaml_tree(workflow)
+        publish = tree["jobs"]["publish"]
+        steps = publish["steps"]
+        step_text = "\n".join(str(s) for s in steps)
+        self.assertIn("reconcile-draft", step_text)
+        self.assertIn("cannot be safely reused", step_text)
+        self.assertIn("repair-missing", step_text)
+        self.assertIn("exact-reuse", step_text)
+        self.assertIn("no clobber", step_text)
+        attach_step = next(s for s in steps if "Attach missing assets" in str(s))
+        self.assertNotIn("--clobber", str(attach_step))
 
     def test_release_debt_cli_computes_canonical_baseline_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:
