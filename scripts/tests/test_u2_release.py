@@ -364,6 +364,22 @@ class U2ReleaseContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_approval_marker("a" * 39, "b" * 64, "2.1.27.1", "c" * 64, "123456", 1)
 
+    def test_approval_marker_embedded_in_prose_or_fences_still_parses(self):
+        marker = build_approval_marker(
+            release_sha="a" * 40,
+            debt="b" * 64,
+            version="2.1.27.1",
+            apk_sha="c" * 64,
+            run="123456",
+            attempt=1,
+        )
+        self.assertEqual(parse_approval_marker(f"Approved.\n\n{marker}")["run"], "123456")
+        self.assertEqual(parse_approval_marker(f"```text\n{marker}\n```")["attempt"], "1")
+        self.assertEqual(parse_approval_marker(f"  {marker}  \nnotes")["version"], "2.1.27.1")
+        # a malformed marker (not matching the exact grammar) still fails
+        with self.assertRaises(ValueError):
+            parse_approval_marker(f"Approved {marker.replace('run=123456', 'run=short')}")
+
     def test_approval_matches_only_identical_release_identity(self):
         marker = build_approval_marker(
             release_sha="a" * 40,

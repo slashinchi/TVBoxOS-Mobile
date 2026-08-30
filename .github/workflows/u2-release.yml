@@ -112,8 +112,8 @@ jobs:
           else
             echo "canary=false" >> "$GITHUB_OUTPUT"
           fi
-          # rc-pipeline accepts only auto-upstream|manual-local.
-          echo "mode=manual-local" >> "$GITHUB_OUTPUT"
+          # u2_qualify.sh emits the rc-pipeline-compatible mode
+          # (canary -> manual-local; auto-upstream/manual-local preserved).
 
   build_rc:
     name: Build exact signed RC

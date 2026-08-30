@@ -24,9 +24,13 @@ out() {
 }
 
 emit() {
+  local pipeline_mode="$MODE"
+  if [[ "$MODE" == "canary" ]]; then
+    pipeline_mode="manual-local"
+  fi
   out "source_sha=$SOURCE_SHA"
   out "release_sha=$SOURCE_SHA"
-  out "mode=$MODE"
+  out "mode=$pipeline_mode"
   out "expected_version_name=${EXPECTED_VERSION_NAME:-}"
   out "expected_version_code=${EXPECTED_VERSION_CODE:-}"
   out "release_debt=$RELEASE_DEBT"
@@ -66,7 +70,8 @@ debt_json=$(python3 "$ROOT/scripts/u2_release.py" release-debt \
   --releases-file "$verified_file" \
   --current "$SOURCE_SHA" \
   --exclude ".github/" --exclude "scripts/" --exclude "docs/" \
-  --exclude "gradle/" --exclude "AGENTS.md" --exclude "README.md" \
+  --exclude "gradle/verified-releases.json" --exclude "gradle/legacy-dependencies.lock.json" \
+  --exclude "AGENTS.md" --exclude "README.md" \
   --exclude "update.json" 2>/dev/null) || {
   echo "::error::release-debt computation failed" >&2
   emit

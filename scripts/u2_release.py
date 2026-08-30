@@ -18,13 +18,13 @@ VERSION_CODE_RE = re.compile(r"^[0-9]+$")
 RUN_ID_RE = re.compile(r"^[0-9]+$")
 HOLD_RELEASE_TAG_RE = re.compile(r"^v[0-9]+(?:\.[0-9]+){3}$")
 APPROVAL_RE = re.compile(
-    r"^TVBOX_RELEASE_APPROVE_V2 "
+    r"\bTVBOX_RELEASE_APPROVE_V2 "
     r"release=(?P<release>[0-9a-f]{40}) "
     r"debt=(?P<debt>[0-9a-f]{64}) "
     r"version=(?P<version>[0-9]+(?:\.[0-9]+)+) "
     r"apk=(?P<apk>[0-9a-f]{64}) "
     r"run=(?P<run>[0-9]+) "
-    r"attempt=(?P<attempt>[0-9]+)$"
+    r"attempt=(?P<attempt>[0-9]+)\b"
 )
 PROVENANCE_RE = re.compile(
     r"^<!-- tvbox-upstream-candidate-v2 "
@@ -456,8 +456,12 @@ def build_approval_marker(release_sha, debt, version, apk_sha, run, attempt):
 
 
 def parse_approval_marker(marker):
-    """Parse and strictly validate an approval marker."""
-    match = APPROVAL_RE.fullmatch((marker or "").strip())
+    """Parse and strictly validate an approval marker embedded in text.
+
+    The marker must appear as a standalone token; surrounding prose, markdown
+    fences or whitespace are tolerated but every bound field must match exactly.
+    """
+    match = APPROVAL_RE.search((marker or "").strip())
     if not match:
         raise ValueError("invalid exact release approval marker")
     return match.groupdict()
