@@ -53,7 +53,6 @@ if [[ -z "$SOURCE_SHA" || -z "$MODE" ]]; then
 fi
 
 QUALIFIED=false
-NOOP=false
 RELEASE_DEBT=""
 BASELINE_TAG=""
 CLASSIFICATION=""
@@ -72,7 +71,7 @@ debt_json=$(python3 "$ROOT/scripts/u2_release.py" release-debt \
   --exclude ".github/" --exclude "scripts/" --exclude "docs/" \
   --exclude "gradle/verified-releases.json" --exclude "gradle/legacy-dependencies.lock.json" \
   --exclude "AGENTS.md" --exclude "README.md" \
-  --exclude "update.json" 2>/dev/null) || {
+  --exclude "update.json") || {
   echo "::error::release-debt computation failed" >&2
   emit
   exit 1
@@ -95,7 +94,7 @@ case "$CLASSIFICATION" in
     ;;
   *)
     if [[ "$NOOP" == "true" ]]; then
-      echo "no-op mode: qualification computed, stopping before build."
+      echo "no-op mode: qualification computed, stopping before prep/build."
     else
       QUALIFIED=true
       echo "qualified: ${CLASSIFICATION} with debt ${RELEASE_DEBT}"

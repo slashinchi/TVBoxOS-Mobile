@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -859,6 +860,35 @@ class U2ReleaseContractTests(unittest.TestCase):
             text=True,
             capture_output=True,
         ).stdout.strip()
+
+    def test_qualify_noop_mode_stops_before_build(self):
+        script = ROOT / "scripts/u2_qualify.sh"
+        head = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt") as output:
+            env = {
+                **os.environ,
+                "SOURCE_SHA": head,
+                "MODE": "auto-upstream",
+                "NOOP": "true",
+                "GITHUB_OUTPUT": output.name,
+            }
+            result = subprocess.run(
+                ["bash", str(script)],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output.seek(0)
+            written = output.read()
+            self.assertIn("noop=true", written)
+            self.assertIn("qualified=false", written)
 
 
 if __name__ == "__main__":
