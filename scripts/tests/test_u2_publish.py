@@ -160,6 +160,23 @@ class U2PublishContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reconcile_draft_decision(draft, VERSION, TAG, TARGET, APK_DIGEST, "")
 
+    def test_reconcile_decision_uses_target_commitish_sha_for_drafts(self):
+        # Drafts have no tag ref; GitHub stores the exact --target SHA in
+        # target_commitish. Without an explicit tagTargetSha the decision must
+        # fall back to a full-SHA targetCommitish (branch names stay rejected).
+        draft = _draft([_asset(APK_NAME, f"sha256:{APK_DIGEST}"), _asset("update.json", f"sha256:{UPDATE_DIGEST}")])
+        draft.pop("tagTargetSha", None)
+        self.assertEqual(
+            reconcile_draft_decision(draft, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "exact-reuse",
+        )
+        branch_target = json.loads(json.dumps(draft))
+        branch_target["targetCommitish"] = "patched"
+        self.assertEqual(
+            reconcile_draft_decision(branch_target, VERSION, TAG, TARGET, APK_DIGEST, UPDATE_DIGEST),
+            "reject-identity",
+        )
+
     def test_reconcile_decision_requires_standard_tag_unless_allowed(self):
         canary_tag = "u2-canary-123-attempt1"
         draft = _draft([_asset(APK_NAME, f"sha256:{APK_DIGEST}"), _asset("update.json", f"sha256:{UPDATE_DIGEST}")], tag=canary_tag)
