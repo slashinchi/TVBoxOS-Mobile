@@ -294,10 +294,13 @@ jobs:
 
   publish:
     name: Production approval and exact immutable publish
-    needs: [gate, qualify, build_rc]
+    needs: [gate, qualify, prep, build_rc]
     if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.qualify.outputs.canary != 'true'
     runs-on: ubuntu-24.04
     environment: release-production
+    concurrency:
+      group: tvbox-u2-publish
+      cancel-in-progress: false
     permissions:
       contents: read
       actions: read
@@ -311,10 +314,10 @@ jobs:
       - name: Validate release identity and approval marker binding
         id: identity
         env:
-          RELEASE_SHA: ${{ needs.qualify.outputs.release_sha }}
+          RELEASE_SHA: ${{ needs.prep.outputs.release_sha }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source_sha }}
           MODE: ${{ needs.qualify.outputs.mode }}
-          EXPECTED_VERSION: ${{ needs.qualify.outputs.expected_version_name }}
+          EXPECTED_VERSION: ${{ needs.prep.outputs.expected_version_name }}
           EXPECTED_DEBT: ${{ needs.qualify.outputs.release_debt }}
           EXPECTED_APK: ${{ needs.build_rc.outputs.signed_sha256 }}
           SIGNER_SHA: ${{ needs.build_rc.outputs.signer_sha256 }}
@@ -327,6 +330,9 @@ jobs:
           [[ "$EXPECTED_APK" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::signed APK SHA-256 is invalid"; exit 1; }
           [[ -n "$EXPECTED_DEBT" && "$EXPECTED_DEBT" =~ ^[0-9a-f]{64}$ ]] || {
             echo "::error::release debt fingerprint is empty or invalid"; exit 1;
+          }
+          [[ -n "$RELEASE_SHA" && "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::release SHA is empty or invalid"; exit 1;
           }
           echo "RELEASE_SHA=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
           echo "EXPECTED_VERSION=$EXPECTED_VERSION" >> "$GITHUB_OUTPUT"
@@ -341,28 +347,223 @@ jobs:
         id: approval
         env:
           RUN_ID: ${{ github.run_id }}
-          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
         run: |
           set -euo pipefail
-          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
           approvals=$(gh api "repos/slashinchi/TVBoxOS-Mobile/actions/runs/${RUN_ID}/approvals" --jq '[.[] | select(.state=="approved" and .environments[]?.name=="release-production")]')
           [[ -n "$approvals" && "$approvals" != "[]" ]] || {
             echo "::error::no release-production approval found for run ${RUN_ID}"; exit 1;
           }
-          comment=$(jq -r '.[0].comment // ""' <<<"$approvals")
-          [[ -n "$comment" ]] || { echo "::error::approval comment is empty; exact marker required"; exit 1; }
-          matched=$(python3 scripts/u2_release.py approval-matches \
-            --marker "$comment" \
-            --release-sha "${{ steps.identity.outputs.RELEASE_SHA }}" \
-            --debt "${{ steps.identity.outputs.EXPECTED_DEBT }}" \
-            --version "${{ steps.identity.outputs.EXPECTED_VERSION }}" \
-            --apk "${{ steps.identity.outputs.EXPECTED_APK }}" \
-            --run "${{ github.run_id }}" \
-            --attempt "${{ github.run_attempt }}")
-          jq -e '.matched == true' <<<"$matched" >/dev/null || {
-            echo "::error::approval marker does not match the exact release identity"; exit 1;
+          matched=false
+          while read -r comment; do
+            check=$(python3 scripts/u2_release.py approval-matches \
+              --marker "$comment" \
+              --release-sha "${{ steps.identity.outputs.RELEASE_SHA }}" \
+              --debt "${{ steps.identity.outputs.EXPECTED_DEBT }}" \
+              --version "${{ steps.identity.outputs.EXPECTED_VERSION }}" \
+              --apk "${{ steps.identity.outputs.EXPECTED_APK }}" \
+              --run "${{ github.run_id }}" \
+              --attempt "${{ github.run_attempt }}")
+            if [[ "$(jq -r '.matched' <<<"$check")" == "true" ]]; then
+              matched=true
+              break
+            fi
+          done < <(jq -r '.[].comment // ""' <<<"$approvals")
+          [[ "$matched" == "true" ]] || {
+            echo "::error::no approval marker matches the exact release identity"; exit 1;
           }
           echo "::notice::exact approval marker verified for run ${RUN_ID} attempt ${RUN_ATTEMPT}"
+
+      - name: Promote patched to exact release SHA (CAS)
+        env:
+          RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          current=$(git rev-parse refs/heads/patched)
+          if [[ "$current" == "$RELEASE_SHA" ]]; then
+            echo "::notice::patched already at release SHA; no promote needed"
+          elif git merge-base --is-ancestor "$RELEASE_SHA" "$current"; then
+            echo "::notice::patched is a descendant of release SHA; promotion already applied"
+          else
+            git fetch --no-tags origin "+refs/heads/patched:refs/remotes/origin/patched"
+            remote=$(git rev-parse refs/remotes/origin/patched)
+            [[ "$remote" == "$current" ]] || { echo "::error::patched moved during promote; CAS failed"; exit 1; }
+            git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              "$RELEASE_SHA:refs/heads/patched"
+            echo "::notice::patched fast-forwarded to release SHA $RELEASE_SHA"
+          fi
+
+      - name: Download exact signed RC and build release assets
+        id: assets
+        env:
+          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/assets"
+          gh api "repos/slashinchi/TVBoxOS-Mobile/actions/artifacts/${{ needs.build_rc.outputs.signed_artifact_id }}/zip" \
+            > "$RUNNER_TEMP/signed.zip"
+          signed=$(python3 scripts/u2_publish.py extract-signed-apk \
+            --zip "$RUNNER_TEMP/signed.zip" \
+            --output-dir "$RUNNER_TEMP/assets")
+          test -f "$signed" || { echo "::error::signed.apk missing from artifact"; exit 1; }
+          actual=$(sha256sum "$signed" | awk '{print $1}')
+          [[ "$actual" == "$EXPECTED_APK" ]] || {
+            echo "::error::signed APK digest mismatch: $actual != $EXPECTED_APK"; exit 1;
+          }
+          asset_name="TVBox-Mobile-v${EXPECTED_VERSION}.apk"
+          cp "$signed" "$RUNNER_TEMP/assets/$asset_name"
+          echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
+          echo "signed_path=$signed" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft Release with exact tag and attach assets
+        id: release
+        env:
+          RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
+          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          EXPECTED_DEBT: ${{ steps.identity.outputs.EXPECTED_DEBT }}
+          EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
+          SIGNER_SHA: ${{ steps.identity.outputs.SIGNER_SHA }}
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          tag="v${EXPECTED_VERSION}"
+          existing=$(gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json id --jq '.id' 2>/dev/null || echo "")
+          if [[ -n "$existing" ]]; then
+            echo "::error::formal tag $tag already exists; refusing to overwrite"; exit 1;
+          fi
+          run_url="https://github.com/slashinchi/TVBoxOS-Mobile/actions/runs/${{ github.run_id }}"
+          notes=$(printf '%s\n' \
+            "## Build / Release Evidence" \
+            "- Mode: ${{ needs.qualify.outputs.mode }}" \
+            "- Release SHA: $RELEASE_SHA" \
+            "- Version: $EXPECTED_VERSION" \
+            "- Debt fingerprint: $EXPECTED_DEBT" \
+            "- Signed APK SHA-256: $EXPECTED_APK" \
+            "- Signer fingerprint: $SIGNER_SHA" \
+            "- Run: $run_url" \
+            "- Verification: \`gh attestation verify <artifact> --repo slashinchi/TVBoxOS-Mobile\`")
+          GH_TOKEN="$TOKEN" gh release create "$tag" \
+            --repo slashinchi/TVBoxOS-Mobile \
+            --draft \
+            --target "$RELEASE_SHA" \
+            --title "TVBoxOS-Mobile v${EXPECTED_VERSION}" \
+            --notes "$notes" \
+            "$RUNNER_TEMP/assets/${{ steps.assets.outputs.asset_name }}"
+          echo "::notice::draft Release created: $tag at $RELEASE_SHA"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Generate update.json and attach
+        id: metadata
+        env:
+          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          tag="${{ steps.release.outputs.tag }}"
+          apk_url="https://gh.xxooo.cf/slashinchi/TVBoxOS-Mobile/releases/download/${tag}/TVBox-Mobile-v${EXPECTED_VERSION}.apk"
+          python3 scripts/u2_publish.py build-update-json \
+            --version "$EXPECTED_VERSION" \
+            --apk-url "$apk_url" \
+            --output "$RUNNER_TEMP/update.json"
+          GH_TOKEN="$TOKEN" gh release upload "$tag" \
+            --repo slashinchi/TVBoxOS-Mobile \
+            --clobber \
+            "$RUNNER_TEMP/update.json"
+          echo "::notice::update.json attached to $tag"
+
+      - name: Publish verified draft
+        env:
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          GH_TOKEN="$TOKEN" gh release publish "$tag" --repo slashinchi/TVBoxOS-Mobile
+          echo "::notice::Release $tag published"
+
+      - name: Verify immutable Release and assets
+        env:
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          GH_TOKEN="$TOKEN" gh release verify "$tag" --repo slashinchi/TVBoxOS-Mobile
+          GH_TOKEN="$TOKEN" gh release verify-asset "$tag" \
+            --repo slashinchi/TVBoxOS-Mobile \
+            "$RUNNER_TEMP/assets/${{ steps.assets.outputs.asset_name }}"
+          echo "::notice::immutable verification passed for $tag"
+
+      - name: Delivery check against proxy URL
+        env:
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          expected="${{ steps.identity.outputs.EXPECTED_APK }}"
+          apk_url="https://gh.xxooo.cf/slashinchi/TVBoxOS-Mobile/releases/download/${tag}/TVBox-Mobile-v${{ steps.identity.outputs.EXPECTED_VERSION }}.apk"
+          proxy_file="$RUNNER_TEMP/proxy.apk"
+          for attempt in 1 2 3; do
+            if curl -fsSL --connect-timeout 15 --max-time 120 -o "$proxy_file" "$apk_url"; then
+              break
+            fi
+            [[ "$attempt" -lt 3 ]] || { echo "::error::delivery proxy fetch failed"; exit 1; }
+            sleep 5
+          done
+          actual=$(sha256sum "$proxy_file" | awk '{print $1}')
+          verified=$(python3 scripts/u2_publish.py delivery-compare \
+            --url "$apk_url" \
+            --expected-sha "$expected" \
+            --fetched-sha "$actual" | jq -r '.verified')
+          [[ "$verified" == "true" ]] || {
+            echo "::error::delivery proxy bytes do not match signed RC ($actual != $expected)";
+            gh issue create --repo slashinchi/TVBoxOS-Mobile \
+              --title "release-delivery: v${{ steps.identity.outputs.EXPECTED_VERSION }} proxy digest mismatch" \
+              --body "Release tag $tag. Expected $expected, got $actual." 2>/dev/null || true
+            exit 1
+          }
+          echo "::notice::delivery proxy verified for $tag"
+
+      - name: Reconcile root update.json monotonically
+        env:
+          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          current_version=$(jq -r '.version // ""' update.json 2>/dev/null || echo "")
+          cand_version="$EXPECTED_VERSION"
+          newer=$(python3 scripts/u2_publish.py monotonic-compare \
+            --current-version "$current_version" \
+            --candidate-version "$cand_version" | jq -r '.newer')
+          [[ "$newer" == "true" ]] || { echo "::error::candidate version is older than current update.json"; exit 1; }
+          apk_url="https://gh.xxooo.cf/slashinchi/TVBoxOS-Mobile/releases/download/v${cand_version}/TVBox-Mobile-v${cand_version}.apk"
+          python3 scripts/u2_publish.py build-update-json \
+            --version "$cand_version" \
+            --apk-url "$apk_url" \
+            --output update.json
+          git config user.name "TVBox U2 Publish"
+          git config user.email "u2-publish@users.noreply.github.com"
+          git add update.json
+          git commit -m "chore: update metadata to v${cand_version}"
+          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/patched
+          [[ "$(git show HEAD:update.json | jq -r '.version')" == "$cand_version" ]] || {
+            echo "::error::update.json readback mismatch after commit"; exit 1;
+          }
+          echo "::notice::root update.json reconciled to v${cand_version}"
+
+      - name: Clean up disposable prep ref
+        env:
+          SOURCE_SHA: ${{ needs.qualify.outputs.source_sha }}
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            ":refs/heads/u2-prep-${SOURCE_SHA}" 2>/dev/null || true
+          echo "::notice::prep ref u2-prep-${SOURCE_SHA} cleaned"
 
   canary_publish:
     name: Draft-only canary publish

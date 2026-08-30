@@ -1,5 +1,8 @@
 import json
+import subprocess
+import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from scripts.u2_publish import (
@@ -8,6 +11,8 @@ from scripts.u2_publish import (
     immutable_verified,
     monotonic_metadata_next,
     verify_delivery_url,
+    build_update_json,
+    extract_signed_apk,
     RELEASE_TAG_RE,
 )
 
@@ -83,6 +88,59 @@ class U2PublishContractTests(unittest.TestCase):
         self.assertFalse(RELEASE_TAG_RE.fullmatch("2.1.26.1"))
         self.assertFalse(RELEASE_TAG_RE.fullmatch("v2.1.26"))
         self.assertFalse(RELEASE_TAG_RE.fullmatch("v2.1.26.1.1"))
+
+    def test_build_update_json_cli_and_extract_signed_apk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            update_out = tmp_path / "update.json"
+            result = subprocess.run(
+                [
+                    "python3", "scripts/u2_publish.py", "build-update-json",
+                    "--version", "2.1.27.1",
+                    "--apk-url", "https://gh.xxooo.cf/slashinchi/TVBoxOS-Mobile/releases/download/v2.1.27.1/TVBox-Mobile-v2.1.27.1.apk",
+                    "--output", str(update_out),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(update_out.read_text())
+            self.assertEqual(payload["version"], "2.1.27.1")
+            zip_path = tmp_path / "artifact.zip"
+            with zipfile.ZipFile(zip_path, "w") as z:
+                z.writestr("signed-output/signed.apk", b"apk-bytes")
+            out_dir = tmp_path / "extracted"
+            out_dir.mkdir()
+            signed = subprocess.run(
+                [
+                    "python3", "scripts/u2_publish.py", "extract-signed-apk",
+                    "--zip", str(zip_path),
+                    "--output-dir", str(out_dir),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(signed.returncode, 0, signed.stderr)
+            self.assertTrue(Path(signed.stdout.strip()).is_file())
+
+    def test_monotonic_compare_cli(self):
+        def run(cur, cand):
+            return subprocess.run(
+                [
+                    "python3", "scripts/u2_publish.py", "monotonic-compare",
+                    "--current-version", cur,
+                    "--candidate-version", cand,
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(json.loads(run("2.1.26.1", "2.1.27.1").stdout)["newer"], True)
+        self.assertEqual(json.loads(run("2.1.27.1", "2.1.26.1").stdout)["newer"], False)
+        self.assertEqual(json.loads(run("2.1.27.1", "2.1.27.1").stdout)["newer"], True)
+        self.assertNotEqual(run("2.1.27", "2.1.27.1").returncode, 0)
 
 
 if __name__ == "__main__":

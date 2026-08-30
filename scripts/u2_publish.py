@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Focused GitHub Release state helpers for the U2 publish path."""
 
+import argparse
 import json
 import re
+import zipfile
+from pathlib import Path
 
 VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){3}$")
 RELEASE_TAG_RE = re.compile(r"^v[0-9]+(?:\.[0-9]+){3}$")
@@ -72,3 +75,67 @@ def verify_delivery_url(url, expected_sha256, fetched_sha256):
     if not HEX64_RE.fullmatch(fetched_sha256 or ""):
         return False
     return fetched_sha256.lower() == expected_sha256.lower()
+
+
+def build_update_json(version, apk_url):
+    """The canonical root update.json payload for a formal release."""
+    if not VERSION_RE.fullmatch(version or ""):
+        raise ValueError("update version must be a 4-part numeric version")
+    if not apk_url.startswith("https://"):
+        raise ValueError("update apk_url must be https")
+    return {"version": version, "apk_url": apk_url}
+
+
+def extract_signed_apk(zip_path, output_dir):
+    """Extract the signed.apk member from an Actions artifact zip."""
+    with zipfile.ZipFile(zip_path) as z:
+        names = z.namelist()
+        signed = next((n for n in names if n.endswith("signed.apk")), None)
+        if signed is None:
+            raise ValueError("artifact zip has no signed.apk")
+        z.extract(signed, output_dir)
+    return str(Path(output_dir) / signed)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    extract = subparsers.add_parser("extract-signed-apk")
+    extract.add_argument("--zip", required=True)
+    extract.add_argument("--output-dir", required=True)
+
+    update = subparsers.add_parser("build-update-json")
+    update.add_argument("--version", required=True)
+    update.add_argument("--apk-url", required=True)
+    update.add_argument("--output", required=True)
+
+    monotonic = subparsers.add_parser("monotonic-compare")
+    monotonic.add_argument("--current-version", required=True)
+    monotonic.add_argument("--candidate-version", required=True)
+
+    delivery = subparsers.add_parser("delivery-compare")
+    delivery.add_argument("--url", required=True)
+    delivery.add_argument("--expected-sha", required=True)
+    delivery.add_argument("--fetched-sha", required=True)
+
+    args = parser.parse_args(argv)
+    if args.command == "extract-signed-apk":
+        print(extract_signed_apk(args.zip, args.output_dir))
+    elif args.command == "build-update-json":
+        payload = build_update_json(args.version, args.apk_url)
+        Path(args.output).write_text(json.dumps(payload, sort_keys=True) + "\n")
+        print(json.dumps(payload, sort_keys=True))
+    elif args.command == "monotonic-compare":
+        if not VERSION_RE.fullmatch(args.current_version or "") or not VERSION_RE.fullmatch(args.candidate_version or ""):
+            raise SystemExit("versions must be 4-part numeric")
+        cur = tuple(int(p) for p in args.current_version.split("."))
+        cand = tuple(int(p) for p in args.candidate_version.split("."))
+        print(json.dumps({"newer": cand >= cur, "current": args.current_version, "candidate": args.candidate_version}, sort_keys=True))
+    elif args.command == "delivery-compare":
+        print(json.dumps({"verified": verify_delivery_url(args.url, args.expected_sha, args.fetched_sha)}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
