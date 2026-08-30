@@ -77,6 +77,7 @@ jobs:
       contents: read
       actions: read
       pull-requests: read
+      issues: write
     outputs:
       source_sha: ${{ steps.qualify.outputs.source_sha }}
       release_sha: ${{ steps.qualify.outputs.release_sha }}
@@ -117,6 +118,39 @@ jobs:
           chmod +x scripts/u2_qualify.sh
           bash scripts/u2_qualify.sh
           if [[ "$MODE" == "auto-upstream" ]]; then
+            # Non-U1 push debt watcher: open one deduplicated local-release-debt Issue.
+            watch_debt() {
+              local reason="$1"
+              local debt version baseline classification
+              debt=$(grep '^release_debt=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
+              version=$(grep '^expected_version_name=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
+              baseline=$(grep '^baseline_tag=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
+              classification=$(grep '^debt_classification=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
+              if [[ "$classification" == "docs-only" ]]; then
+                return 0
+              fi
+              local title="local-release-debt: ${baseline} -> ${SOURCE_SHA} (${classification})"
+              local existing
+              existing=$(gh issue list --repo "$REPO" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
+              if [[ -n "$existing" ]]; then
+                echo "::notice::local-release-debt issue already open: #${existing}"
+                return 0
+              fi
+              gh issue create --repo "$REPO" \
+                --title "$title" \
+                --body "Non-U1 push to patched carries unabsorbed release debt.
+
+                - Mode: auto-upstream (rejected: ${reason})
+                - Source: $SOURCE_SHA
+                - Baseline: $baseline
+                - Debt fingerprint: $debt
+                - Classification: $classification
+                - Planned version: ${version:-none}
+
+                U2 cannot build an RC from this push because it is not a valid U1 merge.
+                Open until the debt is absorbed by a qualified U1 merge or manual-local release."
+              echo "::notice::local-release-debt issue opened for ${SOURCE_SHA}"
+            }
             # Strict U1 qualification: only a real U1 candidate merge qualifies.
             parents=$(git rev-list --parents -n 1 "$PUSH_AFTER" | awk '{for(i=2;i<=NF;i++) printf "%s%s", sep, $i; sep=" "}')
             candidate=$(echo "$parents" | awk '{print $2}')
@@ -124,6 +158,7 @@ jobs:
             pr=$(gh api "repos/${REPO}/commits/${PUSH_AFTER}/pulls" --jq '.[0] // empty' 2>/dev/null || echo "")
             if [[ -z "$pr" || -z "$candidate" ]]; then
               echo "::error::auto-upstream requires an associated U1 PR and merge parents"
+              watch_debt "missing-associated-pr"
               sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
               echo "qualified=false" >> "$GITHUB_OUTPUT"
               echo "canary=false" >> "$GITHUB_OUTPUT"
@@ -137,6 +172,7 @@ jobs:
             parsed=$(python3 scripts/u2_release.py parse-provenance-marker --marker "$marker" 2>/dev/null || echo "")
             if [[ -z "$parsed" ]]; then
               echo "::error::auto-upstream PR missing valid v2 provenance marker"
+              watch_debt "missing-provenance-marker"
               sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
               echo "qualified=false" >> "$GITHUB_OUTPUT"
               echo "canary=false" >> "$GITHUB_OUTPUT"
@@ -169,6 +205,7 @@ jobs:
             if [[ "$(jq -r '.qualified' <<<"$result")" != "true" ]]; then
               reason=$(jq -r '.reason' <<<"$result")
               echo "::error::auto-upstream qualification failed: $reason"
+              watch_debt "$reason"
               sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
               echo "qualified=false" >> "$GITHUB_OUTPUT"
               echo "canary=false" >> "$GITHUB_OUTPUT"
