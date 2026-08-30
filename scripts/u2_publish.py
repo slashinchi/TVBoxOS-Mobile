@@ -135,8 +135,13 @@ def main(argv=None):
         Path(args.output).write_text(json.dumps(payload, sort_keys=True) + "\n")
         print(json.dumps(payload, sort_keys=True))
     elif args.command == "monotonic-compare":
-        if not VERSION_RE.fullmatch(args.current_version or "") or not VERSION_RE.fullmatch(args.candidate_version or ""):
-            raise SystemExit("versions must be 4-part numeric")
+        if not VERSION_RE.fullmatch(args.candidate_version or ""):
+            raise SystemExit("candidate version must be 4-part numeric")
+        if not VERSION_RE.fullmatch(args.current_version or "") and (args.current_version or ""):
+            raise SystemExit("current version must be 4-part numeric or empty")
+        if not (args.current_version or ""):
+            print(json.dumps({"newer": True, "current": "", "candidate": args.candidate_version}, sort_keys=True))
+            return 0
         cur = tuple(int(p) for p in args.current_version.split("."))
         cand = tuple(int(p) for p in args.candidate_version.split("."))
         print(json.dumps({"newer": cand >= cur, "current": args.current_version, "candidate": args.candidate_version}, sort_keys=True))

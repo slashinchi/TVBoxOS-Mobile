@@ -186,6 +186,11 @@ class U2PublishContractTests(unittest.TestCase):
         self.assertEqual(json.loads(run("2.1.27.1", "2.1.26.1").stdout)["newer"], False)
         self.assertEqual(json.loads(run("2.1.27.1", "2.1.27.1").stdout)["newer"], True)
         self.assertNotEqual(run("2.1.27", "2.1.27.1").returncode, 0)
+        empty_current = run("", "2.1.27.1")
+        self.assertEqual(empty_current.returncode, 0, empty_current.stderr)
+        self.assertEqual(json.loads(empty_current.stdout)["newer"], True)
+        self.assertNotEqual(run("2.1.26.1", "").returncode, 0)
+        self.assertNotEqual(run("2.1.26.1", "bad").returncode, 0)
 
 
 if __name__ == "__main__":

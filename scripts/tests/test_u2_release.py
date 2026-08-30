@@ -859,6 +859,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("actions/runs/${RUN_ID}/approvals", approval)
         self.assertIn('[[ "$matched" == "true" ]] || {', approval)
         self.assertIn("no approval marker matches the exact release identity", approval)
+        self.assertIn("approval comment does not match the exact release identity", approval)
+        self.assertNotIn("break", approval)
         self.assertNotIn("tvbox-u2-publish", approval)
         prep = self._job_block(workflow, "prep")
         self.assertIn("plan-prep", prep)

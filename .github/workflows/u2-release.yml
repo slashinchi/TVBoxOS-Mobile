@@ -453,7 +453,9 @@ jobs:
               --attempt "${{ github.run_attempt }}")
             if [[ "$(jq -r '.matched' <<<"$check")" == "true" ]]; then
               matched=true
-              break
+            else
+              echo "::error::approval comment does not match the exact release identity"
+              exit 1
             fi
           done < <(jq -r '.[].comment // ""' <<<"$approvals")
           [[ "$matched" == "true" ]] || {
@@ -817,7 +819,9 @@ jobs:
               --attempt "${{ github.run_attempt }}")
             if [[ "$(jq -r '.matched' <<<"$check")" == "true" ]]; then
               matched=true
-              break
+            else
+              echo "::error::canary approval comment does not match the exact release identity"
+              exit 1
             fi
           done < <(jq -r '.[].comment // ""' <<<"$approvals")
           [[ "$matched" == "true" ]] || {
