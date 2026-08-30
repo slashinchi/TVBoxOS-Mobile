@@ -1097,14 +1097,16 @@ class U2ReleaseContractTests(unittest.TestCase):
             view_run = str(view_step).replace("\\n", "\n")
             json_line = next(l for l in view_run.splitlines() if "--json" in l)
             self.assertNotIn("tag_target_sha", json_line)
-        # The tag-ref API call must use --silent so a 404 body is not captured
-        # into tag_target_sha (gh api prints the error body to stdout even on
-        # exit 1, which would poison the identity fallback).
+        # The tag-ref API call must NOT use --silent (gh api --silent swallows
+        # ALL stdout including --jq results on success) and must guard on the
+        # exit code so a 404 error body is never captured into the identity
+        # fallback (gh api prints the error body to stdout even on exit 1).
         draft_step = next(s for s in steps if "Create or reconcile draft" in str(s))
         draft_run = str(draft_step).replace("\\n", "\n")
         tag_ref_line = next(l for l in draft_run.splitlines() if "git/ref/tags" in l)
-        self.assertIn("--silent", tag_ref_line)
-        self.assertNotIn("--jq '.object.sha' 2>/dev/null || echo \"\")", tag_ref_line.replace("--silent", ""))
+        self.assertNotIn("--silent", tag_ref_line)
+        self.assertIn("if tag_target_sha=$(", tag_ref_line)
+        self.assertIn("2>/dev/null); then", tag_ref_line)
 
     def test_release_debt_cli_computes_canonical_baseline_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:

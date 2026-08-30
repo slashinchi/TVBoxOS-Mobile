@@ -613,7 +613,11 @@ jobs:
             # publish). A draft is NOT a tag: drafts have no git tag ref, so a
             # draft must never satisfy this recovery — otherwise a stale RC
             # could be published after patched moved forward.
-            tag_ref=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' --silent 2>/dev/null || echo "")
+            if tag_ref=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
+              : # success: stdout holds the tag object SHA
+            else
+              tag_ref=""
+            fi
             if [[ -n "$tag_ref" && "$tag_ref" =~ ^[0-9a-f]{40}$ ]]; then
               echo "::notice::recovery: patched advanced past release SHA but tag object $tag exists ($tag_ref); continuing"
             else
@@ -738,7 +742,11 @@ jobs:
             # tag ref yet, so fall back to targetCommitish when it is a full SHA
             # (gh release create --draft --target stores the SHA); a branch-name
             # targetCommitish with a resolvable tag ref must still match the ref.
-            tag_target_sha=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' --silent 2>/dev/null || echo "")
+            if tag_target_sha=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
+              : # success: stdout holds the tag object SHA
+            else
+              tag_target_sha=""
+            fi
             if [[ -z "$tag_target_sha" ]]; then
               commitish=$(echo "$existing" | jq -r '.targetCommitish // ""')
               if [[ "$commitish" =~ ^[0-9a-f]{40}$ ]]; then
@@ -1001,8 +1009,12 @@ jobs:
           cand_version="$EXPECTED_VERSION"
           # Read the CURRENT root update.json from the remote patched branch,
           # never from local HEAD (which may be ahead of or behind remote).
-          remote_b64=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
-            --jq '.content' --silent 2>/dev/null || echo "")
+          if remote_b64=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
+            --jq '.content' 2>/dev/null); then
+            : # success: stdout holds base64 content
+          else
+            remote_b64=""
+          fi
           [[ -n "$remote_b64" ]] || {
             echo "::error::cannot read current patched/update.json from remote; refusing to guess (a transient API failure must never be treated as an empty baseline)"
             exit 1
@@ -1041,12 +1053,38 @@ jobs:
           remote_head=$(git rev-parse refs/remotes/origin/patched)
           if [[ "$(git rev-parse HEAD)" != "$remote_head" ]]; then
             echo "::notice::patched moved during publish ($(git rev-parse --short HEAD) -> $(git rev-parse --short "$remote_head")); rebuilding update.json commit on remote HEAD"
+            # Re-validate monotonicity against the NEW remote baseline before
+            # committing: a concurrent push may have written an even newer
+            # update.json, and we must never regress it.
+            if new_remote_b64=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" --jq '.content' 2>/dev/null); then
+              new_remote_content=$(printf '%s' "$new_remote_b64" | base64 -d 2>/dev/null || echo "")
+              if [[ -n "$new_remote_content" ]]; then
+                new_current_version=$(jq -r '.version // ""' <<<"$new_remote_content" 2>/dev/null || echo "")
+                if [[ -n "$new_current_version" ]]; then
+                  still_newer=$(python3 scripts/u2_publish.py monotonic-compare \
+                    --current-version "$new_current_version" \
+                    --candidate-version "$cand_version" | jq -r '.newer')
+                  [[ "$still_newer" == "true" ]] || {
+                    echo "::error::remote update.json advanced to $new_current_version during publish; refusing to regress metadata"
+                    exit 1
+                  }
+                fi
+              fi
+            fi
             git reset --hard "$remote_head"
             cp "$RUNNER_TEMP/update-json-to-commit.json" update.json
             git add update.json
+            if git diff --cached --quiet; then
+              echo "::notice::update.json on remote HEAD already identical to v${cand_version}; no commit needed"
+              exit 0
+            fi
             git commit -m "chore: update metadata to v${cand_version}"
           else
             git add update.json
+            if git diff --cached --quiet; then
+              echo "::notice::update.json already identical to v${cand_version}; no commit needed"
+              exit 0
+            fi
             git commit -m "chore: update metadata to v${cand_version}"
           fi
           git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/patched
