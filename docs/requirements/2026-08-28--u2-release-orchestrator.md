@@ -84,7 +84,7 @@ Complete the original post-merge release-management objective in production shap
 - Queue order is never release authority; every prep/publish job recomputes canonical state before mutation. A stale approved RC that reaches `publish` after `patched` advanced must fail closed during revalidation.
 
 ### 3.8 Trust / permissions
-- Caller jobs invoking `rc-pipeline.yml`: max `contents: read` + `id-token: write` + `attestations: write`; no other scopes.
+- Caller jobs invoking `rc-pipeline.yml`: `contents: read` + `actions: read` (required for artifact download inside the called workflow) + `id-token: write` + `attestations: write`; no other scopes.
 - Builder: `contents: read` only, no Environment/secrets/OIDC.
 - Isolated signer: no repo checkout; `release-signing` secrets; no contents/OIDC/attestation write.
 - Verifier/attestor: no signing secrets; minimal OIDC + attestation write; no package-manager/repo execution in attestor.

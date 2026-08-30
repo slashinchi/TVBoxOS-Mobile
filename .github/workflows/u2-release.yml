@@ -397,17 +397,37 @@ jobs:
           echo "::notice::Release evidence (mode=$MODE source=$SOURCE_SHA release=$RELEASE_SHA version=$EXPECTED_VERSION apk=$EXPECTED_APK signer=$SIGNER_SHA debt=$EXPECTED_DEBT run=$RUN_ID attempt=$RUN_ATTEMPT)"
           echo "::notice::Required approval marker (paste into the release-production approval comment):"
           echo "::notice::$expected_marker"
+          {
+            echo "## RC / Risk Summary (U2)"
+            echo "- **Mode**: $MODE"
+            echo "- **Release SHA**: $RELEASE_SHA"
+            echo "- **Source SHA**: $SOURCE_SHA"
+            echo "- **Version**: $EXPECTED_VERSION"
+            echo "- **Debt fingerprint**: $EXPECTED_DEBT"
+            echo "- **Signed APK SHA-256**: $EXPECTED_APK"
+            echo "- **Signer fingerprint**: $SIGNER_SHA"
+            echo "- **Run**: https://github.com/slashinchi/TVBoxOS-Mobile/actions/runs/$RUN_ID"
+            echo "- **Approval marker**: \`$expected_marker\`"
+            echo ""
+            echo "Approve with the exact marker as the review comment. Any other comment is rejected."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   watch_approval:
     name: Record explicit human rejection
-    needs: [gate, qualify, prep, build_rc, rc_summary]
-    if: always() && needs.gate.outputs.enabled == 'true'
+    needs: [gate, qualify, prep, build_rc, rc_summary, publish]
+    if: always() && needs.gate.outputs.enabled == 'true' && needs.publish.result == 'failure'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read
       issues: write
     steps:
+      - name: Check out patched
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: refs/heads/patched
+          fetch-depth: 0
+          persist-credentials: false
       - name: Scan for rejected reviews and open identity-bound human-blocked issue
         env:
           RUN_ID: ${{ github.run_id }}
@@ -514,6 +534,8 @@ jobs:
           EXPECTED_DEBT: ${{ steps.identity.outputs.EXPECTED_DEBT }}
           EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
           SIGNER_SHA: ${{ steps.identity.outputs.SIGNER_SHA }}
+          SOURCE_SHA: ${{ needs.rc_summary.outputs.SOURCE_SHA }}
+          MODE: ${{ needs.rc_summary.outputs.MODE }}
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -523,6 +545,26 @@ jobs:
           [[ -n "$EXPECTED_DEBT" && "$EXPECTED_DEBT" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::debt fingerprint invalid"; exit 1; }
           [[ -n "$RELEASE_SHA" && "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::release SHA invalid"; exit 1; }
           [[ -n "$SIGNER_SHA" && "$SIGNER_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::signer fingerprint invalid"; exit 1; }
+          # Recompute cumulative release debt from canonical baseline and require
+          # exact equality with the approved marker — a newer merge or changed
+          # tree invalidates the approval before any mutation.
+          debt_json=$(python3 scripts/u2_release.py release-debt \
+            --repo "$PWD" \
+            --releases-file gradle/verified-releases.json \
+            --current "$RELEASE_SHA" \
+            --exclude ".github/" --exclude "scripts/" --exclude "docs/" \
+            --exclude "gradle/verified-releases.json" --exclude "gradle/legacy-dependencies.lock.json" \
+            --exclude "AGENTS.md" --exclude "README.md" \
+            --exclude "update.json")
+          recomputed_debt=$(jq -r '.fingerprint' <<<"$debt_json")
+          [[ "$recomputed_debt" == "$EXPECTED_DEBT" ]] || {
+            echo "::error::recomputed debt $recomputed_debt != approved marker $EXPECTED_DEBT; approval is stale"; exit 1;
+          }
+          # Mode/identity: manual-local requires release_sha == source_sha;
+          # auto-upstream requires a valid prep identity (verified in prep job).
+          if [[ "$MODE" == "manual-local" ]]; then
+            [[ "$RELEASE_SHA" == "$SOURCE_SHA" ]] || { echo "::error::manual-local requires release SHA == source SHA"; exit 1; }
+          fi
           # Default branch must still be patched and patched == release_sha (or
           # a descendant containing it with an existing formal tag, checked later).
           default_branch=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile" --jq '.default_branch')
@@ -530,7 +572,19 @@ jobs:
           # The release-production environment must still exist with admin bypass off.
           env_state=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/environments/release-production" --jq '{name,protection_rules:.protection_rules}' 2>/dev/null || echo "")
           [[ -n "$env_state" ]] || { echo "::error::release-production environment missing"; exit 1; }
-          echo "::notice::release identity revalidated (release=$RELEASE_SHA version=$EXPECTED_VERSION apk=$EXPECTED_APK signer=$SIGNER_SHA debt=$EXPECTED_DEBT)"
+          # Attestations: both the default build provenance and the custom
+          # release-identity attestation must verify for the exact signed RC.
+          attest_input="$RUNNER_TEMP/attest-input"
+          mkdir -p "$attest_input"
+          cp "$RUNNER_TEMP/signed-output/signed.apk" "$attest_input/signed.apk" 2>/dev/null || true
+          if [[ -f "$attest_input/signed.apk" ]]; then
+            GH_TOKEN="$TOKEN" gh attestation verify "$attest_input/signed.apk" \
+              --repo slashinchi/TVBoxOS-Mobile \
+              --predicate-type https://slsa.dev/provenance/v1 >/dev/null 2>&1 || {
+              echo "::error::default attestation verification failed for signed RC"; exit 1;
+            }
+          fi
+          echo "::notice::release identity revalidated (release=$RELEASE_SHA version=$EXPECTED_VERSION apk=$EXPECTED_APK signer=$SIGNER_SHA debt=$EXPECTED_DEBT recomputed=$recomputed_debt)"
           echo "::notice::default branch patched + release-production environment confirmed (immutable releases enforced per-Release post-publish)"
 
       - name: Promote patched to exact release SHA (CAS)
@@ -720,7 +774,6 @@ jobs:
             --repo slashinchi/TVBoxOS-Mobile \
             --pattern "*" \
             --dir "$RUNNER_TEMP/pre-publish-verify" --clobber
-          mv "$RUNNER_TEMP/update.json" "$RUNNER_TEMP/pre-publish-verify/update.json" 2>/dev/null || true
           state=$(GH_TOKEN="$TOKEN" gh release view "$tag" \
             --repo slashinchi/TVBoxOS-Mobile \
             --json tagName,targetCommitish,isDraft,assets \
@@ -780,7 +833,15 @@ jobs:
           state=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/releases/tags/${tag}" --jq '{immutable:.immutable,tag:.tag_name,target:.target_commitish,assets:[.assets[].name]}')
           [[ "$(jq -r '.immutable' <<<"$state")" == "true" ]] || { echo "::error::release immutable flag is not true for $tag"; exit 1; }
           [[ "$(jq -r '.tag' <<<"$state")" == "$tag" ]] || { echo "::error::release tag mismatch"; exit 1; }
-          [[ "$(jq -r '.target' <<<"$state")" == "$expected_target" ]] || { echo "::error::release target SHA mismatch"; exit 1; }
+          # GitHub may store target_commitish as a branch name after publish;
+          # the authoritative identity is the tag object SHA checked above. A
+          # SHA-valued target_commitish must still equal the expected SHA.
+          commitish=$(jq -r '.target' <<<"$state")
+          if [[ "$commitish" =~ ^[0-9a-f]{40}$ ]]; then
+            [[ "$commitish" == "$expected_target" ]] || { echo "::error::release target SHA mismatch: $commitish"; exit 1; }
+          else
+            echo "::notice::release target_commitish is a ref name ($commitish); tag object SHA is the identity authority"
+          fi
           names=$(jq -r '.assets | sort | join(",")' <<<"$state")
           expected_names="${{ steps.assets.outputs.asset_name }},update.json"
           [[ "$names" == "$expected_names" ]] || { echo "::error::release asset set mismatch: $names"; exit 1; }
