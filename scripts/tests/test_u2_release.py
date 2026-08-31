@@ -1114,10 +1114,17 @@ class U2ReleaseContractTests(unittest.TestCase):
         # The comment stream must use `jq -j` so the NUL separator is the only
         # delimiter: `jq -r` appends a trailing newline after every NUL, making
         # the next comment start with "\n" (only tolerated today by the Python
-        # marker parser's .strip()). str() of the parsed step is a dict repr,
-        # so quotes/escapes are doubled; match the stable tokens only.
-        self.assertIn("jq -j -r ", approval_text)
-        self.assertIn("gsub(", approval_text)
+        # marker parser's .strip()). These two tokens MUST live on the SAME jq
+        # command line: separate cross-section asserts would still pass if the
+        # comment stream regressed to `jq -r`, because the actor stream already
+        # contains `jq -j -r` (a false-positive coverage blind spot).
+        comment_lines = [
+            line for line in approval_step["run"].splitlines()
+            if ".[].comment // " in line
+        ]
+        self.assertEqual(len(comment_lines), 1, approval_text)
+        self.assertIn("jq -j -r ", comment_lines[0])
+        self.assertIn("gsub(", comment_lines[0])
         self.assertIn("expected exactly one approval marker matching this run/attempt", approval_text)
         self.assertNotIn("expected exactly one release-production approval, found", approval_text)
         # Immutable-releases preflight before any mutation.
