@@ -409,7 +409,7 @@ jobs:
             echo "- **Run**: https://github.com/slashinchi/TVBoxOS-Mobile/actions/runs/$RUN_ID"
             echo "- **Approval marker**: \`$expected_marker\`"
             echo ""
-            echo "Approve with the exact marker as the review comment. At least one approval with the current-run/attempt marker is required; any approval from a non-slashinchi actor fails closed."
+            echo "Approve with the exact marker as the review comment. All approved reviews must be by slashinchi, and exactly 1 matching marker is required for the current run/attempt (prior attempt approvals are tolerated)."
           } >> "$GITHUB_STEP_SUMMARY"
 
   watch_approval:
@@ -536,7 +536,7 @@ jobs:
             if [[ "$(jq -r '.matched' <<<"$check")" == "true" ]]; then
               matched=$((matched + 1))
             fi
-          done < <(jq -r '.[].comment // "" | gsub("\u0000"; "\n") + "\u0000"' <<<"$approvals")
+          done < <(jq -j -r '.[].comment // "" | gsub("\u0000"; "\n") + "\u0000"' <<<"$approvals")
           [[ "$matched" -eq 1 ]] || {
             echo "::error::expected exactly one approval marker matching this run/attempt, found $matched"; exit 1;
           }

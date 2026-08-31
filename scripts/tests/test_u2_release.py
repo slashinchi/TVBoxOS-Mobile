@@ -936,9 +936,12 @@ class U2ReleaseContractTests(unittest.TestCase):
         # The approval prompt must match the actual gate semantics (older
         # attempt markers are tolerated as history; exactly one current marker
         # required; non-slashinchi actor fails closed). It must not claim any
-        # non-marker comment is rejected outright.
+        # non-marker comment is rejected outright, and must say exactly one
+        # current marker is required (not "at least one").
         self.assertNotIn("Any other comment is rejected", rc_text)
-        self.assertIn("current-run/attempt marker", rc_text)
+        self.assertNotIn("At least one", rc_text)
+        self.assertIn("exactly 1 matching marker is required for the current run/attempt", rc_text)
+        self.assertIn("prior attempt approvals are tolerated", rc_text)
         # No persistent canary bypass.
         self.assertNotIn("canary_mode", workflow)
         self.assertNotIn("TVBOX_CANARY_INJECT", workflow)
@@ -1108,6 +1111,13 @@ class U2ReleaseContractTests(unittest.TestCase):
         # escaped: assert on the parentheses + operator instead of the escape.
         self.assertIn('.[] | (.user.login // "") + "', approval_text)
         self.assertIn("actor_ok", approval_text)
+        # The comment stream must use `jq -j` so the NUL separator is the only
+        # delimiter: `jq -r` appends a trailing newline after every NUL, making
+        # the next comment start with "\n" (only tolerated today by the Python
+        # marker parser's .strip()). str() of the parsed step is a dict repr,
+        # so quotes/escapes are doubled; match the stable tokens only.
+        self.assertIn("jq -j -r ", approval_text)
+        self.assertIn("gsub(", approval_text)
         self.assertIn("expected exactly one approval marker matching this run/attempt", approval_text)
         self.assertNotIn("expected exactly one release-production approval, found", approval_text)
         # Immutable-releases preflight before any mutation.
