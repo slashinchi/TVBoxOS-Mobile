@@ -409,7 +409,7 @@ jobs:
             echo "- **Run**: https://github.com/slashinchi/TVBoxOS-Mobile/actions/runs/$RUN_ID"
             echo "- **Approval marker**: \`$expected_marker\`"
             echo ""
-            echo "Approve with the exact marker as the review comment. Any other comment is rejected."
+            echo "Approve with the exact marker as the review comment. At least one approval with the current-run/attempt marker is required; any approval from a non-slashinchi actor fails closed."
           } >> "$GITHUB_STEP_SUMMARY"
 
   watch_approval:
@@ -507,9 +507,10 @@ jobs:
           }
           # Every approved review must be slashinchi's (the only configured
           # reviewer). Re-runs accumulate approval history for the same RUN_ID,
-          # so we must not require exactly one; instead each record is checked
-          # and any record that is NOT a precise current-attempt marker fails
-          # closed. This keeps the gate strict while allowing retry recovery.
+          # so we must not require exactly one; instead every record's actor is
+          # checked, and exactly one record must carry the current-attempt
+          # marker (older attempts' approvals are tolerated as history; the
+          # marker itself binds run+attempt).
           count=$(jq 'length' <<<"$approvals")
           [[ "$count" -ge 1 ]] || { echo "::error::no approved release-production review"; exit 1; }
           actor_ok=true

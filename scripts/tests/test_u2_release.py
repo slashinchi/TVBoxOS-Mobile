@@ -933,6 +933,12 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("TVBOX_RELEASE_APPROVE_V2", rc_text)
         self.assertIn("EXPECTED_MARKER", rc_text)
         self.assertNotIn("secrets.TVBOX_RELEASE_TOKEN", rc_text)
+        # The approval prompt must match the actual gate semantics (older
+        # attempt markers are tolerated as history; exactly one current marker
+        # required; non-slashinchi actor fails closed). It must not claim any
+        # non-marker comment is rejected outright.
+        self.assertNotIn("Any other comment is rejected", rc_text)
+        self.assertIn("current-run/attempt marker", rc_text)
         # No persistent canary bypass.
         self.assertNotIn("canary_mode", workflow)
         self.assertNotIn("TVBOX_CANARY_INJECT", workflow)
