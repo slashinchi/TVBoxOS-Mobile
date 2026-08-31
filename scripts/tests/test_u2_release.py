@@ -1050,12 +1050,18 @@ class U2ReleaseContractTests(unittest.TestCase):
         # Attestation verification in publish must pin the exact signing
         # workflow identity (rc-pipeline.yml on patched) for BOTH predicate
         # types, so a signature from any other workflow/ref never passes.
+        # The OIDC cert SAN is the full URI (verified from U2a attestation
+        # evidence); an exact regex on that full form is required and a short
+        # --cert-identity string would never match.
         attest_step = next(s for s in steps if "Verify attestations for the exact signed RC" in str(s))
         attest_text = str(attest_step)
         self.assertIn("--predicate-type https://slsa.dev/provenance/v1", attest_text)
         self.assertIn("--predicate-type https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v2", attest_text)
-        self.assertIn('--cert-identity "rc-pipeline.yml@refs/heads/patched"', attest_text)
-        self.assertEqual(attest_text.count('--cert-identity "rc-pipeline.yml@refs/heads/patched"'), 2)
+        # str() of the parsed step is a dict repr, so each literal backslash
+        # in the regex appears doubled; assert on that repr form.
+        san_regex = r'^https://github\\.com/slashinchi/TVBoxOS-Mobile/\\.github/workflows/rc-pipeline\\.yml@refs/heads/patched$'
+        self.assertIn(san_regex, attest_text)
+        self.assertEqual(attest_text.count(san_regex), 2)
         # Publish step must skip already-published releases (retry recovery)
         # and must use the real gh draft-publication mechanism
         # (gh release edit --draft=false; `gh release publish` does not exist).

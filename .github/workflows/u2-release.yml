@@ -672,11 +672,16 @@ jobs:
           # Default build provenance (SLSA v1) must verify and the signing
           # workflow identity must be pinned to the production signer caller
           # (rc-pipeline.yml on patched) so a signature from any other
-          # workflow/ref can never satisfy this gate.
+          # workflow/ref can never satisfy this gate. The SAN in the OIDC
+          # cert is the full URI
+          # https://github.com/slashinchi/TVBoxOS-Mobile/.github/workflows/rc-pipeline.yml@refs/heads/patched
+          # (verified from U2a attestation evidence), so an exact regex on
+          # that full form is required; a short --cert-identity string would
+          # never match and would hard-fail the whole gate.
           GH_TOKEN="$TOKEN" gh attestation verify "$signed" \
             --repo slashinchi/TVBoxOS-Mobile \
             --predicate-type https://slsa.dev/provenance/v1 \
-            --cert-identity "rc-pipeline.yml@refs/heads/patched" >/dev/null || {
+            --cert-identity-regex '^https://github\.com/slashinchi/TVBoxOS-Mobile/\.github/workflows/rc-pipeline\.yml@refs/heads/patched$' >/dev/null || {
             echo "::error::default attestation verification failed for signed RC"; exit 1;
           }
           # Custom release-identity attestation (tvbox-release-identity-v2) must
@@ -684,7 +689,7 @@ jobs:
           GH_TOKEN="$TOKEN" gh attestation verify "$signed" \
             --repo slashinchi/TVBoxOS-Mobile \
             --predicate-type https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v2 \
-            --cert-identity "rc-pipeline.yml@refs/heads/patched" >/dev/null 2>&1 || {
+            --cert-identity-regex '^https://github\.com/slashinchi/TVBoxOS-Mobile/\.github/workflows/rc-pipeline\.yml@refs/heads/patched$' >/dev/null 2>&1 || {
             echo "::error::release-identity attestation verification failed for signed RC"; exit 1;
           }
           echo "::notice::attestations verified for exact signed RC (SLSA v1 + tvbox-release-identity-v2)"
