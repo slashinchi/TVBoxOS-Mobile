@@ -515,7 +515,7 @@ jobs:
           actor_ok=true
           while IFS= read -r -d '' actor; do
             [[ "$actor" == "slashinchi" ]] || actor_ok=false
-          done < <(jq -r '.[].user.login // "" + "\u0000"' <<<"$approvals")
+          done < <(jq -j -r '.[] | (.user.login // "") + "\u0000"' <<<"$approvals")
           [[ "$actor_ok" == "true" ]] || {
             echo "::error::release-production approval actor is not slashinchi"; exit 1;
           }
@@ -669,17 +669,22 @@ jobs:
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
           signed="${{ steps.assets.outputs.signed_path }}"
           test -f "$signed" || { echo "::error::signed APK missing for attestation verify"; exit 1; }
-          # Default build provenance (SLSA v1) must verify.
+          # Default build provenance (SLSA v1) must verify and the signing
+          # workflow identity must be pinned to the production signer caller
+          # (rc-pipeline.yml on patched) so a signature from any other
+          # workflow/ref can never satisfy this gate.
           GH_TOKEN="$TOKEN" gh attestation verify "$signed" \
             --repo slashinchi/TVBoxOS-Mobile \
-            --predicate-type https://slsa.dev/provenance/v1 >/dev/null || {
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --cert-identity "rc-pipeline.yml@refs/heads/patched" >/dev/null || {
             echo "::error::default attestation verification failed for signed RC"; exit 1;
           }
           # Custom release-identity attestation (tvbox-release-identity-v2) must
-          # verify against the exact signed bytes.
+          # verify against the exact signed bytes from the same signer workflow.
           GH_TOKEN="$TOKEN" gh attestation verify "$signed" \
             --repo slashinchi/TVBoxOS-Mobile \
-            --predicate-type https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v2 >/dev/null 2>&1 || {
+            --predicate-type https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v2 \
+            --cert-identity "rc-pipeline.yml@refs/heads/patched" >/dev/null 2>&1 || {
             echo "::error::release-identity attestation verification failed for signed RC"; exit 1;
           }
           echo "::notice::attestations verified for exact signed RC (SLSA v1 + tvbox-release-identity-v2)"
@@ -953,6 +958,7 @@ jobs:
       - name: Delivery check against proxy URL (identity-bound incident)
         env:
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${{ steps.release.outputs.tag }}"
