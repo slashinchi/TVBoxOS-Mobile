@@ -981,6 +981,14 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("verify-remote-metadata", step_text)
         self.assertIn("release-delivery", step_text)
         self.assertIn("incident-key", step_text)
+        # The delivery incident step must authenticate gh for issue reads/writes:
+        # only TOKEN (a non-gh env var) would leave `gh issue list/create`
+        # unauthenticated and the incident would never be opened.
+        delivery_step = next(s for s in steps if "Delivery check against proxy URL" in str(s))
+        delivery_text = str(delivery_step)
+        self.assertIn("GH_TOKEN", delivery_text)
+        self.assertIn("github.token", delivery_text)
+        self.assertIn("TOKEN", delivery_text)
         self.assertIn("u2-prep-", step_text)
         self.assertIn("concurrency", publish)
         self.assertEqual(publish["concurrency"]["group"], "tvbox-u2-publish")
@@ -1039,6 +1047,15 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("verify-published", step_text)
         self.assertIn("conflicting public identity or unrecoverable missing assets fail closed", step_text)
         self.assertNotIn("repair-published-missing", step_text)
+        # Attestation verification in publish must pin the exact signing
+        # workflow identity (rc-pipeline.yml on patched) for BOTH predicate
+        # types, so a signature from any other workflow/ref never passes.
+        attest_step = next(s for s in steps if "Verify attestations for the exact signed RC" in str(s))
+        attest_text = str(attest_step)
+        self.assertIn("--predicate-type https://slsa.dev/provenance/v1", attest_text)
+        self.assertIn("--predicate-type https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v2", attest_text)
+        self.assertIn('--cert-identity "rc-pipeline.yml@refs/heads/patched"', attest_text)
+        self.assertEqual(attest_text.count('--cert-identity "rc-pipeline.yml@refs/heads/patched"'), 2)
         # Publish step must skip already-published releases (retry recovery)
         # and must use the real gh draft-publication mechanism
         # (gh release edit --draft=false; `gh release publish` does not exist).
@@ -1071,7 +1088,13 @@ class U2ReleaseContractTests(unittest.TestCase):
         approval_step = next(s for s in steps if "Verify exact approval marker" in str(s))
         approval_text = str(approval_step)
         self.assertIn("actor is not slashinchi", approval_text)
-        self.assertIn(".user.login //", approval_text)
+        # The actor stream must be NUL-delimited and the jq fallback must be
+        # parenthesized: `// ""` binds looser than `+`, so the un-parenthesized
+        # form `.[].user.login // "" + "\u0000"` emits no NUL and `read -d ''`
+        # never executes the loop body (actor check silently skipped).
+        # str() of the parsed step is a dict repr, so the NUL literal appears
+        # escaped: assert on the parentheses + operator instead of the escape.
+        self.assertIn('.[] | (.user.login // "") + "', approval_text)
         self.assertIn("actor_ok", approval_text)
         self.assertIn("expected exactly one approval marker matching this run/attempt", approval_text)
         self.assertNotIn("expected exactly one release-production approval, found", approval_text)
