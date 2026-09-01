@@ -339,7 +339,6 @@ jobs:
       validation: ${{ steps.prepare.outputs.validation }}
       classification: ${{ steps.prepare.outputs.classification }}
       candidate_needed: ${{ steps.prepare.outputs.candidate_needed }}
-      candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
       validated_tree: ${{ steps.prepare.outputs.validated_tree }}
       changed_paths_b64: ${{ steps.prepare.outputs.changed_paths_b64 }}
       preserved_paths_b64: ${{ steps.prepare.outputs.preserved_paths_b64 }}
@@ -391,7 +390,6 @@ jobs:
             echo 'validation=fail' >> "$GITHUB_OUTPUT"
             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
-             echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
              echo 'validated_tree=' >> "$GITHUB_OUTPUT"
              echo 'candidate_diff_stat_b64=' >> "$GITHUB_OUTPUT"
             exit 0
@@ -410,7 +408,6 @@ jobs:
             echo 'validation=fail' >> "$GITHUB_OUTPUT"
             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
-             echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
              echo 'validated_tree=' >> "$GITHUB_OUTPUT"
              echo 'candidate_diff_stat_b64=' >> "$GITHUB_OUTPUT"
             exit 0
@@ -418,7 +415,6 @@ jobs:
           classification=$(jq -r '.classification' "$result_file")
           status=$(jq -r '.status' "$result_file")
            candidate_needed=$(jq -r '.candidate_needed' "$result_file")
-           candidate_sha=$(jq -r '.candidate_sha // empty' "$result_file")
            validated_tree=$(jq -r '.validated_tree // empty' "$result_file")
            changed_paths_b64=$(jq -jr '.changed_paths | join("\u0000")' "$result_file" | base64 -w 0)
           preserved_paths_b64=$(jq -jr '.preserved | join("\u0000")' "$result_file" | base64 -w 0)
@@ -442,8 +438,7 @@ jobs:
           }
           echo "classification=$classification" >> "$GITHUB_OUTPUT"
            echo "candidate_needed=$candidate_needed" >> "$GITHUB_OUTPUT"
-           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
-           echo "validated_tree=$validated_tree" >> "$GITHUB_OUTPUT"
+            echo "validated_tree=$validated_tree" >> "$GITHUB_OUTPUT"
           echo "changed_paths_b64=$changed_paths_b64" >> "$GITHUB_OUTPUT"
           echo "preserved_paths_b64=$preserved_paths_b64" >> "$GITHUB_OUTPUT"
           echo "candidate_diff_stat_b64=$candidate_diff_stat_b64" >> "$GITHUB_OUTPUT"
@@ -862,7 +857,6 @@ jobs:
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
           PATCHED_SHA: ${{ needs.probe.outputs.patched_sha }}
           CLASSIFICATION: ${{ needs.candidate_validation.outputs.classification }}
-          CANDIDATE_SHA: ${{ needs.candidate_validation.outputs.candidate_sha }}
           VALIDATED_TREE: ${{ needs.candidate_validation.outputs.validated_tree }}
           CHANGED_PATHS_B64: ${{ needs.candidate_validation.outputs.changed_paths_b64 }}
           PRESERVED_PATHS_B64: ${{ needs.candidate_validation.outputs.preserved_paths_b64 }}
@@ -937,8 +931,7 @@ jobs:
            - upstream full SHA：${UPSTREAM_SHA:-unknown}
            - fork main SHA：${FORK_MAIN_SHA:-unknown}
            - patched SHA：${PATCHED_SHA:-unknown}
-           - candidate SHA：${CANDIDATE_SHA:-none}
-           - validated tree：${VALIDATED_TREE:-none}
+            - validated tree：${VALIDATED_TREE:-none}
            - risk classification：${CLASSIFICATION:-unknown/high-risk}
            - candidate build/validation：$candidate_build_status / ${VALIDATION:-unknown}
            - changed files：$changed_paths

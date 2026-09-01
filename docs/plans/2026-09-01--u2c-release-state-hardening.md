@@ -57,8 +57,8 @@
 - [x] **Step 3:** Implement the pure validator and CLI JSON path; preserve the existing fail-closed error shape for invalid qualification.
 - [x] **Step 4:** Write failing U1 fixture tests proving `.github/**`, `scripts/**`, `gradle/verified-releases.json`, and `gradle/legacy-dependencies.lock.json` remain base-owned when upstream changes them.
 - [x] **Step 5:** Implement the expanded ownership set and required post-push tree checks.
-- [x] **Step 6:** Rewrite qualification to copy `scripts/upstream_monitor.py` and `scripts/u2_release.py` from `PUSH_BEFORE`, fetch fixed official upstream `main` and fork `main`, rebuild from `PUSH_BEFORE + U`, and pass all parent/tree/source evidence to `qualify-u1`.
-- [x] **Step 7:** Run focused tests, then commit the batch.
+- [x] **Step 6:** Rewrite qualification to use trusted control snapshots, bind provenance to the fixed upstream object and synced fork `main`, rebuild from `PUSH_BEFORE + U`, and pass all parent/tree/source evidence to `qualify-u1`.
+- [x] **Step 7:** Run focused/full tests and commit the batch; follow-up reviews closed the manual-dispatch, legacy-replay, marker-version, fork-main timing, candidate identity, probe-variable, cross-job SHA, and missing-marker diagnostics findings.
 
 ### Task 3: Verified-Release Ledger and Atomic Metadata CAS
 

@@ -183,7 +183,7 @@ jobs:
             fi
             pr_json=$(echo "$pr" | jq -c '{number,state,merged_at:.merged_at,base:(.base // {}),merged_by:(.merged_by.login // ""),author:(.user.login // ""),head_repository:(.head.repo.full_name // ""),head:(.head.ref // ""),head_sha:(.head.sha // ""),merge_commit_sha:.merge_commit_sha}')
             # For provenance, read the marker embedded in the PR body.
-            marker=$(echo "$pr" | jq -r '.body // ""' | grep -o '<!-- tvbox-upstream-candidate-v2 .* -->' | head -1)
+            marker=$(echo "$pr" | jq -r '.body // ""' | grep -o '<!-- tvbox-upstream-candidate-v2 .* -->' | head -1 || true)
             parsed=$(python3 "$trusted_root/scripts/u2_release.py" parse-provenance-marker --marker "$marker" 2>/dev/null || echo "")
             if [[ -z "$parsed" ]]; then
               echo "::error::auto-upstream PR missing valid v2 provenance marker"

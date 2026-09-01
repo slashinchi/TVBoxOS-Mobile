@@ -1384,6 +1384,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn('git show "$SOURCE_SHA:scripts/upstream_monitor.py"', qualify)
         self.assertIn('git show "$SOURCE_SHA:scripts/u2_qualify.sh"', qualify)
         self.assertIn('bash "$trusted_root/scripts/u2_qualify.sh"', qualify)
+        self.assertIn("head -1 || true", qualify)
         self.assertNotIn("--replay-status", qualify)
         self.assertNotIn("--replay-tree", qualify)
         self.assertNotIn("--replay-actual-tree", qualify)

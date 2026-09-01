@@ -572,6 +572,8 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("fork-main", workflow)
         self.assertIn('candidate_sha=$(git rev-parse HEAD)', workflow)
         self.assertIn('test "$candidate_sha" = "$(jq -r \'.candidate_sha\' "$result_file")"', workflow)
+        self.assertNotIn('candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}', workflow)
+        self.assertNotIn('needs.candidate_validation.outputs.candidate_sha', workflow)
 
     def test_candidate_jobs_continue_using_a_trusted_helper_copy(self):
         workflow = WORKFLOW.read_text()
