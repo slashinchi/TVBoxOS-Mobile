@@ -13,6 +13,33 @@ RELEASE_TAG_RE = re.compile(r"^v[0-9]+(?:\.[0-9]+){3}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 INCIDENT_REASON_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+RUN_ID_RE = re.compile(r"^[1-9][0-9]*$")
+
+VERIFIED_RELEASE_FIELDS = (
+    "tag",
+    "target",
+    "versionName",
+    "versionCode",
+    "assetSha256",
+    "updateSha256",
+    "signerSha256",
+    "sourceSha",
+    "debt",
+    "runId",
+    "runAttempt",
+    "verified",
+    "tag_ancestor",
+)
+LEGACY_RELEASE_FIELDS = (
+    "tag",
+    "target",
+    "versionName",
+    "versionCode",
+    "assetSha256",
+    "signerSha256",
+    "verified",
+    "tag_ancestor",
+)
 
 
 def expected_asset_set(version):
@@ -30,15 +57,189 @@ def _asset_digest(item):
 
 
 def _require_full_sha(value, label):
-    if not FULL_SHA_RE.fullmatch(value or ""):
+    if not isinstance(value, str) or not FULL_SHA_RE.fullmatch(value):
         raise ValueError(f"{label} must be a full 40-char SHA")
     return value
 
 
 def _require_hex64(value, label):
-    if not HEX64_RE.fullmatch(value or ""):
+    if not isinstance(value, str) or not HEX64_RE.fullmatch(value):
         raise ValueError(f"{label} must be a 64-char hex digest")
     return value.lower()
+
+
+def _require_positive_integer(value, label):
+    text = str(value)
+    if isinstance(value, bool) or not RUN_ID_RE.fullmatch(text):
+        raise ValueError(f"{label} must be a positive integer")
+    return int(text)
+
+
+def verified_release_entry(
+    tag,
+    target,
+    version_name,
+    version_code,
+    asset_sha256,
+    update_sha256,
+    signer_sha256,
+    source_sha,
+    debt,
+    run_id,
+    run_attempt,
+):
+    """Build the complete immutable identity persisted for a verified Release."""
+    if not isinstance(tag, str) or not RELEASE_TAG_RE.fullmatch(tag):
+        raise ValueError("verified release tag must be a formal v* tag")
+    if not isinstance(version_name, str) or not VERSION_RE.fullmatch(version_name):
+        raise ValueError("verified release version must be 4-part numeric")
+    if tag != f"v{version_name}":
+        raise ValueError("verified release tag/version mismatch")
+    _require_full_sha(target, "verified release target SHA")
+    _require_full_sha(source_sha, "verified release source SHA")
+    code = _require_positive_integer(version_code, "verified release versionCode")
+    _require_hex64(asset_sha256, "verified release APK SHA-256")
+    _require_hex64(update_sha256, "verified release update SHA-256")
+    _require_hex64(signer_sha256, "verified release signer SHA-256")
+    _require_hex64(debt, "verified release debt fingerprint")
+    run = str(_require_positive_integer(run_id, "verified release run ID"))
+    attempt = str(_require_positive_integer(run_attempt, "verified release run attempt"))
+    return {
+        "tag": tag,
+        "target": target,
+        "versionName": version_name,
+        "versionCode": code,
+        "assetSha256": asset_sha256.lower(),
+        "updateSha256": update_sha256.lower(),
+        "signerSha256": signer_sha256.lower(),
+        "sourceSha": source_sha,
+        "debt": debt.lower(),
+        "runId": run,
+        "runAttempt": attempt,
+        "verified": True,
+        "tag_ancestor": True,
+    }
+
+
+def _validate_verified_release_entry(entry):
+    if not isinstance(entry, dict) or set(entry) != set(VERIFIED_RELEASE_FIELDS):
+        raise ValueError("malformed verified release entry")
+    expected = verified_release_entry(
+        tag=entry["tag"],
+        target=entry["target"],
+        version_name=entry["versionName"],
+        version_code=entry["versionCode"],
+        asset_sha256=entry["assetSha256"],
+        update_sha256=entry["updateSha256"],
+        signer_sha256=entry["signerSha256"],
+        source_sha=entry["sourceSha"],
+        debt=entry["debt"],
+        run_id=entry["runId"],
+        run_attempt=entry["runAttempt"],
+    )
+    if entry != expected:
+        raise ValueError("verified release entry is not canonical")
+    return entry
+
+
+def _validate_ledger_entry(entry):
+    if not isinstance(entry, dict):
+        raise ValueError("verified release ledger entry must be an object")
+    if set(entry) == set(VERIFIED_RELEASE_FIELDS):
+        return _validate_verified_release_entry(entry)
+    if set(entry) != set(LEGACY_RELEASE_FIELDS):
+        raise ValueError("malformed verified release ledger entry")
+    if not RELEASE_TAG_RE.fullmatch(entry.get("tag") or ""):
+        raise ValueError("legacy verified release tag is invalid")
+    if not VERSION_RE.fullmatch(entry.get("versionName") or ""):
+        raise ValueError("legacy verified release version is invalid")
+    if entry["tag"] != f"v{entry['versionName']}":
+        raise ValueError("legacy verified release tag/version mismatch")
+    _require_full_sha(entry.get("target"), "legacy verified release target SHA")
+    if isinstance(entry.get("versionCode"), bool) or not isinstance(entry.get("versionCode"), int):
+        raise ValueError("legacy verified release versionCode must be an integer")
+    _require_positive_integer(entry.get("versionCode"), "legacy verified release versionCode")
+    _require_hex64(entry.get("assetSha256"), "legacy verified release APK SHA-256")
+    _require_hex64(entry.get("signerSha256"), "legacy verified release signer SHA-256")
+    if entry.get("verified") is not True or entry.get("tag_ancestor") is not True:
+        raise ValueError("legacy verified release flags must be true")
+    return entry
+
+
+def _validate_ledger(ledger):
+    if not isinstance(ledger, list):
+        raise ValueError("verified release ledger must be a JSON array")
+    identities = set()
+    tags = set()
+    versions = set()
+    version_codes = set()
+    targets = set()
+    for entry in ledger:
+        validated = _validate_ledger_entry(entry)
+        identity = (validated["tag"], validated["versionName"], validated["target"])
+        if (
+            identity in identities
+            or validated["tag"] in tags
+            or validated["versionName"] in versions
+            or validated["versionCode"] in version_codes
+            or validated["target"] in targets
+        ):
+            raise ValueError("duplicate verified release identity")
+        identities.add(identity)
+        tags.add(validated["tag"])
+        versions.add(validated["versionName"])
+        version_codes.add(validated["versionCode"])
+        targets.add(validated["target"])
+    return ledger
+
+
+def reconcile_verified_releases(ledger, entry):
+    """Reconcile one verified identity without rewriting a conflicting release."""
+    _validate_ledger(ledger)
+    _validate_verified_release_entry(entry)
+    identity = (entry["tag"], entry["versionName"], entry["target"])
+    for existing in ledger:
+        existing_identity = (
+            existing.get("tag"),
+            existing.get("versionName"),
+            existing.get("target"),
+        )
+        if existing == entry:
+            return {"action": "exact-reuse", "ledger": list(ledger)}
+        if (
+            existing_identity == identity
+            or existing.get("tag") == entry["tag"]
+            or existing.get("versionName") == entry["versionName"]
+            or existing.get("versionCode") == entry["versionCode"]
+            or existing.get("target") == entry["target"]
+        ):
+            raise ValueError("verified release identity conflict")
+
+    versions = [
+        tuple(int(part) for part in existing["versionName"].split("."))
+        for existing in ledger
+    ]
+    version_codes = [int(existing["versionCode"]) for existing in ledger]
+    candidate_version = tuple(int(part) for part in entry["versionName"].split("."))
+    if versions and candidate_version < max(versions):
+        raise ValueError("verified release version is not monotonic")
+    if version_codes and entry["versionCode"] <= max(version_codes):
+        raise ValueError("verified release versionCode is not monotonic")
+    return {"action": "append", "ledger": [*ledger, dict(entry)]}
+
+
+def verify_verified_releases(metadata_bytes, expected_entry):
+    """Verify that remote ledger bytes contain exactly one canonical entry."""
+    try:
+        ledger = json.loads(metadata_bytes.decode("utf-8"))
+        _validate_ledger(ledger)
+        expected = _validate_verified_release_entry(expected_entry)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return {"verified": False, "reason": "invalid-ledger"}
+    matches = [entry for entry in ledger if entry == expected]
+    if len(matches) != 1:
+        return {"verified": False, "reason": "entry-mismatch"}
+    return {"verified": True, "reason": ""}
 
 
 def reconcile_draft_assets(draft, version, expected_digests=None):
@@ -368,6 +569,11 @@ def main(argv=None):
     verify_meta.add_argument("--expected-version", required=True)
     verify_meta.add_argument("--expected-apk-url", required=True)
 
+    verified_releases = subparsers.add_parser("reconcile-verified-releases")
+    verified_releases.add_argument("--ledger", required=True)
+    verified_releases.add_argument("--entry", required=True)
+    verified_releases.add_argument("--output", required=True)
+
     released = subparsers.add_parser("released-identity")
     released.add_argument("--release", required=True)
     released.add_argument("--version", required=True)
@@ -428,6 +634,13 @@ def main(argv=None):
             args.expected_version,
             args.expected_apk_url,
         ), sort_keys=True))
+    elif args.command == "reconcile-verified-releases":
+        result = reconcile_verified_releases(
+            json.loads(Path(args.ledger).read_text()),
+            json.loads(Path(args.entry).read_text()),
+        )
+        Path(args.output).write_text(json.dumps(result["ledger"], indent=2) + "\n")
+        print(json.dumps({"action": result["action"]}, sort_keys=True))
     elif args.command == "released-identity":
         release = json.loads(args.release)
         decision = released_identity_decision(

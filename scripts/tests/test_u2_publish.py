@@ -6,6 +6,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
+from scripts import u2_publish as u2_publish_module
 from scripts.u2_publish import (
     expected_asset_set,
     reconcile_draft_assets,
@@ -31,6 +32,11 @@ TARGET = "a" * 40
 APK_DIGEST = "b" * 64
 UPDATE_DIGEST = "c" * 64
 APK_NAME = f"TVBox-Mobile-v{VERSION}.apk"
+SIGNER_DIGEST = "d" * 64
+SOURCE_SHA = "e" * 40
+DEBT_DIGEST = "f" * 64
+RUN_ID = "123456"
+RUN_ATTEMPT = "2"
 
 
 def _draft(assets, is_draft=True, tag=TAG, tag_target_sha=TARGET, target_commitish=TARGET):
@@ -45,6 +51,22 @@ def _draft(assets, is_draft=True, tag=TAG, tag_target_sha=TARGET, target_commiti
 
 def _asset(name, digest):
     return {"name": name, "digest": digest}
+
+
+def _verified_entry():
+    return u2_publish_module.verified_release_entry(
+        tag=TAG,
+        target=TARGET,
+        version_name=VERSION,
+        version_code=23701,
+        asset_sha256=APK_DIGEST,
+        update_sha256=UPDATE_DIGEST,
+        signer_sha256=SIGNER_DIGEST,
+        source_sha=SOURCE_SHA,
+        debt=DEBT_DIGEST,
+        run_id=RUN_ID,
+        run_attempt=RUN_ATTEMPT,
+    )
 
 
 class U2PublishContractTests(unittest.TestCase):
@@ -302,6 +324,169 @@ class U2PublishContractTests(unittest.TestCase):
         self.assertFalse(verify_remote_metadata(b"not json", VERSION, url)["verified"])
         self.assertFalse(verify_remote_metadata(canonical.replace(b"2.1.27.1", b"2.1.26.1"), VERSION, url)["verified"])
         self.assertFalse(verify_remote_metadata(canonical + b"\n", VERSION, url)["verified"])
+
+    def test_verified_release_entry_contains_complete_identity(self):
+        entry = _verified_entry()
+        self.assertEqual(
+            entry,
+            {
+                "tag": TAG,
+                "target": TARGET,
+                "versionName": VERSION,
+                "versionCode": 23701,
+                "assetSha256": APK_DIGEST,
+                "updateSha256": UPDATE_DIGEST,
+                "signerSha256": SIGNER_DIGEST,
+                "sourceSha": SOURCE_SHA,
+                "debt": DEBT_DIGEST,
+                "runId": RUN_ID,
+                "runAttempt": RUN_ATTEMPT,
+                "verified": True,
+                "tag_ancestor": True,
+            },
+        )
+
+        invalid = {
+            "target": "short",
+            "asset_sha256": "zz",
+            "update_sha256": "zz",
+            "signer_sha256": "zz",
+            "source_sha": "short",
+            "debt": "zz",
+            "version_name": "2.1.27",
+            "version_code": 0,
+            "run_id": "0",
+            "run_attempt": "0",
+        }
+        for field, value in invalid.items():
+            kwargs = {
+                "tag": TAG,
+                "target": TARGET,
+                "version_name": VERSION,
+                "version_code": 23701,
+                "asset_sha256": APK_DIGEST,
+                "update_sha256": UPDATE_DIGEST,
+                "signer_sha256": SIGNER_DIGEST,
+                "source_sha": SOURCE_SHA,
+                "debt": DEBT_DIGEST,
+                "run_id": RUN_ID,
+                "run_attempt": RUN_ATTEMPT,
+            }
+            kwargs[field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    u2_publish_module.verified_release_entry(**kwargs)
+        for field, value in {"tag": 123, "version_name": 123, "target": 123}.items():
+            kwargs = {
+                "tag": TAG,
+                "target": TARGET,
+                "version_name": VERSION,
+                "version_code": 23701,
+                "asset_sha256": APK_DIGEST,
+                "update_sha256": UPDATE_DIGEST,
+                "signer_sha256": SIGNER_DIGEST,
+                "source_sha": SOURCE_SHA,
+                "debt": DEBT_DIGEST,
+                "run_id": RUN_ID,
+                "run_attempt": RUN_ATTEMPT,
+            }
+            kwargs[field] = value
+            with self.subTest(field=field, value_type=type(value).__name__):
+                with self.assertRaises(ValueError):
+                    u2_publish_module.verified_release_entry(**kwargs)
+
+    def test_verified_release_reconcile_is_idempotent_and_rejects_identity_conflict(self):
+        entry = _verified_entry()
+        appended = u2_publish_module.reconcile_verified_releases([], entry)
+        self.assertEqual(appended["action"], "append")
+        self.assertEqual(appended["ledger"], [entry])
+
+        replay = u2_publish_module.reconcile_verified_releases(appended["ledger"], entry)
+        self.assertEqual(replay["action"], "exact-reuse")
+        self.assertEqual(replay["ledger"], [entry])
+
+        conflict = dict(entry, assetSha256="0" * 64)
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_releases([entry], conflict)
+        same_target = dict(entry, tag="v2.1.28.1", versionName="2.1.28.1", versionCode=23801)
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_releases([entry], same_target)
+
+    def test_verified_release_reconcile_rejects_malformed_or_non_monotonic_ledger(self):
+        entry = _verified_entry()
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_releases({"entries": []}, entry)
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_releases([{"tag": TAG}], entry)
+        malformed_legacy = {
+            "tag": "v2.1.26.1",
+            "target": TARGET,
+            "versionName": "2.1.26.1",
+            "versionCode": "23601",
+            "assetSha256": APK_DIGEST,
+            "signerSha256": SIGNER_DIGEST,
+            "verified": True,
+            "tag_ancestor": True,
+        }
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_releases([malformed_legacy], entry)
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_releases([entry, entry], entry)
+        conflicting_target = dict(entry, target="0" * 40)
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_releases([entry, conflicting_target], entry)
+
+        older = dict(entry, tag="v2.1.26.1", versionName="2.1.26.1", versionCode=23601)
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_releases([entry], older)
+
+        lower_code = dict(entry, tag="v2.1.28.1", versionName="2.1.28.1", versionCode=1)
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_releases([entry], lower_code)
+
+    def test_verified_release_readback_requires_exact_entry(self):
+        entry = _verified_entry()
+        canonical = (json.dumps([entry], indent=2, sort_keys=True) + "\n").encode()
+        self.assertEqual(
+            u2_publish_module.verify_verified_releases(canonical, entry),
+            {"verified": True, "reason": ""},
+        )
+        self.assertFalse(
+            u2_publish_module.verify_verified_releases(canonical.replace(SOURCE_SHA.encode(), ("0" * 40).encode()), entry)["verified"]
+        )
+        self.assertFalse(u2_publish_module.verify_verified_releases(b"not json", entry)["verified"])
+        self.assertFalse(
+            u2_publish_module.verify_verified_releases(
+                (json.dumps([dict(entry, runAttempt="3")], sort_keys=True) + "\n").encode(), entry
+            )["verified"]
+        )
+
+    def test_reconcile_verified_releases_cli_round_trip(self):
+        entry = _verified_entry()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger = tmp_path / "verified-releases.json"
+            entry_file = tmp_path / "entry.json"
+            output = tmp_path / "reconciled.json"
+            ledger.write_text("[]\n")
+            entry_file.write_text(json.dumps(entry, sort_keys=True) + "\n")
+
+            command = [
+                "python3", "scripts/u2_publish.py", "reconcile-verified-releases",
+                "--ledger", str(ledger),
+                "--entry", str(entry_file),
+                "--output", str(output),
+            ]
+            first = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(json.loads(first.stdout)["action"], "append")
+            self.assertEqual(json.loads(output.read_text()), [entry])
+
+            ledger.write_bytes(output.read_bytes())
+            second = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(json.loads(second.stdout)["action"], "exact-reuse")
+            self.assertEqual(json.loads(output.read_text()), [entry])
 
     def test_monotonic_metadata_never_rolls_back(self):
         current = {"version": "2.1.26.1", "apk_url": "https://example.invalid/old"}

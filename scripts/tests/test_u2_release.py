@@ -365,6 +365,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertEqual(derive_integrated_upstream_sha([sha], {sha}, {sha}), sha)
         with self.assertRaises(ValueError):
             derive_integrated_upstream_sha([sha, "b" * 40], {sha, "b" * 40}, {sha, "b" * 40})
+        with self.assertRaises(ValueError):
+            canonical_release_baseline(["malformed-ledger-entry"])
         release = {
             "tag": "v2.1.26.1",
             "target": "c" * 40,
@@ -1359,6 +1361,34 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("--silent", tag_ref_line)
         self.assertIn("if tag_target_sha=$(", tag_ref_line)
         self.assertIn("2>/dev/null); then", tag_ref_line)
+
+    def test_u2_metadata_reconciliation_is_bounded_two_file_normal_cas(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        publish = tree["jobs"]["publish"]
+        steps = publish["steps"]
+        metadata_step = next(
+            s for s in steps if "Reconcile verified release metadata" in str(s)
+        )
+        metadata_text = str(metadata_step)
+        for token in (
+            "gradle/verified-releases.json",
+            "reconcile-verified-releases",
+            "verify_verified_releases",
+            "verify-remote-metadata",
+            "current-canonical-update.json",
+            "keys | sort",
+            "git fetch --no-tags origin",
+            "refs/heads/patched",
+            "non-fast-forward",
+            "retry exhaustion",
+            "git add update.json gradle/verified-releases.json",
+        ):
+            self.assertIn(token, metadata_text, token)
+        self.assertIn("for attempt in 1 2 3", metadata_text)
+        self.assertNotIn("git push --atomic", metadata_text)
+        self.assertNotIn("git push --force", metadata_text)
+        self.assertNotIn("git push -f", metadata_text)
 
     def test_auto_qualification_requires_real_trusted_replay_evidence(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()

@@ -1114,110 +1114,208 @@ jobs:
           echo "delivery_ok=true" >> "$GITHUB_OUTPUT"
           echo "::notice::delivery proxy verified for $tag"
 
-      - name: Reconcile root update.json monotonically with remote readback
+      - name: Reconcile verified release metadata with bounded normal CAS
         env:
+          RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
           EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          EXPECTED_VERSION_CODE: ${{ needs.prep.outputs.expected_version_code }}
           EXPECTED_DEBT: ${{ steps.identity.outputs.EXPECTED_DEBT }}
+          EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
+          SIGNER_SHA: ${{ steps.identity.outputs.SIGNER_SHA }}
+          SOURCE_SHA: ${{ needs.rc_summary.outputs.SOURCE_SHA }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Reconcile root update.json together with the verified-release ledger.
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
-          cand_version="$EXPECTED_VERSION"
-          # Read the CURRENT root update.json from the remote patched branch,
-          # never from local HEAD (which may be ahead of or behind remote).
-          if remote_b64=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
-            --jq '.content' 2>/dev/null); then
-            : # success: stdout holds base64 content
-          else
-            remote_b64=""
-          fi
-          [[ -n "$remote_b64" ]] || {
-            echo "::error::cannot read current patched/update.json from remote; refusing to guess (a transient API failure must never be treated as an empty baseline)"
-            exit 1
-          }
-          remote_content=$(printf '%s' "$remote_b64" | base64 -d 2>/dev/null || echo "")
-          [[ -n "$remote_content" ]] || {
-            echo "::error::remote update.json base64 decode failed or is empty; refusing to proceed on an unknown baseline"
-            exit 1
-          }
-          current_version=$(jq -r '.version // ""' <<<"$remote_content" 2>/dev/null || echo "")
-          [[ -n "$current_version" ]] || {
-            echo "::error::remote update.json has no readable version; refusing to proceed on an unknown baseline"
-            exit 1
-          }
-          newer=$(python3 scripts/u2_publish.py monotonic-compare \
-            --current-version "$current_version" \
-            --candidate-version "$cand_version" | jq -r '.newer')
-          [[ "$newer" == "true" ]] || { echo "::error::candidate version is older than current update.json"; exit 1; }
-          apk_url="https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/v${cand_version}/TVBox-Mobile-v${cand_version}.apk"
+          tag="v${EXPECTED_VERSION}"
+          apk_url="https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/${tag}/TVBox-Mobile-v${EXPECTED_VERSION}.apk"
+          candidate_update="$RUNNER_TEMP/u2-candidate-update.json"
           python3 scripts/u2_publish.py build-update-json \
-            --version "$cand_version" \
+            --version "$EXPECTED_VERSION" \
             --apk-url "$apk_url" \
-            --output update.json
-          if cmp -s update.json <(printf '%s' "$remote_content"); then
-            echo "::notice::remote update.json already identical to v${cand_version}; no commit needed"
-            exit 0
-          fi
+            --output "$candidate_update"
+          update_digest=$(sha256sum "$candidate_update" | awk '{print $1}')
+          [[ "$update_digest" == "${{ steps.release.outputs.update_digest }}" ]] || {
+            echo "::error::candidate update.json digest changed after delivery verification"; exit 1;
+          }
+          entry_file="$RUNNER_TEMP/u2-verified-release-entry.json"
+          python3 - "$tag" "$RELEASE_SHA" "$EXPECTED_VERSION" "$EXPECTED_VERSION_CODE" \
+            "$EXPECTED_APK" "$update_digest" "$SIGNER_SHA" "$SOURCE_SHA" \
+            "$EXPECTED_DEBT" "$RUN_ID" "$RUN_ATTEMPT" > "$entry_file" <<'PY'
+          import json
+          import sys
+
+          from scripts.u2_publish import verified_release_entry
+
+          entry = verified_release_entry(
+              tag=sys.argv[1],
+              target=sys.argv[2],
+              version_name=sys.argv[3],
+              version_code=sys.argv[4],
+              asset_sha256=sys.argv[5],
+              update_sha256=sys.argv[6],
+              signer_sha256=sys.argv[7],
+              source_sha=sys.argv[8],
+              debt=sys.argv[9],
+              run_id=sys.argv[10],
+              run_attempt=sys.argv[11],
+          )
+          print(json.dumps(entry, sort_keys=True))
+          PY
           git config user.name "TVBox U2 Publish"
           git config user.email "u2-publish@users.noreply.github.com"
-          # Metadata is forward-only: if patched moved while this run was
-          # publishing (TOCTOU), rebuild the single update.json commit on the
-          # NEW remote HEAD so we never fast-forward-overwrite concurrent
-          # pushes, and never leave a published Release without metadata.
-          cp update.json "$RUNNER_TEMP/update-json-to-commit.json"
-          git fetch --no-tags origin "+refs/heads/patched:refs/remotes/origin/patched"
-          remote_head=$(git rev-parse refs/remotes/origin/patched)
-          if [[ "$(git rev-parse HEAD)" != "$remote_head" ]]; then
-            echo "::notice::patched moved during publish ($(git rev-parse --short HEAD) -> $(git rev-parse --short "$remote_head")); rebuilding update.json commit on remote HEAD"
-            # Re-validate monotonicity against the NEW remote baseline before
-            # committing: a concurrent push may have written an even newer
-            # update.json, and we must never regress it.
-            if new_remote_b64=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" --jq '.content' 2>/dev/null); then
-              new_remote_content=$(printf '%s' "$new_remote_b64" | base64 -d 2>/dev/null || echo "")
-              if [[ -n "$new_remote_content" ]]; then
-                new_current_version=$(jq -r '.version // ""' <<<"$new_remote_content" 2>/dev/null || echo "")
-                if [[ -n "$new_current_version" ]]; then
-                  still_newer=$(python3 scripts/u2_publish.py monotonic-compare \
-                    --current-version "$new_current_version" \
-                    --candidate-version "$cand_version" | jq -r '.newer')
-                  [[ "$still_newer" == "true" ]] || {
-                    echo "::error::remote update.json advanced to $new_current_version during publish; refusing to regress metadata"
-                    exit 1
-                  }
-                fi
-              fi
-            fi
+          metadata_ledger="$RUNNER_TEMP/u2-reconciled-verified-releases.json"
+          for attempt in 1 2 3; do
+            echo "::notice::metadata CAS attempt ${attempt}/3: fresh fetch and remote read"
+            git fetch --no-tags origin "+refs/heads/patched:refs/remotes/origin/patched"
+            remote_head=$(git rev-parse refs/remotes/origin/patched)
             git reset --hard "$remote_head"
-            cp "$RUNNER_TEMP/update-json-to-commit.json" update.json
-            git add update.json
-            if git diff --cached --quiet; then
-              echo "::notice::update.json on remote HEAD already identical to v${cand_version}; no commit needed"
-              exit 0
+
+            remote_update_b64=$(GH_TOKEN="$TOKEN" gh api \
+              "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
+              --jq '.content' 2>/dev/null) || {
+              echo "::error::cannot read current patched/update.json from remote; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            [[ -n "$remote_update_b64" ]] || {
+              echo "::error::remote update.json read failed or returned empty content; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            remote_update="$RUNNER_TEMP/u2-remote-update.json"
+            printf '%s' "$remote_update_b64" | base64 -d > "$remote_update" || {
+              echo "::error::remote update.json base64 decode failed; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            [[ -s "$remote_update" ]] || { echo "::error::remote update.json is empty; refusing to proceed on an unknown baseline"; exit 1; }
+            current_version=$(jq -er 'if type == "object" then (.version // empty) else empty end' "$remote_update") || {
+              echo "::error::remote update.json is malformed or has no readable version; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            current_url=$(jq -er 'if type == "object" then (.apk_url // empty) else empty end' "$remote_update") || {
+              echo "::error::remote update.json is malformed or has no apk_url; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            current_keys=$(jq -ce 'if type == "object" then (keys | sort) else [] end' "$remote_update") || {
+              echo "::error::remote update.json is not a JSON object; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            [[ "$current_keys" == '["apk_url","version"]' ]] || {
+              echo "::error::remote update.json has unexpected fields; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            python3 scripts/u2_publish.py build-update-json \
+              --version "$current_version" \
+              --apk-url "$current_url" \
+              --output "$RUNNER_TEMP/current-canonical-update.json" >/dev/null || {
+              echo "::error::remote update.json failed semantic validation; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            newer=$(python3 scripts/u2_publish.py monotonic-compare \
+              --current-version "$current_version" \
+              --candidate-version "$EXPECTED_VERSION" | jq -r '.newer')
+            [[ "$newer" == "true" ]] || {
+              echo "::error::candidate version is older than current update.json"; exit 1;
+            }
+            if [[ "$current_version" == "$EXPECTED_VERSION" ]]; then
+              cmp -s "$candidate_update" "$remote_update" || {
+                echo "::error::same-version update.json has a different identity"; exit 1;
+              }
             fi
-            git commit -m "chore: update metadata to v${cand_version}"
-          else
-            git add update.json
-            if git diff --cached --quiet; then
-              echo "::notice::update.json already identical to v${cand_version}; no commit needed"
-              exit 0
+
+            remote_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
+              "repos/slashinchi/TVBoxOS-Mobile/contents/gradle/verified-releases.json?ref=patched" \
+              --jq '.content' 2>/dev/null) || {
+              echo "::error::cannot read current patched/gradle/verified-releases.json from remote"; exit 1;
+            }
+            [[ -n "$remote_ledger_b64" ]] || {
+              echo "::error::remote verified-release ledger read failed or returned empty content"; exit 1;
+            }
+            remote_ledger="$RUNNER_TEMP/u2-remote-verified-releases.json"
+            printf '%s' "$remote_ledger_b64" | base64 -d > "$remote_ledger" || {
+              echo "::error::remote verified-release ledger base64 decode failed"; exit 1;
+            }
+            [[ -s "$remote_ledger" ]] || { echo "::error::remote verified-release ledger is empty"; exit 1; }
+            rm -f "$metadata_ledger"
+            reconcile=$(python3 scripts/u2_publish.py reconcile-verified-releases \
+              --ledger "$remote_ledger" \
+              --entry "$entry_file" \
+              --output "$metadata_ledger")
+            action=$(jq -er '.action' <<<"$reconcile") || {
+              echo "::error::verified-release ledger reconciliation returned no action"; exit 1;
+            }
+            [[ "$action" == "append" || "$action" == "exact-reuse" ]] || {
+              echo "::error::unexpected verified-release ledger action: $action"; exit 1;
+            }
+
+            cp "$candidate_update" update.json
+            cp "$metadata_ledger" gradle/verified-releases.json
+            if cmp -s update.json "$remote_update" && cmp -s gradle/verified-releases.json "$remote_ledger"; then
+              echo "::notice::both remote metadata files are already identical and contain exact verified identity; no commit needed"
+              break
             fi
-            git commit -m "chore: update metadata to v${cand_version}"
-          fi
-          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/patched
-          # Remote byte readback via the Contents API on patched.
-          remote_after=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
-            --jq '.content' | base64 -d)
-          expected_url="$apk_url"
-          printf '%s' "$remote_after" > "$RUNNER_TEMP/remote-update.json"
-          verified=$(python3 scripts/u2_publish.py verify-remote-metadata \
-            --metadata-file "$RUNNER_TEMP/remote-update.json" \
-            --expected-version "$cand_version" \
-            --expected-apk-url "$expected_url" | jq -r '.verified')
-          [[ "$verified" == "true" ]] || {
-            echo "::error::remote update.json readback mismatch after commit"; exit 1;
+            git add update.json gradle/verified-releases.json
+            git commit -m "chore: reconcile verified release metadata v${EXPECTED_VERSION}"
+            push_log="$RUNNER_TEMP/u2-metadata-push.log"
+            set +e
+            git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/patched > "$push_log" 2>&1
+            push_status=$?
+            set -e
+            cat "$push_log"
+            if [[ "$push_status" -eq 0 ]]; then
+              echo "::notice::metadata CAS push succeeded on attempt ${attempt}"
+              break
+            fi
+            if grep -Eq 'non-fast-forward|fetch first|\[rejected\]' "$push_log" && [[ "$attempt" -lt 3 ]]; then
+              echo "::notice::patched moved during publish; rebuilding update.json commit on remote HEAD with the verified-release ledger after a fresh read"
+              continue
+            fi
+            if grep -Eq 'non-fast-forward|fetch first|\[rejected\]' "$push_log"; then
+              echo "::error::metadata CAS retry exhaustion after 3 non-fast-forward failures"
+              exit 1
+            fi
+            echo "::error::metadata CAS push failed without a retryable non-fast-forward (status=$push_status)"
+            exit "$push_status"
+          done
+
+          verify_remote_blobs() {
+            local remote_after_update_b64 remote_after_ledger_b64
+            remote_after_update_b64=$(GH_TOKEN="$TOKEN" gh api \
+              "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
+              --jq '.content' 2>/dev/null) || {
+              echo "::error::remote update.json readback failed"; return 1;
+            }
+            remote_after_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
+              "repos/slashinchi/TVBoxOS-Mobile/contents/gradle/verified-releases.json?ref=patched" \
+              --jq '.content' 2>/dev/null) || {
+              echo "::error::remote verified-release ledger readback failed"; return 1;
+            }
+            printf '%s' "$remote_after_update_b64" | base64 -d > "$RUNNER_TEMP/u2-readback-update.json" || return 1
+            printf '%s' "$remote_after_ledger_b64" | base64 -d > "$RUNNER_TEMP/u2-readback-verified-releases.json" || return 1
+            cmp -s "$candidate_update" "$RUNNER_TEMP/u2-readback-update.json" || {
+              echo "::error::remote update.json readback is not byte-exact"; return 1;
+            }
+            cmp -s "$metadata_ledger" "$RUNNER_TEMP/u2-readback-verified-releases.json" || {
+              echo "::error::remote verified-release ledger readback is not byte-exact"; return 1;
+            }
+            verified=$(python3 scripts/u2_publish.py verify-remote-metadata \
+              --metadata-file "$RUNNER_TEMP/u2-readback-update.json" \
+              --expected-version "$EXPECTED_VERSION" \
+              --expected-apk-url "$apk_url" | jq -r '.verified')
+            [[ "$verified" == "true" ]] || { echo "::error::remote update.json semantic readback failed"; return 1; }
+            verified=$(python3 - "$entry_file" "$RUNNER_TEMP/u2-readback-verified-releases.json" <<'PY'
+          import json
+          import sys
+
+          from scripts.u2_publish import verify_verified_releases
+
+          expected = json.loads(open(sys.argv[1]).read())
+          actual = open(sys.argv[2], "rb").read()
+          print(json.dumps(verify_verified_releases(actual, expected), sort_keys=True))
+          PY
+            )
+            [[ "$(jq -r '.verified' <<<"$verified")" == "true" ]] || {
+              echo "::error::remote verified-release ledger semantic readback failed: $verified"; return 1;
+            }
+            return 0
           }
-          echo "::notice::root update.json reconciled to v${cand_version} and remote-readback byte-exact"
+          verify_remote_blobs
+          echo "::notice::update.json and verified-releases.json are remote byte-exact readback after bounded normal CAS"
 
       - name: Clean up disposable prep ref and close satisfied incidents
         env:
