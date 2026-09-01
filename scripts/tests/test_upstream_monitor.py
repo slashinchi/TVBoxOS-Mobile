@@ -538,6 +538,12 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("--preview-candidate-needed", probe)
         self.assertIn("needs.probe.outputs.state == 'actionable-main-ahead'", workflow)
 
+    def test_probe_derives_fork_main_before_downstream_baseline_checks(self):
+        workflow = WORKFLOW.read_text()
+        probe = workflow[workflow.index("      - id: probe"):workflow.index("\n\n  coverage:")]
+        self.assertIn("fork_main_sha=$(git rev-parse refs/remotes/origin/main)", probe)
+        self.assertNotIn("$FORK_MAIN_SHA", probe)
+
     def test_workflow_binds_validated_tree_before_pr_creation(self):
         workflow = WORKFLOW.read_text()
         self.assertIn("validated_tree", workflow)

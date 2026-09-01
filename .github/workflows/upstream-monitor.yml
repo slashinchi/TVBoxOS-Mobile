@@ -198,11 +198,6 @@ jobs:
           set -euo pipefail
            trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
            cp scripts/upstream_monitor.py "$trusted_helper"
-           existing_fork_main=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
-           if [[ -n "$existing_fork_main" && "$existing_fork_main" != "$FORK_MAIN_SHA" ]]; then
-             echo "::error::fork main baseline changed during candidate write"
-             exit 1
-           fi
            git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
@@ -559,7 +554,7 @@ jobs:
            cp scripts/upstream_monitor.py "$trusted_helper"
            existing_fork_main=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
            if [[ -n "$existing_fork_main" && "$existing_fork_main" != "$FORK_MAIN_SHA" ]]; then
-             echo "::error::fork main baseline changed during recovery"
+             echo "::error::fork main baseline changed during candidate write"
              exit 1
            fi
            git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
