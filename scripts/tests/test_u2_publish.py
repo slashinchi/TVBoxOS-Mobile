@@ -439,6 +439,10 @@ class U2PublishContractTests(unittest.TestCase):
         result = u2_publish_module.reconcile_verified_releases([prior], replay)
         self.assertEqual(result["action"], "exact-reuse")
         self.assertEqual(result["ledger"], [prior])
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_releases(
+                [prior], dict(prior, runId="654321", runAttempt="2")
+            )
 
     def test_verified_release_reconcile_rejects_malformed_or_non_monotonic_ledger(self):
         entry = _verified_entry()
@@ -494,6 +498,19 @@ class U2PublishContractTests(unittest.TestCase):
         ).encode()
         self.assertFalse(u2_publish_module.verify_verified_releases(duplicate, entry)["verified"])
 
+    def test_verified_release_readback_can_select_the_persisted_replay_entry(self):
+        persisted = dict(_verified_entry(), runAttempt="1")
+        replay = dict(persisted, runAttempt="2")
+        metadata = (json.dumps([persisted], sort_keys=True) + "\n").encode()
+        result = u2_publish_module.persisted_verified_release_entry(metadata, replay)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["entry"], persisted)
+        self.assertFalse(
+            u2_publish_module.persisted_verified_release_entry(
+                metadata, dict(replay, runId="654321")
+            )["verified"]
+        )
+
     def test_strict_json_parser_rejects_duplicate_update_keys(self):
         update = '{"version":"2.1.27.1","version":"2.1.27.1","apk_url":"https://example.invalid/apk"}'
         with self.assertRaises(ValueError):
@@ -522,6 +539,22 @@ class U2PublishContractTests(unittest.TestCase):
         )
         self.assertEqual(result["action"], "append")
         self.assertEqual(result["ledger"], [entry])
+
+        mismatched_current_ledger = dict(
+            _verified_entry(),
+            tag="v2.1.27.1",
+            versionName="2.1.27.1",
+            versionCode=23701,
+            target="1" * 40,
+            sourceSha="2" * 40,
+        )
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_release_metadata(
+                current_update,
+                json.dumps([mismatched_current_ledger]).encode(),
+                candidate_update,
+                entry,
+            )
 
         duplicate_ledger = b'[{"tag":"v2.1.26.1","tag":"v2.1.26.1"}]'
         with self.assertRaises(ValueError):
@@ -574,6 +607,12 @@ class U2PublishContractTests(unittest.TestCase):
         )
         self.assertEqual(
             u2_publish_module.classify_metadata_push(
+                0, rejected, sha_a, sha_a, sha_b, 1, 3
+            )["action"],
+            "fail",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
                 1, rejected, sha_a, sha_a, sha_b, 3, 3
             )["action"],
             "retry-exhausted",
@@ -585,12 +624,66 @@ class U2PublishContractTests(unittest.TestCase):
             )["action"],
             "retry",
         )
+        fetch_first = "!\tHEAD:refs/heads/patched\t[rejected] (fetch first)"
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                1, fetch_first, sha_a, sha_a, sha_b, 1, 3
+            )["action"],
+            "retry",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                1,
+                "!\tHEAD:refs/heads/patched\t[remote rejected] (hook declined)",
+                sha_a,
+                sha_a,
+                sha_b,
+                1,
+                3,
+            )["action"],
+            "fail",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                1,
+                "!\tHEAD:refs/heads/main\t[rejected] (fetch first)",
+                sha_a,
+                sha_a,
+                sha_b,
+                1,
+                3,
+            )["action"],
+            "fail",
+        )
         self.assertEqual(
             u2_publish_module.classify_metadata_push(
                 1, "fatal: authentication failed", sha_a, sha_a, sha_a, 1, 3
             )["action"],
             "fail",
         )
+
+    def test_release_read_classifier_allows_only_explicit_404_fallback(self):
+        self.assertEqual(
+            u2_publish_module.classify_release_read(0, 200)["action"],
+            "present",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_release_read(1, 404)["action"],
+            "missing",
+        )
+        for exit_status, http_status in (
+            (1, 401),
+            (1, 403),
+            (1, 422),
+            (1, 500),
+            (1, 0),
+            (0, 500),
+        ):
+            with self.subTest(exit_status=exit_status, http_status=http_status):
+                self.assertEqual(
+                    u2_publish_module.classify_release_read(exit_status, http_status)["action"],
+                    "fail",
+                )
 
     def test_reconcile_verified_releases_cli_round_trip(self):
         entry = _verified_entry()

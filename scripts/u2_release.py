@@ -336,6 +336,8 @@ def canonical_release_baseline(releases, update_version=None, delivery_hold=Fals
     if not isinstance(releases, list):
         raise ValueError("verified release ledger must be a JSON array")
     valid = []
+    previous_version = None
+    previous_version_code = None
     for release in releases:
         if not isinstance(release, dict):
             raise ValueError("verified release ledger entry must be an object")
@@ -346,7 +348,7 @@ def canonical_release_baseline(releases, update_version=None, delivery_hold=Fals
             raise ValueError("verified release tag is invalid")
         if not FULL_SHA_RE.fullmatch(release["target"]):
             raise ValueError("verified release target SHA is invalid")
-        _version_tuple(release["versionName"])
+        release_version = _version_tuple(release["versionName"])
         if release["tag"] != f"v{release['versionName']}":
             raise ValueError("verified release tag/version mismatch")
         if (
@@ -358,6 +360,12 @@ def canonical_release_baseline(releases, update_version=None, delivery_hold=Fals
             raise ValueError("verified release version or digest is invalid")
         if release.get("verified") is not True or release.get("tag_ancestor") is not True:
             raise ValueError("verified release flags must be true")
+        release_version_code = int(release["versionCode"])
+        if previous_version is not None and (
+            release_version <= previous_version
+            or release_version_code <= previous_version_code
+        ):
+            raise ValueError("verified release ledger is not strictly increasing")
         optional_identity = {"updateSha256", "sourceSha", "debt", "runId", "runAttempt"}
         present_identity = optional_identity & release.keys()
         if present_identity and present_identity != optional_identity:
@@ -372,6 +380,8 @@ def canonical_release_baseline(releases, update_version=None, delivery_hold=Fals
             ):
                 raise ValueError("verified release identity is invalid")
         valid.append(release)
+        previous_version = release_version
+        previous_version_code = release_version_code
     if not valid:
         raise ValueError("no internally consistent formal release")
     valid.sort(key=lambda item: (int(item["versionCode"]), _version_tuple(item["versionName"])), reverse=True)

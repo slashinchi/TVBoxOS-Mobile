@@ -386,6 +386,16 @@ class U2ReleaseContractTests(unittest.TestCase):
             canonical_release_baseline([release], update_version="2.1.26", delivery_hold=True)['tag'],
             "v2.1.26.1",
         )
+        newer = dict(
+            release,
+            tag="v2.1.27.1",
+            target="f" * 40,
+            versionName="2.1.27.1",
+            versionCode=23701,
+            assetSha256="a" * 64,
+        )
+        with self.assertRaises(ValueError):
+            canonical_release_baseline([newer, release])
 
     def test_delivery_hold_is_identity_bound_not_boolean(self):
         release = {
@@ -1446,6 +1456,38 @@ class U2ReleaseContractTests(unittest.TestCase):
                 capture_output=True,
             )
         self.assertNotEqual(result.returncode, 0)
+
+    def test_metadata_postpublish_reuses_shared_pair_preflight_and_persisted_entry(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        metadata_step = next(
+            step for step in tree["jobs"]["publish"]["steps"]
+            if step.get("name") == "Reconcile verified release metadata with bounded normal CAS"
+        )
+        metadata_text = str(metadata_step)
+        self.assertIn("reconcile-verified-release-metadata", metadata_text)
+        self.assertIn("persisted_verified_release_entry", metadata_text)
+        self.assertIn("metadata_ledger", metadata_text)
+
+    def test_release_and_tag_reads_allow_only_explicit_404_fallback(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        promote_step = next(
+            step for step in tree["jobs"]["publish"]["steps"]
+            if step.get("name") == "Promote patched to exact release SHA (CAS)"
+        )
+        self.assertIn("classify-release-read", str(promote_step))
+        release_step = next(
+            step for step in tree["jobs"]["publish"]["steps"]
+            if step.get("name") == "Create or reconcile draft Release with exact identity"
+        )
+        release_text = str(release_step)
+        self.assertIn("classify-release-read", release_text)
+        self.assertIn("release_http_status", release_text)
+        self.assertIn("release_read_action", release_text)
+        self.assertNotIn("gh release view \"$tag\" --repo slashinchi/TVBoxOS-Mobile \\\n            --json tagName,targetCommitish,isDraft,assets \\\n            --jq '.' 2>/dev/null || echo \"\"", release_text)
+        self.assertIn("tag_read_action", release_text)
+        self.assertIn("tag_http_status", release_text)
 
     def test_auto_qualification_requires_real_trusted_replay_evidence(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()

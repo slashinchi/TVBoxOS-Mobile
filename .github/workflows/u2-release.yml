@@ -719,10 +719,32 @@ jobs:
             # publish). A draft is NOT a tag: drafts have no git tag ref, so a
             # draft must never satisfy this recovery — otherwise a stale RC
             # could be published after patched moved forward.
-            if tag_ref=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
-              : # success: stdout holds the tag object SHA
-            else
+            tag_api_base="repos/slashinchi/TVBoxOS-Mobile/git/ref/"
+            tag_api="${tag_api_base}tags/${tag}"
+            tag_read="$RUNNER_TEMP/u2-promote-tag-read.txt"
+            set +e
+            GH_TOKEN="$TOKEN" gh api --include "$tag_api" > "$tag_read" 2>&1
+            tag_read_status=$?
+            set -e
+            tag_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$tag_read")
+            tag_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+              --status "$tag_read_status" \
+              --http-status "$tag_http_status") || {
+              echo "::error::promotion tag read classification failed closed"; exit 1;
+            }
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result") || {
+              echo "::error::promotion tag read classification returned no action"; exit 1;
+            }
+            if [[ "$tag_read_action" == "present" ]]; then
+              if tag_ref=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
+                : # success: stdout holds the tag object SHA
+              else
+                echo "::error::tag was present but the promotion identity read failed; refusing to continue"; exit 1
+              fi
+            elif [[ "$tag_read_action" == "missing" ]]; then
               tag_ref=""
+            else
+              echo "::error::promotion tag read failed (status=$tag_read_status http=$tag_http_status); only explicit HTTP 404 may report missing"; exit 1
             fi
             if [[ -n "$tag_ref" && "$tag_ref" =~ ^[0-9a-f]{40}$ ]]; then
               echo "::notice::recovery: patched advanced past release SHA but tag object $tag exists ($tag_ref); continuing"
@@ -927,19 +949,78 @@ jobs:
             --apk-url "$apk_url" \
             --output "$update_file"
           update_digest=$(sha256sum "$update_file" | awk '{print $1}')
-          existing=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile \
-            --json tagName,targetCommitish,isDraft,assets \
-            --jq '.' 2>/dev/null || echo "")
+
+          release_read="$RUNNER_TEMP/u2-release-read.txt"
+          set +e
+          GH_TOKEN="$TOKEN" gh api --include \
+            "repos/slashinchi/TVBoxOS-Mobile/releases/tags/${tag}" > "$release_read" 2>&1
+          release_read_status=$?
+          set -e
+          release_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$release_read")
+          release_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+            --status "$release_read_status" \
+            --http-status "$release_http_status") || {
+            echo "::error::Release read classification failed closed"; exit 1;
+          }
+          release_read_action=$(jq -er '.action' <<<"$release_read_result") || {
+            echo "::error::Release read classification returned no action"; exit 1;
+          }
+          case "$release_read_action" in
+            present)
+              existing=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile \
+                --json tagName,targetCommitish,isDraft,assets \
+                --jq '.') || {
+                echo "::error::Release existed during preflight but the identity read failed; refusing to create or fallback"; exit 1;
+              }
+              [[ -n "$existing" ]] || { echo "::error::present Release read returned empty identity"; exit 1; }
+              ;;
+            missing)
+              existing=""
+              ;;
+            *)
+              echo "::error::Release read failed (status=$release_read_status http=$release_http_status); only explicit HTTP 404 may create a Release"
+              exit 1
+              ;;
+          esac
           if [[ -n "$existing" ]]; then
             # Resolve the authoritative tag-object commit SHA. Drafts have no
             # tag ref yet, so fall back to targetCommitish when it is a full SHA
             # (gh release create --draft --target stores the SHA); a branch-name
             # targetCommitish with a resolvable tag ref must still match the ref.
-            if tag_target_sha=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
-              : # success: stdout holds the tag object SHA
-            else
-              tag_target_sha=""
-            fi
+            tag_read="$RUNNER_TEMP/u2-tag-read.txt"
+            set +e
+            tag_api_base="repos/slashinchi/TVBoxOS-Mobile/git/ref/"
+            tag_api="${tag_api_base}tags/${tag}"
+            GH_TOKEN="$TOKEN" gh api --include \
+              "$tag_api" > "$tag_read" 2>&1
+            tag_read_status=$?
+            set -e
+            tag_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$tag_read")
+            tag_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+              --status "$tag_read_status" \
+              --http-status "$tag_http_status") || {
+              echo "::error::tag read classification failed closed"; exit 1;
+            }
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result") || {
+              echo "::error::tag read classification returned no action"; exit 1;
+            }
+            tag_target_sha=""
+            case "$tag_read_action" in
+              present)
+                if tag_target_sha=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
+                  : # success: stdout holds the tag object SHA
+                else
+                  echo "::error::tag was present but the identity read failed; refusing to fallback"; exit 1
+                fi
+                ;;
+              missing)
+                : # Drafts have no tag ref; an explicit 404 permits fallback.
+                ;;
+              *)
+                echo "::error::tag read failed (status=$tag_read_status http=$tag_http_status); only explicit HTTP 404 may fallback"
+                exit 1
+                ;;
+            esac
             if [[ -z "$tag_target_sha" ]]; then
               commitish=$(echo "$existing" | jq -r '.targetCommitish // ""')
               if [[ "$commitish" =~ ^[0-9a-f]{40}$ ]]; then
@@ -1314,8 +1395,12 @@ jobs:
             }
             [[ -s "$remote_ledger" ]] || { echo "::error::remote verified-release ledger is empty"; exit 1; }
             rm -f "$metadata_ledger"
-            reconcile=$(python3 scripts/u2_publish.py reconcile-verified-releases \
-              --ledger "$remote_ledger" \
+            # Keep reconcile-verified-releases only as a compatibility reference;
+            # the shared two-file helper below is the sole reconciliation authority.
+            reconcile=$(python3 scripts/u2_publish.py reconcile-verified-release-metadata \
+              --current-update "$remote_update" \
+              --current-ledger "$remote_ledger" \
+              --candidate-update "$candidate_update" \
               --entry "$entry_file" \
               --output "$metadata_ledger")
             action=$(jq -er '.action' <<<"$reconcile") || {
@@ -1383,6 +1468,20 @@ jobs:
             esac
           done
 
+          persisted_entry_file="$RUNNER_TEMP/u2-persisted-release-entry.json"
+          python3 - "$entry_file" "$metadata_ledger" > "$persisted_entry_file" <<'PY'
+          import json
+          import sys
+
+          from scripts.u2_publish import persisted_verified_release_entry, strict_json_loads
+
+          expected = strict_json_loads(open(sys.argv[1], encoding="utf-8").read())
+          result = persisted_verified_release_entry(open(sys.argv[2], "rb").read(), expected)
+          if not result["verified"]:
+              raise SystemExit("persisted metadata ledger does not contain the exact release identity")
+          print(json.dumps(result["entry"], sort_keys=True))
+          PY
+
           verify_remote_blobs() {
             local remote_after_update_b64 remote_after_ledger_b64
             remote_after_update_b64=$(GH_TOKEN="$TOKEN" gh api \
@@ -1408,7 +1507,7 @@ jobs:
               --expected-version "$EXPECTED_VERSION" \
               --expected-apk-url "$apk_url" | jq -r '.verified')
             [[ "$verified" == "true" ]] || { echo "::error::remote update.json semantic readback failed"; return 1; }
-            verified=$(python3 - "$entry_file" "$RUNNER_TEMP/u2-readback-verified-releases.json" <<'PY'
+            verified=$(python3 - "$persisted_entry_file" "$RUNNER_TEMP/u2-readback-verified-releases.json" <<'PY'
           import json
           import sys
 

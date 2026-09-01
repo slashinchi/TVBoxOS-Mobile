@@ -55,7 +55,7 @@ VERIFIED_RELEASE_FIELDS = (
     "tag_ancestor",
 )
 VERIFIED_RELEASE_STABLE_FIELDS = tuple(
-    field for field in VERIFIED_RELEASE_FIELDS if field not in {"runId", "runAttempt"}
+    field for field in VERIFIED_RELEASE_FIELDS if field != "runAttempt"
 )
 LEGACY_RELEASE_FIELDS = (
     "tag",
@@ -333,20 +333,24 @@ def classify_metadata_push(
     if attempt > max_attempts:
         raise ValueError("metadata CAS attempt exceeds maximum")
 
-    rejected = False
+    nff_rejected = False
     for line in (porcelain_status or "").splitlines():
         fields = line.split("\t", 2)
         if (
-            len(fields) > 1
+            len(fields) > 2
             and fields[0] == "!"
             and fields[1].split(":", 1)[-1] == "refs/heads/patched"
+            and fields[2].strip() in {
+                "[rejected] (non-fast-forward)",
+                "[rejected] (fetch first)",
+            }
         ):
-            rejected = True
+            nff_rejected = True
             break
-    if push_status == 0 and not rejected:
+    if push_status == 0 and not nff_rejected:
         return {"action": "success", "reason": "push-ok"}
 
-    confirmed_nff = rejected and (
+    confirmed_nff = push_status != 0 and nff_rejected and (
         remote_head_before != local_parent or remote_head_after != remote_head_before
     )
     if confirmed_nff:
@@ -355,6 +359,38 @@ def classify_metadata_push(
             "reason": "fresh-remote-head-changed",
         }
     return {"action": "fail", "reason": "push-failure-not-confirmed-nff"}
+
+
+def persisted_verified_release_entry(metadata_bytes, expected_entry):
+    """Select the persisted entry while allowing only a new runAttempt."""
+    try:
+        ledger = strict_json_loads(metadata_bytes)
+        _validate_ledger(ledger)
+        expected = _validate_verified_release_entry(expected_entry)
+    except (TypeError, ValueError):
+        return {"verified": False, "reason": "invalid-ledger"}
+    matches = [
+        entry for entry in ledger
+        if all(entry[field] == expected[field] for field in VERIFIED_RELEASE_STABLE_FIELDS)
+    ]
+    if len(matches) != 1:
+        return {"verified": False, "reason": "entry-mismatch"}
+    return {"verified": True, "reason": "", "entry": matches[0]}
+
+
+def classify_release_read(exit_status, http_status):
+    """Classify a Release/tag GET without treating errors as absence."""
+    if (
+        isinstance(exit_status, int)
+        and not isinstance(exit_status, bool)
+        and isinstance(http_status, int)
+        and not isinstance(http_status, bool)
+    ):
+        if exit_status == 0 and http_status == 200:
+            return {"action": "present", "reason": "ok"}
+        if exit_status != 0 and http_status == 404:
+            return {"action": "missing", "reason": "not-found"}
+    return {"action": "fail", "reason": "release-read-failed"}
 
 
 def verify_verified_releases(metadata_bytes, expected_entry):
@@ -720,6 +756,10 @@ def main(argv=None):
     push.add_argument("--attempt", required=True, type=int)
     push.add_argument("--max-attempts", required=True, type=int)
 
+    release_read = subparsers.add_parser("classify-release-read")
+    release_read.add_argument("--status", required=True, type=int)
+    release_read.add_argument("--http-status", required=True, type=int)
+
     released = subparsers.add_parser("released-identity")
     released.add_argument("--release", required=True)
     released.add_argument("--version", required=True)
@@ -809,6 +849,8 @@ def main(argv=None):
             args.max_attempts,
         )
         print(json.dumps(result, sort_keys=True))
+    elif args.command == "classify-release-read":
+        print(json.dumps(classify_release_read(args.status, args.http_status), sort_keys=True))
     elif args.command == "released-identity":
         release = strict_json_loads(args.release)
         decision = released_identity_decision(
