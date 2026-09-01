@@ -434,7 +434,7 @@ jobs:
               --upstream "$UPSTREAM_SHA" \
               --candidate "$candidate_sha" \
               --tree "$validated_tree" \
-              --fork-main "$FORK_MAIN_SHA" \
+              --fork-main "$UPSTREAM_SHA" \
               --upstream-version "$upstream_version" \
                --upstream-code "$upstream_code")
            fi
@@ -608,7 +608,7 @@ jobs:
               --upstream "$UPSTREAM_SHA" \
               --candidate "$candidate_sha" \
               --tree "$VALIDATED_TREE" \
-              --fork-main "$FORK_MAIN_SHA" \
+              --fork-main "$UPSTREAM_SHA" \
               --upstream-version "$(jq -r '.versionName' <<<"$upstream_version_json")" \
              --upstream-code "$(jq -r '.versionCode' <<<"$upstream_version_json")")
            test "$provenance_marker" = "$EXPECTED_PROVENANCE_MARKER"
@@ -754,7 +754,7 @@ jobs:
               --upstream "$UPSTREAM_SHA" \
               --candidate "$CANDIDATE_BRANCH_OID" \
               --tree "$expected_tree" \
-              --fork-main "$FORK_MAIN_SHA" \
+              --fork-main "$UPSTREAM_SHA" \
               --upstream-version "$(jq -r '.versionName' <<<"$upstream_version_json")" \
              --upstream-code "$(jq -r '.versionCode' <<<"$upstream_version_json")")
            if ! python3 "$trusted_helper" tree-check --actual "$actual_tree" --expected "$expected_tree"; then

@@ -560,6 +560,8 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("git diff --quiet \"$PATCHED_SHA\" \"$actual_candidate_oid\"", workflow)
         self.assertIn("FORK_MAIN_SHA", workflow)
         self.assertIn("--fork-main", workflow)
+        self.assertIn('--fork-main "$UPSTREAM_SHA"', workflow)
+        self.assertNotIn('--fork-main "$FORK_MAIN_SHA"', workflow)
         self.assertNotIn("origin +refs/heads/main", workflow)
 
     def test_candidate_pr_binds_versioned_provenance_marker(self):
