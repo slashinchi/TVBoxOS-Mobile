@@ -2207,6 +2207,15 @@ class U2ReleaseContractTests(unittest.TestCase):
         validate_run = validate[validate.index("run: |") :]
         self.assertIn("^u2-canary-[0-9]+-attempt-[0-9]+$", validate_run)
         self.assertIn("CANARY_NAMESPACE", validate_run)
+        for token in (
+            "RUN_ID",
+            "RUN_ATTEMPT",
+            "CALLER_WORKFLOW_REF",
+            "github.workflow_ref",
+            "expected_namespace",
+            "namespace does not match the current run and attempt",
+        ):
+            self.assertIn(token, validate, token)
         for job_id in ("build_unsigned", "build_repro"):
             self.assertIn("validate_canary_namespace", str(tree["jobs"][job_id]["needs"]), job_id)
 
@@ -2240,7 +2249,14 @@ class U2ReleaseContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "github-output"
-            env = {**os.environ, "GITHUB_OUTPUT": str(output), "CANARY_NAMESPACE": ""}
+            env = {
+                **os.environ,
+                "GITHUB_OUTPUT": str(output),
+                "CANARY_NAMESPACE": "",
+                "RUN_ID": "123",
+                "RUN_ATTEMPT": "1",
+                "CALLER_WORKFLOW_REF": "slashinchi/TVBoxOS-Mobile/.github/workflows/u2-canary-harness.yml@refs/heads/patched",
+            }
             result = subprocess.run(
                 ["bash", "-c", validate_run], cwd=ROOT, env=env, text=True, capture_output=True
             )
@@ -2248,6 +2264,8 @@ class U2ReleaseContractTests(unittest.TestCase):
             self.assertIn("canary_namespace=", output.read_text())
             for namespace in (
                 "u2-canary-123-attempt-1",
+                "u2-canary-122-attempt-1",
+                "u2-canary-123-attempt-2",
                 "u2-canary-123-attempt-1-extra",
                 "u2-canary-x-attempt-1",
                 "rc-control-123",
@@ -2261,6 +2279,20 @@ class U2ReleaseContractTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                 else:
                     self.assertNotEqual(result.returncode, 0, namespace)
+
+            output.write_text("")
+            env["CANARY_NAMESPACE"] = "u2-canary-123-attempt-1"
+            env["CALLER_WORKFLOW_REF"] = "slashinchi/TVBoxOS-Mobile/.github/workflows/rc-control.yml@refs/heads/patched"
+            result = subprocess.run(
+                ["bash", "-c", validate_run], cwd=ROOT, env=env, text=True, capture_output=True
+            )
+            self.assertNotEqual(result.returncode, 0, "non-harness caller")
+            output.write_text("")
+            env["CANARY_NAMESPACE"] = ""
+            result = subprocess.run(
+                ["bash", "-c", validate_run], cwd=ROOT, env=env, text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_u2_canary_passes_and_verifies_every_namespaced_pipeline_artifact(self):
         workflow = CANARY_HARNESS_WORKFLOW.read_text()
@@ -2294,10 +2326,18 @@ class U2ReleaseContractTests(unittest.TestCase):
             "continue",
             "REVIEW_PENDING",
             "GITHUB_STEP_SUMMARY",
+            "needs.gate.result",
+            "needs.build_rc.result",
+            "needs.verify.result",
+            "upstream-run-incomplete",
+            "empty-artifact-list",
         ):
             self.assertIn(token, cleanup, token)
         self.assertIn("actions/runs/${GITHUB_RUN_ID}/artifacts", cleanup)
+        self.assertIn("--paginate", cleanup)
+        self.assertIn("--slurp", cleanup)
         self.assertIn("select(.name == $expected_name)", cleanup)
+        self.assertIn("unknown-artifact", cleanup)
         self.assertNotIn("*", cleanup.replace("${CANARY_NAMESPACE}", ""))
 
     def test_u2_canary_verifier_checks_signed_identity_predicate_fields(self):
@@ -2316,6 +2356,11 @@ class U2ReleaseContractTests(unittest.TestCase):
             "canary_run_id",
             "canary_run_attempt",
             "signed_sha256",
+            "normalize_artifact_digest",
+            "SIGNED_ARTIFACT_API_DIGEST",
+            ".digest",
+            "actual_digest",
+            "sha256:",
             "attestation-identity-mismatch",
             "refs/heads/main",
         ):
@@ -2333,7 +2378,7 @@ class U2ReleaseContractTests(unittest.TestCase):
                 "release": "a" * 40,
                 "source": "b" * 40,
                 "artifact_name": "u2-canary-123-attempt-1-tvbox-u2-signed-output-b-1",
-                "artifact_digest": "c" * 64,
+                "artifact_digest": "sha256:" + "c" * 64,
                 "run": "123",
                 "attempt": "1",
                 "signed": "d" * 64,
@@ -2363,6 +2408,7 @@ class U2ReleaseContractTests(unittest.TestCase):
                 "SOURCE_SHA": expected["source"],
                 "CANARY_ARTIFACT_NAME": expected["artifact_name"],
                 "SIGNED_ARTIFACT_DIGEST": expected["artifact_digest"],
+                "SIGNED_ARTIFACT_DIGEST_NORMALIZED": expected["artifact_digest"],
                 "RUN_ID": expected["run"],
                 "RUN_ATTEMPT": expected["attempt"],
                 "SIGNED_SHA": expected["signed"],
@@ -2371,6 +2417,39 @@ class U2ReleaseContractTests(unittest.TestCase):
             result = subprocess.run(["bash", "-c", check], cwd=ROOT, env=env, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             env["CANARY_NAMESPACE"] = "u2-canary-123-attempt-2"
+            result = subprocess.run(["bash", "-c", check], cwd=ROOT, env=env, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_u2_canary_artifact_digest_helper_normalizes_and_rejects_wrong_api_digest(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        verifier = self._job_block(workflow, "verify")
+        verifier_run = verifier[verifier.index("run: |") :]
+        normalize = re.search(
+            r"(?ms)^[ \t]*normalize_artifact_digest\(\) \{\n.*?^[ \t]*\}\n",
+            verifier_run,
+        )
+        compare = re.search(
+            r"(?ms)^[ \t]*assert_artifact_digest\(\) \{\n.*?^[ \t]*\}\n",
+            verifier_run,
+        )
+        self.assertIsNotNone(normalize, "artifact digest normalizer is missing")
+        self.assertIsNotNone(compare, "artifact digest comparison helper is missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            check = (
+                normalize.group(0)
+                + compare.group(0)
+                + "\nprintf '%s\\n' \"$(normalize_artifact_digest \"$PIPELINE_DIGEST\")\"\n"
+                + "assert_artifact_digest \"$PIPELINE_DIGEST\" \"$API_DIGEST\"\n"
+            )
+            env = {
+                **os.environ,
+                "PIPELINE_DIGEST": "c" * 64,
+                "API_DIGEST": "sha256:" + "c" * 64,
+            }
+            result = subprocess.run(["bash", "-c", check], cwd=ROOT, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("sha256:" + "c" * 64, result.stdout)
+            env["API_DIGEST"] = "sha256:" + "d" * 64
             result = subprocess.run(["bash", "-c", check], cwd=ROOT, env=env, text=True, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
 
@@ -2388,7 +2467,7 @@ class U2ReleaseContractTests(unittest.TestCase):
                 "set -euo pipefail\n"
                 "path=\"${@: -1}\"\n"
                 "if [[ \"$path\" == *\"/actions/runs/\"* ]]; then\n"
-                "  printf '{\"artifacts\":[{\"id\":101,\"name\":\"%s\"},{\"id\":102,\"name\":\"%s\"},{\"id\":103,\"name\":\"%s\"},{\"id\":104,\"name\":\"%s\"},{\"id\":105,\"name\":\"%s\"},{\"id\":106,\"name\":\"%s\"},{\"id\":107,\"name\":\"%s\"}]}\\n' \\\n"
+                "  printf '[{\"artifacts\":[{\"id\":101,\"name\":\"%s\"},{\"id\":102,\"name\":\"%s\"},{\"id\":103,\"name\":\"%s\"},{\"id\":104,\"name\":\"%s\"},{\"id\":105,\"name\":\"%s\"},{\"id\":106,\"name\":\"%s\"}]},{\"artifacts\":[{\"id\":107,\"name\":\"%s\"},{\"id\":108,\"name\":\"unexpected-current-run-artifact\"}]}]\\n' \\\n"
                 "    \"$CANARY_NAMESPACE-tvbox-u2-build-evidence-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
                 "    \"$CANARY_NAMESPACE-tvbox-u2-repro-build-evidence-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
                 "    \"$CANARY_NAMESPACE-tvbox-u2-repro-comparison-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
@@ -2430,6 +2509,9 @@ class U2ReleaseContractTests(unittest.TestCase):
                 "GH_TOKEN": "test-token-not-secret",
                 "GITHUB_STEP_SUMMARY": str(summary),
                 "GH_DELETE_LOG": str(delete_log),
+                "GATE_RESULT": "success",
+                "BUILD_RESULT": "success",
+                "VERIFY_RESULT": "success",
                 "BUILD_ARTIFACT_ID": "101",
                 "REPRO_ARTIFACT_ID": "102",
                 "COMPARISON_ARTIFACT_ID": "103",
@@ -2443,7 +2525,54 @@ class U2ReleaseContractTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(delete_log.read_text().splitlines(), ["101", "102", "103", "104", "105", "106", "107"])
-            self.assertIn("REVIEW_PENDING", summary.read_text())
+            summary_text = summary.read_text()
+            self.assertIn("REVIEW_PENDING", summary_text)
+            self.assertIn("unknown-artifact:unexpected-current-run-artifact", summary_text)
+
+    def test_u2_canary_cleanup_never_reports_complete_for_empty_failed_or_cancelled_run(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        cleanup = self._job_block(workflow, "cleanup")
+        cleanup_run = cleanup[cleanup.index("run: |") :]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$*\" == *\"--paginate\"* ]]; then\n"
+                "  printf '[{\"artifacts\":[]}]\\n'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n"
+            )
+            fake_gh.chmod(0o755)
+            for result_value in ("failure", "cancelled", "skipped"):
+                with self.subTest(result=result_value):
+                    summary = root / f"summary-{result_value}"
+                    env = {
+                        **os.environ,
+                        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                        "EXPECTED_SHA": "a" * 40,
+                        "CANARY_NAMESPACE": "u2-canary-123-attempt-1",
+                        "GITHUB_RUN_ID": "123",
+                        "GITHUB_RUN_ATTEMPT": "1",
+                        "GITHUB_REPOSITORY": "slashinchi/TVBoxOS-Mobile",
+                        "GH_TOKEN": "test-token-not-secret",
+                        "GITHUB_STEP_SUMMARY": str(summary),
+                        "GATE_RESULT": result_value,
+                        "BUILD_RESULT": result_value,
+                        "VERIFY_RESULT": result_value,
+                    }
+                    run = subprocess.run(
+                        ["bash", "-c", cleanup_run],
+                        cwd=ROOT,
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(run.returncode, 0)
+                    self.assertIn("REVIEW_PENDING", summary.read_text())
 
     def test_u2_intent_is_mutually_exclusive_and_cross_job_identity_is_explicit(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()

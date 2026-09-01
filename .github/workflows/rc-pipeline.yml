@@ -146,14 +146,30 @@ jobs:
         name: Fail closed on an invalid canary namespace
         env:
           CANARY_NAMESPACE: ${{ inputs.canary_namespace }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           set -euo pipefail
           if [[ -z "$CANARY_NAMESPACE" ]]; then
             echo "canary_namespace=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          [[ "$RUN_ID" =~ ^[0-9]+$ && "$RUN_ATTEMPT" =~ ^[0-9]+$ ]] || {
+            echo "::error::GitHub run identity is not numeric"
+            exit 1
+          }
           [[ "$CANARY_NAMESPACE" =~ ^u2-canary-[0-9]+-attempt-[0-9]+$ ]] || {
             echo "::error::canary namespace must match u2-canary-<run>-attempt-<attempt>"
+            exit 1
+          }
+          expected_namespace="u2-canary-${RUN_ID}-attempt-${RUN_ATTEMPT}"
+          [[ "$CANARY_NAMESPACE" == "$expected_namespace" ]] || {
+            echo "::error::namespace does not match the current run and attempt"
+            exit 1
+          }
+          [[ "$CALLER_WORKFLOW_REF" == "slashinchi/TVBoxOS-Mobile/.github/workflows/u2-canary-harness.yml@refs/heads/patched" ]] || {
+            echo "::error::namespaced pipeline calls are allowed only from the patched canary harness"
             exit 1
           }
           echo "canary_namespace=$CANARY_NAMESPACE" >> "$GITHUB_OUTPUT"
@@ -918,6 +934,20 @@ jobs:
            [[ "$signer_java_version" == *"17.0.20"* ]] || { echo "::error::signer JDK identity mismatch"; exit 1; }
             verifier_image_os="${ImageOS:-unknown}"
             verifier_image_version="${ImageVersion:-unknown}"
+            normalize_artifact_digest() {
+              local digest="$1"
+              if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                printf '%s\n' "$digest"
+                return 0
+              fi
+              if [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+                printf 'sha256:%s\n' "$digest"
+                return 0
+              fi
+              echo "::error::signed artifact digest is not a normalized SHA-256 value" >&2
+              return 1
+            }
+            signed_artifact_digest_normalized=$(normalize_artifact_digest "$EXPECTED_SIGNED_OUTPUT_ARTIFACT_DIGEST")
             signed_artifact_name="tvbox-u2-signed-output-${RELEASE_SHA}-${GITHUB_RUN_ATTEMPT}"
             if [[ -n "$CANARY_NAMESPACE" ]]; then
               signed_artifact_name="${CANARY_NAMESPACE}-${signed_artifact_name}"
@@ -948,7 +978,7 @@ jobs:
                --arg canary_release_sha "$RELEASE_SHA" \
                --arg canary_source_sha "$SOURCE_SHA" \
                --arg canary_signed_artifact_name "$signed_artifact_name" \
-               --arg canary_signed_artifact_digest "$EXPECTED_SIGNED_OUTPUT_ARTIFACT_DIGEST" \
+               --arg canary_signed_artifact_digest "$signed_artifact_digest_normalized" \
                --arg reproducibility_status "$(jq -r '.status' "$comparison")" \
                --argjson runner_image_drift "$(jq -r '.runner_image_drift' "$comparison")" \
                '$builder + {schema:"tvbox-release-identity-v2", unsigned_sha256:$unsigned, signed_sha256:$signed, signer_sha256:$signer, signer_java_version:$signer_java, verifier_image_os:$verifier_image_os, verifier_image_version:$verifier_image_version, verifier_workflow_source_sha:$workflow_source, run_id:$run, run_attempt:$attempt, primary_artifact_id:$primary_artifact_id, primary_artifact_digest:$primary_artifact_digest, repro_artifact_id:$repro_artifact_id, repro_artifact_digest:$repro_artifact_digest, reproducibility_report_artifact_id:$reproducibility_report_artifact_id, reproducibility_report_artifact_digest:$reproducibility_report_artifact_digest, reproducibility_report_sha256:$comparison_report_sha256, signed_artifact_id:$signed_artifact_id, signed_artifact_digest:$signed_artifact_digest, reproducibility_status:$reproducibility_status, runner_image_drift:$runner_image_drift} + (if $canary_namespace == "" then {} else {canary_namespace:$canary_namespace, canary_release_sha:$canary_release_sha, canary_source_sha:$canary_source_sha, canary_signed_artifact_name:$canary_signed_artifact_name, canary_signed_artifact_digest:$canary_signed_artifact_digest, canary_run_id:$run, canary_run_attempt:$attempt} end)' \

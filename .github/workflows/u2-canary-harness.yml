@@ -246,6 +246,7 @@ jobs:
             "$expected_signed_name"
             "$expected_attest_input_name"
           )
+          SIGNED_ARTIFACT_API_DIGEST=""
           for index in "${!artifact_ids[@]}"; do
             artifact_id="${artifact_ids[$index]}"
             expected_name="${expected_names[$index]}"
@@ -261,11 +262,44 @@ jobs:
               "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}")
             owner_run=$(jq -r '.workflow_run.id // empty' <<<"$metadata")
             actual_name=$(jq -r '.name // empty' <<<"$metadata")
+            actual_digest=$(jq -r '.digest // empty' <<<"$metadata")
             [[ "$owner_run" == "$RUN_ID" && "$actual_name" == "$expected_name" ]] || {
               echo "::error::shared pipeline artifact is not exact-run owned"
               exit 1
             }
+            if [[ "$artifact_id" == "$SIGNED_ARTIFACT_ID" ]]; then
+              SIGNED_ARTIFACT_API_DIGEST="$actual_digest"
+            fi
           done
+
+          normalize_artifact_digest() {
+            local digest="$1"
+            if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              printf '%s\n' "$digest"
+              return 0
+            fi
+            if [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              printf 'sha256:%s\n' "$digest"
+              return 0
+            fi
+            echo "::error::artifact digest is not a normalized SHA-256 value" >&2
+            return 1
+          }
+
+          assert_artifact_digest() {
+            local pipeline_digest="$1"
+            local api_digest="$2"
+            local normalized_pipeline
+            local normalized_api
+            normalized_pipeline=$(normalize_artifact_digest "$pipeline_digest") || return 1
+            normalized_api=$(normalize_artifact_digest "$api_digest") || return 1
+            if [[ "$normalized_pipeline" != "$normalized_api" ]]; then
+              echo "::error::pipeline and GitHub artifact digests differ"
+              return 1
+            fi
+          }
+          assert_artifact_digest "$SIGNED_ARTIFACT_DIGEST" "$SIGNED_ARTIFACT_API_DIGEST"
+          SIGNED_ARTIFACT_DIGEST_NORMALIZED=$(normalize_artifact_digest "$SIGNED_ARTIFACT_API_DIGEST")
 
           actual_signed_sha=$(sha256sum "$signed" | awk '{print $1}')
           SIGNED_SHA="$actual_signed_sha"
@@ -327,7 +361,7 @@ jobs:
               --arg release "$RELEASE_SHA" \
               --arg source "$SOURCE_SHA" \
               --arg artifact_name "$CANARY_ARTIFACT_NAME" \
-              --arg artifact_digest "$SIGNED_ARTIFACT_DIGEST" \
+              --arg artifact_digest "$SIGNED_ARTIFACT_DIGEST_NORMALIZED" \
               --arg run "$RUN_ID" \
               --arg attempt "$RUN_ATTEMPT" \
               --arg signed "$SIGNED_SHA" \
@@ -377,7 +411,7 @@ jobs:
             --arg signed_sha "$actual_signed_sha" \
             --arg signer_sha "$signer_sha" \
             --arg artifact_name "$CANARY_ARTIFACT_NAME" \
-            --arg artifact_digest "$SIGNED_ARTIFACT_DIGEST" \
+            --arg artifact_digest "$SIGNED_ARTIFACT_DIGEST_NORMALIZED" \
             --arg workflow_identity 'https://github.com/slashinchi/TVBoxOS-Mobile/.github/workflows/rc-pipeline.yml@refs/heads/patched' \
             '{schema:"tvbox-u2-canary-verification-v1", namespace:$namespace, release_sha:$release_sha, source_sha:$source_sha, run:$run, attempt:$attempt, signed_artifact_id:$artifact_id, signed_artifact_name:$artifact_name, signed_artifact_digest:$artifact_digest, signed_sha256:$signed_sha, signer_sha256:$signer_sha, workflow_identity:$workflow_identity, slsa_attestation:"verified", release_identity_attestation:"verified"}' \
             > "$evidence_root/verification.json"
@@ -414,6 +448,9 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          BUILD_RESULT: ${{ needs.build_rc.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
         run: |
           set -euo pipefail
 
@@ -482,15 +519,43 @@ jobs:
             "${CANARY_NAMESPACE}-verification"
           )
           cleanup_failures=()
-          if ! artifacts=$(GH_TOKEN="$GH_TOKEN" gh api \
+          for run_result in "$GATE_RESULT" "$BUILD_RESULT" "$VERIFY_RESULT"; do
+            if [[ "$run_result" != "success" ]]; then
+              cleanup_failures+=("upstream-run-incomplete:$run_result")
+            fi
+          done
+          if ! artifact_pages=$(GH_TOKEN="$GH_TOKEN" gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100"); then
             cleanup_failures+=("artifact-list")
-            artifacts='{"artifacts":[]}'
+            artifact_pages='[]'
+          fi
+          if ! artifacts=$(jq -c '[.[] | .artifacts[]]' <<<"$artifact_pages"); then
+            cleanup_failures+=("artifact-list-shape")
+            artifacts='[]'
+          fi
+          artifact_count=$(jq 'length' <<<"$artifacts")
+          if [[ "$artifact_count" == "0" ]]; then
+            cleanup_failures+=("empty-artifact-list")
+          fi
+          allowed_names=$(printf '%s\n' "${expected_names[@]}" | jq -R -s 'split("\n") | map(select(length > 0))')
+          if ! unknown_names=$(jq -r --argjson allowed "$allowed_names" \
+            'map(select(.name as $artifact_name | ($allowed | index($artifact_name) | not))) | .[] | .name' \
+            <<<"$artifacts"); then
+            cleanup_failures+=("unknown-artifact-scan")
+            unknown_names=''
+          fi
+          while IFS= read -r unknown_name; do
+            if [[ -n "$unknown_name" ]]; then
+              cleanup_failures+=("unknown-artifact:$unknown_name")
+            fi
+          done <<<"$unknown_names"
+          if [[ ${#cleanup_failures[@]} -gt 0 ]]; then
+            echo "::warning::current run contains cleanup findings; exact allowlist processing continues"
           fi
           for index in "${!expected_names[@]}"; do
             expected_name="${expected_names[$index]}"
             if ! matches=$(jq -r --arg expected_name "$expected_name" \
-              '.artifacts[] | select(.name == $expected_name) | .id' <<<"$artifacts"); then
+              '[.[] | select(.name == $expected_name) | .id] | .[]' <<<"$artifacts"); then
               cleanup_failures+=("$expected_name")
               continue
             fi
