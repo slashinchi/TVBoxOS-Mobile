@@ -401,6 +401,47 @@ class U2ReleaseContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     canonical_release_baseline([dict(release, versionCode=version_code)])
 
+    def test_canonical_release_baseline_matches_strict_ledger_shapes_and_production_legacy(self):
+        production = json.loads((ROOT / "gradle/verified-releases.json").read_text())
+        baseline = canonical_release_baseline(production)
+        self.assertEqual(baseline["tag"], "v2.1.26.1")
+
+        complete = dict(
+            production[0],
+            tag="v2.1.27.1",
+            versionName="2.1.27.1",
+            versionCode=23701,
+            target="a" * 40,
+            updateSha256="b" * 64,
+            sourceSha="c" * 40,
+            debt="d" * 64,
+            runId="123456",
+            runAttempt="1",
+        )
+        self.assertEqual(canonical_release_baseline([complete])["tag"], "v2.1.27.1")
+
+        with self.assertRaises(ValueError):
+            canonical_release_baseline([dict(production[0], unexpected="field")])
+        duplicate_target = dict(
+            production[0],
+            tag="v2.1.27.1",
+            versionName="2.1.27.1",
+            versionCode=23701,
+        )
+        with self.assertRaises(ValueError):
+            canonical_release_baseline([production[0], duplicate_target])
+        with self.assertRaises(ValueError):
+            canonical_release_baseline([dict(complete, updateSha256="invalid")])
+        legacy_after_complete = dict(
+            production[0],
+            tag="v2.1.28.1",
+            versionName="2.1.28.1",
+            versionCode=23801,
+            target="e" * 40,
+        )
+        with self.assertRaises(ValueError):
+            canonical_release_baseline([complete, legacy_after_complete])
+
     def test_delivery_hold_is_identity_bound_not_boolean(self):
         release = {
             "tag": "v2.1.26.1",
@@ -1427,6 +1468,26 @@ class U2ReleaseContractTests(unittest.TestCase):
             "current-ledger",
         ):
             self.assertIn(token, preflight, token)
+
+    def test_u2_promote_is_locked_to_the_preflight_live_patched_sha(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        steps = tree["jobs"]["publish"]["steps"]
+        preflight = next(s for s in steps if s.get("name") == "Preflight verified release metadata")
+        self.assertEqual(preflight.get("id"), "preflight")
+        preflight_text = str(preflight)
+        self.assertIn('echo "remote_head_before=$remote_head_before" >> "$GITHUB_OUTPUT"', preflight_text)
+
+        promote = next(s for s in steps if s.get("name") == "Promote patched to exact release SHA (CAS)")
+        promote_text = promote["run"]
+        self.assertIn("steps.preflight.outputs.remote_head_before", str(promote))
+        live_read = promote_text.index("git ls-remote")
+        current_decision = promote_text.index('if [[ "$current" == "$RELEASE_SHA" ]]')
+        recovery_decision = promote_text.index('git merge-base --is-ancestor "$RELEASE_SHA" "$current"')
+        self.assertLess(live_read, min(current_decision, recovery_decision))
+        self.assertIn('[[ "$live_remote_sha" == "$preflight_sha" ]]', promote_text)
+        self.assertIn('[[ "$current" == "$preflight_sha" ]]', promote_text)
+        self.assertIn("refusing to continue", promote_text)
 
     def test_u2_metadata_retry_uses_porcelain_status_and_remote_sha_not_log_grep(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()

@@ -215,8 +215,14 @@ def _validate_ledger(ledger):
     targets = set()
     previous_version = None
     previous_version_code = None
+    complete_seen = False
     for entry in ledger:
         validated = _validate_ledger_entry(entry)
+        fields = set(validated)
+        if complete_seen and fields == set(LEGACY_RELEASE_FIELDS):
+            raise ValueError("legacy verified release entry after complete identity")
+        if fields == set(VERIFIED_RELEASE_FIELDS):
+            complete_seen = True
         version = tuple(int(part) for part in validated["versionName"].split("."))
         version_code = validated["versionCode"]
         if previous_version is not None and (

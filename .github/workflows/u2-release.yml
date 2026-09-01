@@ -702,6 +702,7 @@ jobs:
            echo "::notice::default branch patched + release-production environment confirmed (immutable releases enforced per-Release post-publish)"
 
       - name: Preflight verified release metadata
+        id: preflight
         env:
           RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
           EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
@@ -766,6 +767,7 @@ jobs:
           printf '%s' "$current_ledger_b64" | base64 -d > "$current_ledger" || { echo "::error::current verified-release ledger preflight decode failed"; exit 1; }
           remote_head_after=$(git ls-remote origin refs/heads/patched | awk 'NF {print $1}')
           [[ "$remote_head_after" == "$remote_head_before" ]] || { echo "::error::patched moved during read-only metadata preflight"; exit 1; }
+          echo "remote_head_before=$remote_head_before" >> "$GITHUB_OUTPUT"
 
           preflight_ledger="$RUNNER_TEMP/u2-preflight-reconciled-ledger.json"
           preflight=$(python3 scripts/u2_publish.py reconcile-verified-release-metadata \
@@ -782,11 +784,28 @@ jobs:
         env:
           RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
           EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          PREFLIGHT_REMOTE_SHA: ${{ steps.preflight.outputs.remote_head_before }}
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
         run: |
           set -euo pipefail
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          preflight_sha="${PREFLIGHT_REMOTE_SHA:-}"
+          [[ "$preflight_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::preflight patched SHA is empty or invalid; refusing to continue"; exit 1;
+          }
+          live_remote_sha=$(git ls-remote origin refs/heads/patched | awk 'NF {print $1}') || {
+            echo "::error::cannot read live patched SHA during promote preflight; refusing to continue"; exit 1;
+          }
+          [[ "$live_remote_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::live patched SHA is empty or invalid; refusing to continue"; exit 1;
+          }
+          [[ "$live_remote_sha" == "$preflight_sha" ]] || {
+            echo "::error::patched moved since metadata preflight; refusing to continue"; exit 1;
+          }
           current=$(git rev-parse refs/heads/patched)
+          [[ "$current" == "$preflight_sha" ]] || {
+            echo "::error::local patched ref does not match metadata preflight SHA; refusing to continue"; exit 1;
+          }
           tag="v${EXPECTED_VERSION}"
           if [[ "$current" == "$RELEASE_SHA" ]]; then
             echo "::notice::patched already at release SHA; no promote needed"

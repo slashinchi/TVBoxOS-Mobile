@@ -433,6 +433,24 @@ class U2PublishContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             u2_publish_module.reconcile_verified_releases(descending, candidate)
 
+    def test_verified_release_reconcile_rejects_legacy_entry_after_complete_entry(self):
+        complete = _verified_entry()
+        production_legacy = json.loads(
+            (ROOT / "gradle/verified-releases.json").read_text()
+        )[0]
+        legacy_after = dict(
+            production_legacy,
+            tag="v2.1.28.1",
+            versionName="2.1.28.1",
+            versionCode=23801,
+            target="1" * 40,
+        )
+        candidate = _versioned_entry("2.1.29.1", 23901, "2" * 40, "3" * 40)
+        with self.assertRaisesRegex(ValueError, "legacy"):
+            u2_publish_module.reconcile_verified_releases(
+                [complete, legacy_after], candidate
+            )
+
     def test_verified_release_reconcile_recovers_same_release_with_new_run_attempt(self):
         prior = dict(_verified_entry(), runId="123456", runAttempt="1")
         replay = dict(prior, runAttempt="2")

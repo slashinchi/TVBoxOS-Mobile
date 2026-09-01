@@ -48,6 +48,24 @@ FORK_CONTROL_FILES = {
     "NOTICE.md",
 }
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".adoc", ".rst")
+LEGACY_RELEASE_FIELDS = frozenset({
+    "tag",
+    "target",
+    "versionName",
+    "versionCode",
+    "assetSha256",
+    "signerSha256",
+    "verified",
+    "tag_ancestor",
+})
+COMPLETE_RELEASE_FIELDS = frozenset({
+    *LEGACY_RELEASE_FIELDS,
+    "updateSha256",
+    "sourceSha",
+    "debt",
+    "runId",
+    "runAttempt",
+})
 
 
 def _reject_duplicate_object_keys(pairs):
@@ -336,18 +354,34 @@ def canonical_release_baseline(releases, update_version=None, delivery_hold=Fals
     if not isinstance(releases, list):
         raise ValueError("verified release ledger must be a JSON array")
     valid = []
+    identities = set()
+    tags = set()
+    versions = set()
+    version_codes = set()
+    targets = set()
     previous_version = None
     previous_version_code = None
+    complete_seen = False
     for release in releases:
         if not isinstance(release, dict):
             raise ValueError("verified release ledger entry must be an object")
+        fields = set(release)
+        if fields not in {LEGACY_RELEASE_FIELDS, COMPLETE_RELEASE_FIELDS}:
+            raise ValueError("malformed verified release ledger entry")
+        is_complete = fields == COMPLETE_RELEASE_FIELDS
+        if complete_seen and not is_complete:
+            raise ValueError("legacy verified release entry after complete identity")
+        if is_complete:
+            complete_seen = True
         required = ("tag", "target", "versionName", "versionCode", "assetSha256", "signerSha256")
         if any(key not in release or release.get(key) in (None, "") for key in required):
             raise ValueError("malformed verified release ledger entry")
-        if not re.fullmatch(r"v[0-9]+(?:\.[0-9]+){3}", release["tag"]):
+        if not isinstance(release["tag"], str) or not re.fullmatch(r"v[0-9]+(?:\.[0-9]+){3}", release["tag"]):
             raise ValueError("verified release tag is invalid")
-        if not FULL_SHA_RE.fullmatch(release["target"]):
+        if not isinstance(release["target"], str) or not FULL_SHA_RE.fullmatch(release["target"]):
             raise ValueError("verified release target SHA is invalid")
+        if not isinstance(release["versionName"], str):
+            raise ValueError("verified release version is invalid")
         release_version = _version_tuple(release["versionName"])
         if release["tag"] != f"v{release['versionName']}":
             raise ValueError("verified release tag/version mismatch")
@@ -355,32 +389,49 @@ def canonical_release_baseline(releases, update_version=None, delivery_hold=Fals
             isinstance(release["versionCode"], bool)
             or not isinstance(release["versionCode"], int)
             or int(release["versionCode"]) <= 0
+            or not isinstance(release["assetSha256"], str)
             or not HEX64_RE.fullmatch(release["assetSha256"])
+            or not isinstance(release["signerSha256"], str)
             or not HEX64_RE.fullmatch(release["signerSha256"])
         ):
             raise ValueError("verified release version or digest is invalid")
         if release.get("verified") is not True or release.get("tag_ancestor") is not True:
             raise ValueError("verified release flags must be true")
+        identity = (release["tag"], release["versionName"], release["target"])
+        if (
+            identity in identities
+            or release["tag"] in tags
+            or release["versionName"] in versions
+            or release["versionCode"] in version_codes
+            or release["target"] in targets
+        ):
+            raise ValueError("duplicate verified release identity")
         release_version_code = release["versionCode"]
         if previous_version is not None and (
             release_version <= previous_version
             or release_version_code <= previous_version_code
         ):
             raise ValueError("verified release ledger is not strictly increasing")
-        optional_identity = {"updateSha256", "sourceSha", "debt", "runId", "runAttempt"}
-        present_identity = optional_identity & release.keys()
-        if present_identity and present_identity != optional_identity:
-            raise ValueError("incomplete verified release identity")
-        if present_identity:
+        if is_complete:
             if (
-                not HEX64_RE.fullmatch(release["updateSha256"])
+                not isinstance(release["updateSha256"], str)
+                or not HEX64_RE.fullmatch(release["updateSha256"])
+                or not isinstance(release["sourceSha"], str)
                 or not FULL_SHA_RE.fullmatch(release["sourceSha"])
+                or not isinstance(release["debt"], str)
                 or not HEX64_RE.fullmatch(release["debt"])
-                or not re.fullmatch(r"[1-9][0-9]*", str(release["runId"] or ""))
-                or not re.fullmatch(r"[1-9][0-9]*", str(release["runAttempt"] or ""))
+                or not isinstance(release["runId"], str)
+                or not isinstance(release["runAttempt"], str)
+                or not re.fullmatch(r"[1-9][0-9]*", release["runId"])
+                or not re.fullmatch(r"[1-9][0-9]*", release["runAttempt"])
             ):
                 raise ValueError("verified release identity is invalid")
         valid.append(release)
+        identities.add(identity)
+        tags.add(release["tag"])
+        versions.add(release["versionName"])
+        version_codes.add(release["versionCode"])
+        targets.add(release["target"])
         previous_version = release_version
         previous_version_code = release_version_code
     if not valid:
