@@ -140,6 +140,7 @@ jobs:
       id-token: write
       attestations: write
     uses: ./.github/workflows/rc-pipeline.yml
+    secrets: inherit
     with:
       release_sha: ${{ needs.gate.outputs.expected_sha }}
       source_sha: ${{ needs.gate.outputs.expected_sha }}

@@ -2062,6 +2062,16 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertEqual(build["permissions"]["id-token"], "write")
         self.assertEqual(build["permissions"]["attestations"], "write")
 
+    def test_u2_canary_inherits_only_the_called_workflow_secret_boundary(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        pipeline = RC_WORKFLOW.read_text()
+        tree = self._yaml_tree(workflow)
+        build = tree["jobs"]["build_rc"]
+        self.assertEqual(build["secrets"], "inherit")
+        self.assertIn("environment: release-signing", pipeline)
+        self.assertIn("Sign exact APK with the only secret-bearing step", pipeline)
+        self.assertNotIn("TVBOX_RELEASE_TOKEN", workflow + pipeline)
+
         verify = tree["jobs"]["verify"]
         verify_text = self._job_block(workflow, "verify")
         self.assertEqual(verify["permissions"]["actions"], "read")
