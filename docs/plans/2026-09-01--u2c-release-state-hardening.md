@@ -75,13 +75,13 @@
 - Add CLI `reconcile-verified-releases --ledger --entry --output`.
 - Add `verify_verified_releases(metadata_bytes, expected_entry) -> dict` for exact remote readback.
 
-- [ ] **Step 1: Write failing tests** for complete entry construction, exact replay idempotency, same tag/version/target conflict, malformed ledger, and exact JSON byte readback.
-- [ ] **Step 2:** Run focused tests and confirm the new functions/CLI are absent or fail.
-- [ ] **Step 3:** Implement the pure entry/reconcile/readback helpers with strict full-SHA, SHA-256, version, and positive version-code validation.
-- [ ] **Step 4:** Add a CLI round-trip test using temporary ledger and metadata files.
-- [ ] **Step 5:** Replace the publish metadata step with a bounded normal-CAS loop: fetch remote `patched`, reread both remote files, reconcile both, commit both files together, push normally, and retry only after a fresh read/rebuild on non-fast-forward.
-- [ ] **Step 6:** Make remote read failure, malformed ledger/update, different same-version identity, and retry exhaustion fail closed; keep exact identity recovery idempotent.
-- [ ] **Step 7:** Verify both remote blobs byte-exactly after a successful push and commit the batch.
+- [x] **Step 1: Write failing tests** for complete entry construction, exact replay idempotency, same tag/version/target conflict, malformed ledger, and exact JSON byte readback.
+- [x] **Step 2:** Run focused tests and confirm the new functions/CLI are absent or fail.
+- [x] **Step 3:** Implement the pure entry/reconcile/readback helpers with strict full-SHA, SHA-256, version, and positive version-code validation.
+- [x] **Step 4:** Add a CLI round-trip test using temporary ledger and metadata files.
+- [x] **Step 5:** Replace the publish metadata step with a bounded normal-CAS loop: fetch remote `patched`, reread both remote files, reconcile both, commit both files together, push normally, and retry only after a fresh read/rebuild on non-fast-forward.
+- [x] **Step 6:** Make remote read failure, malformed ledger/update, different same-version identity, and retry exhaustion fail closed; keep exact identity recovery idempotent.
+- [x] **Step 7:** Verify both remote blobs byte-exactly after a successful push and commit the batch; five review rounds and scoped re-reviews are clean.
 
 ### Task 4: Manual Intent, Trusted NOOP, and Publish Identity Freeze
 
