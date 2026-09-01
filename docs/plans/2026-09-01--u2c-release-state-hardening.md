@@ -103,16 +103,16 @@
 **Files:**
 - Create: `.github/workflows/u2-canary-harness.yml`
 - Modify: `.github/workflows/rc-pipeline.yml` for the controlled canary artifact-name prefix only
-- Modify: `.github/workflows/rc-control.yml` only if the canary requires an explicit deprecation guard
+- Delete: `.github/workflows/rc-control.yml` after the canary and drain gates pass
 - Modify: `scripts/tests/test_u2_release.py`
 - Modify: `docs/plans/2026-09-01--u2c-release-state-hardening.md`
 
 - [x] **Step 1:** Add structural tests requiring dispatch-only actor gating, exact run-owned canary namespace, no production tag/Release/update writes, same `rc-pipeline.yml` reference, and `always()` cleanup.
 - [x] **Step 2:** Implement the harness and the controlled `rc-pipeline.yml` canary artifact prefix with exact-run cleanup; the explicitly authorized canary may use the isolated signer only for a non-published artifact and must never wildcard-delete `rc-control-*`, formal `v*`, Releases, rulesets, or policies.
-  - D-050 fix batch adds dual actor gating (`github.actor` and `github.triggering_actor`), strict reusable-workflow namespace validation, namespaced names and outputs for every RC artifact, predicate-bound canary source/release/artifact/run identity, and failure-tolerant exact-name cleanup. The named harness is the only signer exception; it creates no draft, ref, PR, Release, or production-metadata object. Remote canary, drain, retirement, and flag changes remain pending Steps 3-6.
+  - D-050 fix batch adds dual actor gating (`github.actor` and `github.triggering_actor`), strict reusable-workflow namespace validation, namespaced names and outputs for every RC artifact, predicate-bound canary source/release/artifact/run identity, and failure-tolerant exact-name cleanup. The named harness is the only signer exception; it creates no draft, ref, PR, Release, or production-metadata object.
   - Fix round 1 binds the reusable namespace to the current caller run/attempt and the patched canary harness workflow, paginates the complete current-run artifact set, flags unknown names as `REVIEW_PENDING`, aggregates partial deletion failures, rejects empty/incomplete runs, and compares the GitHub artifact API digest with the normalized pipeline/predicate digest.
-- [ ] **Step 3:** Merge workflow changes through PR, run the harness with `TVBOX_U2_ENABLED=false`, and verify signer, APK, full SAN workflow identity, attestation, and zero residue.
-- [ ] **Step 4:** Drain Actions runs, queued runs, and pending deployments before changing any reviewer or signer ingress policy; record the readback.
+- [x] **Step 3:** Merge workflow changes through PR, run the harness with `TVBOX_U2_ENABLED=false`, and verify signer, APK, full SAN workflow identity, attestation, and zero residue. PR #32 merged at `28aabd14`; canary run `33517784492` passed with namespace `u2-canary-33517784492-attempt-1`, both attestations verified, and zero current-run artifacts after exact cleanup.
+- [x] **Step 4:** Drain Actions runs, queued runs, and pending deployments before changing any reviewer or signer ingress policy; record the readback. No non-completed Actions runs or pending deployments remained; deployment `6203110466` finished successfully.
 - [ ] **Step 5:** Disable `rc-control-v1` ingress and remove its workflow/tag policy only in a separate PR after canary evidence; if any active consumer or cleanup residue remains, return `REVIEW_PENDING` instead of deleting broadly.
 - [ ] **Step 6:** Re-run local and remote CI, verify formal Release `v2.1.26.1`, production `update.json`, signing secrets, and `TVBOX_U2_ENABLED=false` are unchanged.
 
