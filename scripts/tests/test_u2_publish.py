@@ -69,6 +69,18 @@ def _verified_entry():
     )
 
 
+def _versioned_entry(version, version_code, target, source):
+    entry = _verified_entry()
+    entry.update({
+        "tag": f"v{version}",
+        "versionName": version,
+        "versionCode": version_code,
+        "target": target,
+        "sourceSha": source,
+    })
+    return entry
+
+
 class U2PublishContractTests(unittest.TestCase):
     def test_expected_asset_set_is_exact_version_contract(self):
         self.assertEqual(
@@ -412,6 +424,22 @@ class U2PublishContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             u2_publish_module.reconcile_verified_releases([entry], same_target)
 
+    def test_verified_release_reconcile_rejects_existing_ledger_order_regression(self):
+        descending = [
+            _versioned_entry("2.1.28.1", 23801, "1" * 40, "2" * 40),
+            _versioned_entry("2.1.27.1", 23701, "3" * 40, "4" * 40),
+        ]
+        candidate = _versioned_entry("2.1.29.1", 23901, "5" * 40, "6" * 40)
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_releases(descending, candidate)
+
+    def test_verified_release_reconcile_recovers_same_release_with_new_run_attempt(self):
+        prior = dict(_verified_entry(), runId="123456", runAttempt="1")
+        replay = dict(prior, runAttempt="2")
+        result = u2_publish_module.reconcile_verified_releases([prior], replay)
+        self.assertEqual(result["action"], "exact-reuse")
+        self.assertEqual(result["ledger"], [prior])
+
     def test_verified_release_reconcile_rejects_malformed_or_non_monotonic_ledger(self):
         entry = _verified_entry()
         with self.assertRaises(ValueError):
@@ -459,6 +487,109 @@ class U2PublishContractTests(unittest.TestCase):
             u2_publish_module.verify_verified_releases(
                 (json.dumps([dict(entry, runAttempt="3")], sort_keys=True) + "\n").encode(), entry
             )["verified"]
+        )
+        duplicate = (
+            '{"tag":"v2.1.27.1","tag":"v2.1.27.1",'
+            '"target":"' + TARGET + '"}'
+        ).encode()
+        self.assertFalse(u2_publish_module.verify_verified_releases(duplicate, entry)["verified"])
+
+    def test_strict_json_parser_rejects_duplicate_update_keys(self):
+        update = '{"version":"2.1.27.1","version":"2.1.27.1","apk_url":"https://example.invalid/apk"}'
+        with self.assertRaises(ValueError):
+            u2_publish_module.strict_json_loads(update)
+        with self.assertRaises(ValueError):
+            u2_publish_module.parse_update_metadata(update.encode())
+        self.assertFalse(
+            u2_publish_module.verify_remote_metadata(
+                update.encode(),
+                VERSION,
+                "https://example.invalid/apk",
+            )["verified"]
+        )
+
+    def test_verified_release_metadata_preflight_rejects_duplicate_ledger_and_binds_two_blobs(self):
+        current_url = "https://example.invalid/current.apk"
+        candidate_url = "https://example.invalid/candidate.apk"
+        current_update = json.dumps({"version": "2.1.26.1", "apk_url": current_url}, indent=2).encode()
+        candidate_update = (json.dumps({"version": VERSION, "apk_url": candidate_url}, sort_keys=True) + "\n").encode()
+        entry = dict(_verified_entry(), updateSha256=hashlib.sha256(candidate_update).hexdigest())
+        result = u2_publish_module.reconcile_verified_release_metadata(
+            current_update,
+            b"[]\n",
+            candidate_update,
+            entry,
+        )
+        self.assertEqual(result["action"], "append")
+        self.assertEqual(result["ledger"], [entry])
+
+        duplicate_ledger = b'[{"tag":"v2.1.26.1","tag":"v2.1.26.1"}]'
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_release_metadata(
+                current_update,
+                duplicate_ledger,
+                candidate_update,
+                entry,
+            )
+
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_release_metadata(
+                current_update,
+                b"[]\n",
+                candidate_update,
+                dict(entry, updateSha256="0" * 64),
+            )
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_release_metadata(
+                b'{"version":"2.1.27.1","version":"2.1.27.1","apk_url":"https://example.invalid/current.apk"}',
+                b"[]\n",
+                candidate_update,
+                entry,
+            )
+        for malformed in (
+            b'[]',
+            b'{"version":123,"apk_url":"https://example.invalid/apk"}',
+            b'{"version":"2.1.27.1","apk_url":123}',
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(ValueError):
+                    u2_publish_module.parse_update_metadata(malformed)
+
+    def test_metadata_cas_harness_retries_only_on_fresh_porcelain_nff(self):
+        sha_a = "a" * 40
+        sha_b = "b" * 40
+        rejected = "!\trefs/heads/patched:refs/heads/patched\t[rejected] (non-fast-forward)"
+        accepted = "=\trefs/heads/patched:refs/heads/patched\t[up to date]"
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                0, accepted, sha_a, sha_a, sha_a, 1, 3
+            )["action"],
+            "success",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                1, rejected, sha_a, sha_a, sha_b, 1, 3
+            )["action"],
+            "retry",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                1, rejected, sha_a, sha_a, sha_b, 3, 3
+            )["action"],
+            "retry-exhausted",
+        )
+        actual_git_rejected = "!\tHEAD:refs/heads/patched\t[rejected] (non-fast-forward)"
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                1, actual_git_rejected, sha_a, sha_a, sha_b, 1, 3
+            )["action"],
+            "retry",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                1, "fatal: authentication failed", sha_a, sha_a, sha_a, 1, 3
+            )["action"],
+            "fail",
         )
 
     def test_reconcile_verified_releases_cli_round_trip(self):

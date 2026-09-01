@@ -1390,6 +1390,63 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("git push --force", metadata_text)
         self.assertNotIn("git push -f", metadata_text)
 
+    def test_u2_metadata_preflight_precedes_all_formal_release_mutations(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        steps = tree["jobs"]["publish"]["steps"]
+        names = [step.get("name", "") for step in steps]
+        preflight_index = names.index("Preflight verified release metadata")
+        mutation_indexes = [
+            names.index("Create or reconcile draft Release with exact identity"),
+            names.index("Attach missing assets only (no clobber)"),
+            names.index("Publish verified draft"),
+        ]
+        self.assertLess(preflight_index, min(mutation_indexes))
+        preflight = str(steps[preflight_index])
+        for token in (
+            "update.json",
+            "gradle/verified-releases.json",
+            "reconcile-verified-release-metadata",
+            "current-update",
+            "current-ledger",
+        ):
+            self.assertIn(token, preflight, token)
+
+    def test_u2_metadata_retry_uses_porcelain_status_and_remote_sha_not_log_grep(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        publish = tree["jobs"]["publish"]
+        metadata_step = next(
+            step for step in publish["steps"]
+            if step.get("name") == "Reconcile verified release metadata with bounded normal CAS"
+        )
+        metadata_text = str(metadata_step)
+        for token in (
+            "git push --porcelain",
+            "git ls-remote",
+            "remote_head_before",
+            "remote_head_after",
+            "push_is_non_fast_forward",
+            "awk",
+        ):
+            self.assertIn(token, metadata_text, token)
+        self.assertNotIn("grep -Eq", metadata_text)
+
+    def test_strict_json_parser_is_used_for_release_ledger_cli_input(self):
+        duplicate = '{"tag":"v2.1.26.1","tag":"v2.1.26.1"}'
+        with self.assertRaises(ValueError):
+            u2_release_module.strict_json_loads(duplicate)
+        with tempfile.NamedTemporaryFile(mode="w+", suffix=".json") as file:
+            file.write(duplicate)
+            file.flush()
+            result = subprocess.run(
+                ["python3", "scripts/u2_release.py", "canonical-release-baseline", "--file", file.name],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+
     def test_auto_qualification_requires_real_trusted_replay_evidence(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
         qualify = workflow[workflow.index("  qualify:"):workflow.index("  prep:")]

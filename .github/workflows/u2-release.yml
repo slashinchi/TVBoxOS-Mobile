@@ -828,6 +828,83 @@ jobs:
           [[ "$apk_name" == "$EXPECTED_VERSION" ]] || { echo "::error::publish APK versionName mismatch: $apk_name != $EXPECTED_VERSION"; exit 1; }
           echo "::notice::APK identity independently verified (signer=$signer_sha package=$package_name versionName=$apk_name)"
 
+      - name: Preflight verified release metadata
+        env:
+          RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
+          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          EXPECTED_VERSION_CODE: ${{ needs.prep.outputs.expected_version_code }}
+          EXPECTED_DEBT: ${{ steps.identity.outputs.EXPECTED_DEBT }}
+          EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
+          SIGNER_SHA: ${{ steps.identity.outputs.SIGNER_SHA }}
+          SOURCE_SHA: ${{ needs.rc_summary.outputs.SOURCE_SHA }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          tag="v${EXPECTED_VERSION}"
+          candidate_update="$RUNNER_TEMP/u2-preflight-candidate-update.json"
+          python3 scripts/u2_publish.py build-update-json \
+            --version "$EXPECTED_VERSION" \
+            --apk-url "https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/${tag}/TVBox-Mobile-v${EXPECTED_VERSION}.apk" \
+            --output "$candidate_update" >/dev/null
+          update_digest=$(sha256sum "$candidate_update" | awk '{print $1}')
+          entry_file="$RUNNER_TEMP/u2-preflight-entry.json"
+          python3 - "$tag" "$RELEASE_SHA" "$EXPECTED_VERSION" "$EXPECTED_VERSION_CODE" \
+            "$EXPECTED_APK" "$update_digest" "$SIGNER_SHA" "$SOURCE_SHA" \
+            "$EXPECTED_DEBT" "$RUN_ID" "$RUN_ATTEMPT" > "$entry_file" <<'PY'
+          import json
+          import sys
+
+          from scripts.u2_publish import verified_release_entry
+
+          entry = verified_release_entry(
+              tag=sys.argv[1],
+              target=sys.argv[2],
+              version_name=sys.argv[3],
+              version_code=sys.argv[4],
+              asset_sha256=sys.argv[5],
+              update_sha256=sys.argv[6],
+              signer_sha256=sys.argv[7],
+              source_sha=sys.argv[8],
+              debt=sys.argv[9],
+              run_id=sys.argv[10],
+              run_attempt=sys.argv[11],
+          )
+          print(json.dumps(entry, sort_keys=True))
+          PY
+
+          # Read both blobs without changing the repository. The branch SHA
+          # guards the two API reads against a moving patched ref.
+          remote_head_before=$(git ls-remote origin refs/heads/patched | awk 'NF {print $1}')
+          [[ "$remote_head_before" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::cannot read patched SHA before metadata preflight"; exit 1; }
+          current_update="$RUNNER_TEMP/u2-preflight-current-update.json"
+          current_update_b64=$(GH_TOKEN="$TOKEN" gh api \
+            "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
+            --jq '.content' 2>/dev/null) || { echo "::error::current update.json preflight read failed"; exit 1; }
+          [[ -n "$current_update_b64" ]] || { echo "::error::current update.json preflight content is empty"; exit 1; }
+          printf '%s' "$current_update_b64" | base64 -d > "$current_update" || { echo "::error::current update.json preflight decode failed"; exit 1; }
+          current_ledger="$RUNNER_TEMP/u2-preflight-current-ledger.json"
+          current_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
+            "repos/slashinchi/TVBoxOS-Mobile/contents/gradle/verified-releases.json?ref=patched" \
+            --jq '.content' 2>/dev/null) || { echo "::error::current verified-release ledger preflight read failed"; exit 1; }
+          [[ -n "$current_ledger_b64" ]] || { echo "::error::current verified-release ledger preflight content is empty"; exit 1; }
+          printf '%s' "$current_ledger_b64" | base64 -d > "$current_ledger" || { echo "::error::current verified-release ledger preflight decode failed"; exit 1; }
+          remote_head_after=$(git ls-remote origin refs/heads/patched | awk 'NF {print $1}')
+          [[ "$remote_head_after" == "$remote_head_before" ]] || { echo "::error::patched moved during read-only metadata preflight"; exit 1; }
+
+          preflight_ledger="$RUNNER_TEMP/u2-preflight-reconciled-ledger.json"
+          preflight=$(python3 scripts/u2_publish.py reconcile-verified-release-metadata \
+            --current-update "$current_update" \
+            --current-ledger "$current_ledger" \
+            --candidate-update "$candidate_update" \
+            --entry "$entry_file" \
+            --output "$preflight_ledger") || { echo "::error::strict two-file metadata preflight failed; no Release or tag mutation allowed"; exit 1; }
+          action=$(jq -er '.action' <<<"$preflight") || { echo "::error::metadata preflight returned no action"; exit 1; }
+          [[ "$action" == "append" || "$action" == "exact-reuse" ]] || { echo "::error::unexpected metadata preflight action: $action"; exit 1; }
+          echo "::notice::read-only verified release metadata preflight passed (action=$action, patched=$remote_head_before); formal Release/tag mutations may proceed"
+
       - name: Create or reconcile draft Release with exact identity
         id: release
         env:
@@ -1188,18 +1265,18 @@ jobs:
               echo "::error::remote update.json base64 decode failed; refusing to proceed on an unknown baseline"; exit 1;
             }
             [[ -s "$remote_update" ]] || { echo "::error::remote update.json is empty; refusing to proceed on an unknown baseline"; exit 1; }
-            current_version=$(jq -er 'if type == "object" then (.version // empty) else empty end' "$remote_update") || {
-              echo "::error::remote update.json is malformed or has no readable version; refusing to proceed on an unknown baseline"; exit 1;
+            current_metadata=$(python3 scripts/u2_publish.py parse-update-metadata \
+              --metadata-file "$remote_update") || {
+              echo "::error::remote update.json strict parse/semantic validation failed; refusing to proceed on an unknown baseline"; exit 1;
             }
-            current_url=$(jq -er 'if type == "object" then (.apk_url // empty) else empty end' "$remote_update") || {
-              echo "::error::remote update.json is malformed or has no apk_url; refusing to proceed on an unknown baseline"; exit 1;
+            current_version=$(jq -er '.version' <<<"$current_metadata") || {
+              echo "::error::remote update.json has no readable version; refusing to proceed on an unknown baseline"; exit 1;
             }
-            current_keys=$(jq -ce 'if type == "object" then (keys | sort) else [] end' "$remote_update") || {
-              echo "::error::remote update.json is not a JSON object; refusing to proceed on an unknown baseline"; exit 1;
+            current_url=$(jq -er '.apk_url' <<<"$current_metadata") || {
+              echo "::error::remote update.json has no readable apk_url; refusing to proceed on an unknown baseline"; exit 1;
             }
-            [[ "$current_keys" == '["apk_url","version"]' ]] || {
-              echo "::error::remote update.json has unexpected fields; refusing to proceed on an unknown baseline"; exit 1;
-            }
+            # Do not replace strict JSON parsing with jq's duplicate-folding
+            # `keys | sort` check; the Python helper rejected duplicates above.
             python3 scripts/u2_publish.py build-update-json \
               --version "$current_version" \
               --apk-url "$current_url" \
@@ -1213,9 +1290,14 @@ jobs:
               echo "::error::candidate version is older than current update.json"; exit 1;
             }
             if [[ "$current_version" == "$EXPECTED_VERSION" ]]; then
-              cmp -s "$candidate_update" "$remote_update" || {
-                echo "::error::same-version update.json has a different identity"; exit 1;
-              }
+              python3 - "$candidate_update" "$remote_update" <<'PY'
+          import sys
+
+          from scripts.u2_publish import parse_update_metadata
+
+          if parse_update_metadata(open(sys.argv[1], "rb").read()) != parse_update_metadata(open(sys.argv[2], "rb").read()):
+              raise SystemExit("same-version update.json has a different identity")
+          PY
             fi
 
             remote_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
@@ -1251,26 +1333,54 @@ jobs:
             fi
             git add update.json gradle/verified-releases.json
             git commit -m "chore: reconcile verified release metadata v${EXPECTED_VERSION}"
+            local_parent=$(git rev-parse HEAD^)
+            remote_url="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            remote_head_before=$(git ls-remote "$remote_url" refs/heads/patched | awk 'NF {print $1}')
+            [[ "$remote_head_before" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::cannot read remote patched SHA before metadata push"; exit 1;
+            }
             push_log="$RUNNER_TEMP/u2-metadata-push.log"
             set +e
-            git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/patched > "$push_log" 2>&1
+            git push --porcelain "$remote_url" HEAD:refs/heads/patched > "$push_log" 2>&1
             push_status=$?
             set -e
-            cat "$push_log"
-            if [[ "$push_status" -eq 0 ]]; then
-              echo "::notice::metadata CAS push succeeded on attempt ${attempt}"
-              break
-            fi
-            if grep -Eq 'non-fast-forward|fetch first|\[rejected\]' "$push_log" && [[ "$attempt" -lt 3 ]]; then
-              echo "::notice::patched moved during publish; rebuilding update.json commit on remote HEAD with the verified-release ledger after a fresh read"
-              continue
-            fi
-            if grep -Eq 'non-fast-forward|fetch first|\[rejected\]' "$push_log"; then
-              echo "::error::metadata CAS retry exhaustion after 3 non-fast-forward failures"
-              exit 1
-            fi
-            echo "::error::metadata CAS push failed without a retryable non-fast-forward (status=$push_status)"
-            exit "$push_status"
+            remote_head_after=$(git ls-remote "$remote_url" refs/heads/patched | awk 'NF {print $1}')
+            [[ "$remote_head_after" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::cannot read remote patched SHA after metadata push"; exit 1;
+            }
+            push_is_non_fast_forward=$(awk -F '\t' '
+              $1 == "!" && $2 ~ /:refs\/heads\/patched$/ { print "true"; found=1; exit }
+              END { if (!found) print "false" }
+            ' "$push_log")
+            push_decision=$(python3 scripts/u2_publish.py classify-metadata-push \
+              --status "$push_status" \
+              --porcelain-file "$push_log" \
+              --local-parent "$local_parent" \
+              --remote-before "$remote_head_before" \
+              --remote-after "$remote_head_after" \
+              --attempt "$attempt" \
+              --max-attempts 3) || {
+              echo "::error::metadata push classification failed closed (porcelain_nff=$push_is_non_fast_forward)"; exit 1;
+            }
+            push_action=$(jq -er '.action' <<<"$push_decision") || {
+              echo "::error::metadata push classification returned no action"; exit 1;
+            }
+            case "$push_action" in
+              success)
+                echo "::notice::metadata CAS push succeeded on attempt ${attempt}"
+                break
+                ;;
+              retry)
+                echo "::notice::patched moved during publish; rebuilding update.json commit on remote HEAD with both metadata files after a fresh read (porcelain_nff=$push_is_non_fast_forward, remote_head_before=$remote_head_before, remote_head_after=$remote_head_after)"
+                continue
+                ;;
+              retry-exhausted)
+                echo "::error::metadata CAS retry exhaustion after 3 confirmed non-fast-forward failures"; exit 1
+                ;;
+              *)
+                echo "::error::metadata CAS push failed closed without a confirmed non-fast-forward (status=$push_status)"; exit 1
+                ;;
+            esac
           done
 
           verify_remote_blobs() {
@@ -1304,7 +1414,9 @@ jobs:
 
           from scripts.u2_publish import verify_verified_releases
 
-          expected = json.loads(open(sys.argv[1]).read())
+          from scripts.u2_publish import strict_json_loads
+
+          expected = strict_json_loads(open(sys.argv[1], encoding="utf-8").read())
           actual = open(sys.argv[2], "rb").read()
           print(json.dumps(verify_verified_releases(actual, expected), sort_keys=True))
           PY

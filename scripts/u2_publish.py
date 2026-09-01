@@ -15,6 +15,30 @@ FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 INCIDENT_REASON_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 RUN_ID_RE = re.compile(r"^[1-9][0-9]*$")
 
+
+def _reject_duplicate_object_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def strict_json_loads(value):
+    """Parse JSON without silently accepting duplicate object keys."""
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("JSON must be valid UTF-8") from exc
+    if not isinstance(value, str):
+        raise ValueError("JSON input must be text or UTF-8 bytes")
+    try:
+        return json.loads(value, object_pairs_hook=_reject_duplicate_object_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid JSON") from exc
+
 VERIFIED_RELEASE_FIELDS = (
     "tag",
     "target",
@@ -29,6 +53,9 @@ VERIFIED_RELEASE_FIELDS = (
     "runAttempt",
     "verified",
     "tag_ancestor",
+)
+VERIFIED_RELEASE_STABLE_FIELDS = tuple(
+    field for field in VERIFIED_RELEASE_FIELDS if field not in {"runId", "runAttempt"}
 )
 LEGACY_RELEASE_FIELDS = (
     "tag",
@@ -174,8 +201,16 @@ def _validate_ledger(ledger):
     versions = set()
     version_codes = set()
     targets = set()
+    previous_version = None
+    previous_version_code = None
     for entry in ledger:
         validated = _validate_ledger_entry(entry)
+        version = tuple(int(part) for part in validated["versionName"].split("."))
+        version_code = validated["versionCode"]
+        if previous_version is not None and (
+            version <= previous_version or version_code <= previous_version_code
+        ):
+            raise ValueError("verified release ledger is not strictly increasing")
         identity = (validated["tag"], validated["versionName"], validated["target"])
         if (
             identity in identities
@@ -190,6 +225,8 @@ def _validate_ledger(ledger):
         versions.add(validated["versionName"])
         version_codes.add(validated["versionCode"])
         targets.add(validated["target"])
+        previous_version = version
+        previous_version_code = version_code
     return ledger
 
 
@@ -205,6 +242,10 @@ def reconcile_verified_releases(ledger, entry):
             existing.get("target"),
         )
         if existing == entry:
+            return {"action": "exact-reuse", "ledger": list(ledger)}
+        if all(existing.get(field) == entry[field] for field in VERIFIED_RELEASE_STABLE_FIELDS):
+            # A rerun can have a new workflow attempt after the Release already
+            # exists. Preserve the first durable run identity and reuse it.
             return {"action": "exact-reuse", "ledger": list(ledger)}
         if (
             existing_identity == identity
@@ -228,10 +269,98 @@ def reconcile_verified_releases(ledger, entry):
     return {"action": "append", "ledger": [*ledger, dict(entry)]}
 
 
+def parse_update_metadata(metadata_bytes):
+    """Parse and semantically validate the strict two-field update manifest."""
+    payload = strict_json_loads(metadata_bytes)
+    if not isinstance(payload, dict) or set(payload) != {"version", "apk_url"}:
+        raise ValueError("update metadata must contain exactly version and apk_url")
+    build_update_json(payload["version"], payload["apk_url"])
+    return payload
+
+
+def reconcile_verified_release_metadata(
+    current_update_bytes,
+    current_ledger_bytes,
+    candidate_update_bytes,
+    entry,
+):
+    """Read and reconcile both metadata blobs without mutating either input."""
+    current = parse_update_metadata(current_update_bytes)
+    candidate = parse_update_metadata(candidate_update_bytes)
+    ledger = strict_json_loads(current_ledger_bytes)
+    _validate_ledger(ledger)
+    _validate_verified_release_entry(entry)
+    if candidate["version"] != entry["versionName"]:
+        raise ValueError("candidate update version does not match verified release entry")
+    if hashlib.sha256(candidate_update_bytes).hexdigest() != entry["updateSha256"]:
+        raise ValueError("candidate update digest does not match verified release entry")
+
+    current_version = tuple(int(part) for part in current["version"].split("."))
+    candidate_version = tuple(int(part) for part in candidate["version"].split("."))
+    if candidate_version < current_version:
+        raise ValueError("candidate update version is not monotonic")
+    if candidate_version == current_version and candidate != current:
+        raise ValueError("same-version update metadata has a different identity")
+    if ledger and current["version"] != ledger[-1]["versionName"]:
+        raise ValueError("update metadata does not match the latest verified release")
+
+    result = reconcile_verified_releases(ledger, entry)
+    return {
+        "action": result["action"],
+        "ledger": result["ledger"],
+        "current": current,
+        "candidate": candidate,
+    }
+
+
+def classify_metadata_push(
+    push_status,
+    porcelain_status,
+    local_parent,
+    remote_head_before,
+    remote_head_after,
+    attempt,
+    max_attempts,
+):
+    """Classify a normal metadata push using status and fresh remote refs."""
+    if isinstance(push_status, bool) or not isinstance(push_status, int) or push_status < 0:
+        raise ValueError("push status must be a non-negative integer")
+    _require_full_sha(local_parent, "local metadata parent")
+    _require_full_sha(remote_head_before, "remote metadata head before push")
+    _require_full_sha(remote_head_after, "remote metadata head after push")
+    attempt = _require_positive_integer(attempt, "metadata CAS attempt")
+    max_attempts = _require_positive_integer(max_attempts, "metadata CAS maximum attempts")
+    if attempt > max_attempts:
+        raise ValueError("metadata CAS attempt exceeds maximum")
+
+    rejected = False
+    for line in (porcelain_status or "").splitlines():
+        fields = line.split("\t", 2)
+        if (
+            len(fields) > 1
+            and fields[0] == "!"
+            and fields[1].split(":", 1)[-1] == "refs/heads/patched"
+        ):
+            rejected = True
+            break
+    if push_status == 0 and not rejected:
+        return {"action": "success", "reason": "push-ok"}
+
+    confirmed_nff = rejected and (
+        remote_head_before != local_parent or remote_head_after != remote_head_before
+    )
+    if confirmed_nff:
+        return {
+            "action": "retry" if attempt < max_attempts else "retry-exhausted",
+            "reason": "fresh-remote-head-changed",
+        }
+    return {"action": "fail", "reason": "push-failure-not-confirmed-nff"}
+
+
 def verify_verified_releases(metadata_bytes, expected_entry):
     """Verify that remote ledger bytes contain exactly one canonical entry."""
     try:
-        ledger = json.loads(metadata_bytes.decode("utf-8"))
+        ledger = strict_json_loads(metadata_bytes)
         _validate_ledger(ledger)
         expected = _validate_verified_release_entry(expected_entry)
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
@@ -433,11 +562,9 @@ def verify_release_assets(release, version, expected_digests, download_dir):
 def verify_remote_metadata(metadata_bytes, expected_version, expected_apk_url):
     """Byte-exact remote metadata readback."""
     try:
-        payload = json.loads(metadata_bytes.decode("utf-8"))
-    except Exception:
+        payload = parse_update_metadata(metadata_bytes)
+    except (TypeError, ValueError):
         return {"verified": False, "reason": "invalid-json"}
-    if not isinstance(payload, dict):
-        return {"verified": False, "reason": "invalid-shape"}
     if payload.get("version") != expected_version:
         return {"verified": False, "reason": "version-mismatch"}
     if payload.get("apk_url") != expected_apk_url:
@@ -474,9 +601,9 @@ def verify_delivery_url(url, expected_sha256, fetched_sha256):
 
 def build_update_json(version, apk_url):
     """The canonical root update.json payload for a formal release."""
-    if not VERSION_RE.fullmatch(version or ""):
+    if not isinstance(version, str) or not VERSION_RE.fullmatch(version):
         raise ValueError("update version must be a 4-part numeric version")
-    if not apk_url.startswith("https://"):
+    if not isinstance(apk_url, str) or not apk_url.startswith("https://"):
         raise ValueError("update apk_url must be https")
     return {"version": version, "apk_url": apk_url}
 
@@ -574,6 +701,25 @@ def main(argv=None):
     verified_releases.add_argument("--entry", required=True)
     verified_releases.add_argument("--output", required=True)
 
+    metadata_preflight = subparsers.add_parser("reconcile-verified-release-metadata")
+    metadata_preflight.add_argument("--current-update", required=True)
+    metadata_preflight.add_argument("--current-ledger", required=True)
+    metadata_preflight.add_argument("--candidate-update", required=True)
+    metadata_preflight.add_argument("--entry", required=True)
+    metadata_preflight.add_argument("--output", required=True)
+
+    parse_update = subparsers.add_parser("parse-update-metadata")
+    parse_update.add_argument("--metadata-file", required=True)
+
+    push = subparsers.add_parser("classify-metadata-push")
+    push.add_argument("--status", required=True, type=int)
+    push.add_argument("--porcelain-file", required=True)
+    push.add_argument("--local-parent", required=True)
+    push.add_argument("--remote-before", required=True)
+    push.add_argument("--remote-after", required=True)
+    push.add_argument("--attempt", required=True, type=int)
+    push.add_argument("--max-attempts", required=True, type=int)
+
     released = subparsers.add_parser("released-identity")
     released.add_argument("--release", required=True)
     released.add_argument("--version", required=True)
@@ -609,7 +755,7 @@ def main(argv=None):
     elif args.command == "delivery-compare":
         print(json.dumps({"verified": verify_delivery_url(args.url, args.expected_sha, args.fetched_sha)}, sort_keys=True))
     elif args.command == "reconcile-draft":
-        draft = json.loads(args.draft)
+        draft = strict_json_loads(args.draft)
         decision = reconcile_draft_decision(
             draft,
             args.version,
@@ -621,7 +767,7 @@ def main(argv=None):
         )
         print(json.dumps({"decision": decision, "reuse": decision == "exact-reuse"}, sort_keys=True))
     elif args.command == "verify-release-assets":
-        release = json.loads(args.release)
+        release = strict_json_loads(args.release)
         print(json.dumps(verify_release_assets(
             release,
             args.version,
@@ -636,13 +782,35 @@ def main(argv=None):
         ), sort_keys=True))
     elif args.command == "reconcile-verified-releases":
         result = reconcile_verified_releases(
-            json.loads(Path(args.ledger).read_text()),
-            json.loads(Path(args.entry).read_text()),
+            strict_json_loads(Path(args.ledger).read_text()),
+            strict_json_loads(Path(args.entry).read_text()),
         )
         Path(args.output).write_text(json.dumps(result["ledger"], indent=2) + "\n")
         print(json.dumps({"action": result["action"]}, sort_keys=True))
+    elif args.command == "reconcile-verified-release-metadata":
+        result = reconcile_verified_release_metadata(
+            Path(args.current_update).read_bytes(),
+            Path(args.current_ledger).read_bytes(),
+            Path(args.candidate_update).read_bytes(),
+            strict_json_loads(Path(args.entry).read_text()),
+        )
+        Path(args.output).write_text(json.dumps(result["ledger"], indent=2) + "\n")
+        print(json.dumps({"action": result["action"]}, sort_keys=True))
+    elif args.command == "parse-update-metadata":
+        print(json.dumps(parse_update_metadata(Path(args.metadata_file).read_bytes()), sort_keys=True))
+    elif args.command == "classify-metadata-push":
+        result = classify_metadata_push(
+            args.status,
+            Path(args.porcelain_file).read_text(),
+            args.local_parent,
+            args.remote_before,
+            args.remote_after,
+            args.attempt,
+            args.max_attempts,
+        )
+        print(json.dumps(result, sort_keys=True))
     elif args.command == "released-identity":
-        release = json.loads(args.release)
+        release = strict_json_loads(args.release)
         decision = released_identity_decision(
             release,
             args.version,

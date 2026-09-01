@@ -50,6 +50,30 @@ FORK_CONTROL_FILES = {
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".adoc", ".rst")
 
 
+def _reject_duplicate_object_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def strict_json_loads(value):
+    """Parse JSON without silently accepting duplicate object keys."""
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("JSON must be valid UTF-8") from exc
+    if not isinstance(value, str):
+        raise ValueError("JSON input must be text or UTF-8 bytes")
+    try:
+        return json.loads(value, object_pairs_hook=_reject_duplicate_object_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid JSON") from exc
+
+
 def _full_sha(value, label):
     if not FULL_SHA_RE.fullmatch(value or ""):
         raise ValueError(f"{label} must be a full 40-character lowercase SHA")
@@ -777,16 +801,16 @@ def main(argv=None):
     elif args.command == "debt-manifest":
         print(json.dumps(debt_manifest(Path(args.repo), args.baseline, args.current, args.exclude), ensure_ascii=True))
     elif args.command == "fingerprint-manifest":
-        print(fingerprint_manifest(json.loads(Path(args.file).read_text())))
+        print(fingerprint_manifest(strict_json_loads(Path(args.file).read_text())))
     elif args.command == "plan-version":
-        print(json.dumps(plan_version(args.upstream_name, args.upstream_code, json.loads(Path(args.published_file).read_text()))))
+        print(json.dumps(plan_version(args.upstream_name, args.upstream_code, strict_json_loads(Path(args.published_file).read_text()))))
     elif args.command == "release-trailers":
         print(build_release_trailers(args.source, args.mode, args.upstream, args.version, args.debt, args.pr, args.code))
     elif args.command == "canonical-runtime-dependencies":
         result = canonical_runtime_dependencies(Path(args.file).read_text(), args.configuration)
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     elif args.command == "release-debt":
-        releases = json.loads(Path(args.releases_file).read_text())
+        releases = strict_json_loads(Path(args.releases_file).read_text())
         baseline = canonical_release_baseline(releases)
         debt = cumulative_release_debt(Path(args.repo), baseline["target"], args.current, args.exclude)
         print(json.dumps({
@@ -801,7 +825,7 @@ def main(argv=None):
             "path_count": len(debt["paths"]),
         }, sort_keys=True))
     elif args.command == "canonical-release-baseline":
-        baseline = canonical_release_baseline(json.loads(Path(args.file).read_text()))
+        baseline = canonical_release_baseline(strict_json_loads(Path(args.file).read_text()))
         print(json.dumps({
             "tag": baseline["tag"],
             "target": baseline["target"],
@@ -822,8 +846,8 @@ def main(argv=None):
         else:
             print(json.dumps({"matched": False}, sort_keys=True))
     elif args.command == "qualify-u1":
-        pr = json.loads(args.pr)
-        replay = json.loads(Path(args.replay_file).read_text())
+        pr = strict_json_loads(args.pr)
+        replay = strict_json_loads(Path(args.replay_file).read_text())
         result = qualify_u1_merge(
             before=args.before,
             after=args.after,
@@ -842,7 +866,7 @@ def main(argv=None):
         print(json.dumps(result, sort_keys=True))
     elif args.command == "plan-prep":
         if args.upstream_name:
-            published = json.loads(Path(args.published_file).read_text())
+            published = strict_json_loads(Path(args.published_file).read_text())
             pairs = []
             for item in published:
                 if isinstance(item, dict):
