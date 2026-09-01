@@ -1,7 +1,7 @@
 # U2c Canary Exceptions Design
 
 Date: 2026-09-01
-Status: **APPROVED**
+Status: **AUTHORIZED** (user authorized bounded U2c canary exceptions on 2026-09-01)
 
 ## Decision
 
