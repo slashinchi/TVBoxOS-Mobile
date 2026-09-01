@@ -989,7 +989,8 @@ class U2ReleaseContractTests(unittest.TestCase):
             for line_no, line in enumerate(text.splitlines(), 1):
                 if "environment: release-signing" in line:
                     consumers.append(f"{path.name}:{line_no}")
-        self.assertEqual(consumers, ["rc-pipeline.yml:490"])
+        self.assertEqual(len(consumers), 1)
+        self.assertTrue(consumers[0].startswith("rc-pipeline.yml:"), consumers)
 
     def test_u2_publish_is_the_only_release_write_workflow(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
@@ -2110,6 +2111,7 @@ class U2ReleaseContractTests(unittest.TestCase):
                 "GITHUB_OUTPUT": str(output),
                 "EVENT": "workflow_dispatch",
                 "ACTOR": "slashinchi",
+                "TRIGGERING_ACTOR": "slashinchi",
                 "REF": "refs/heads/patched",
                 "EXPECTED_SHA": expected,
                 "GITHUB_SHA": expected,
@@ -2132,7 +2134,12 @@ class U2ReleaseContractTests(unittest.TestCase):
             self.assertIn("expected_sha=" + expected, written)
             self.assertIn("canary_namespace=u2-canary-12345-attempt-2", written)
 
-            for field, value in (("ACTOR", "intruder"), ("REF", "refs/heads/main"), ("U2_ENABLED", "true")):
+            for field, value in (
+                ("ACTOR", "intruder"),
+                ("TRIGGERING_ACTOR", "intruder"),
+                ("REF", "refs/heads/main"),
+                ("U2_ENABLED", "true"),
+            ):
                 output.write_text("")
                 env[field] = value
                 result = subprocess.run(
@@ -2143,7 +2150,12 @@ class U2ReleaseContractTests(unittest.TestCase):
                     capture_output=True,
                 )
                 self.assertNotEqual(result.returncode, 0, field)
-                env[field] = {"ACTOR": "slashinchi", "REF": "refs/heads/patched", "U2_ENABLED": "false"}[field]
+                env[field] = {
+                    "ACTOR": "slashinchi",
+                    "TRIGGERING_ACTOR": "slashinchi",
+                    "REF": "refs/heads/patched",
+                    "U2_ENABLED": "false",
+                }[field]
 
             invalid_cases = (
                 ("EVENT", "push"),
@@ -2169,6 +2181,269 @@ class U2ReleaseContractTests(unittest.TestCase):
                         "GITHUB_SHA": expected,
                         "FAILURE_INJECTION": "none",
                     }[field]
+
+    def test_u2_canary_gate_requires_original_and_triggering_actor(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        gate = self._job_block(workflow, "gate")
+        gate_run = gate[gate.index("run: |") :]
+        for token in (
+            "TRIGGERING_ACTOR: ${{ github.triggering_actor }}",
+            '[[ "$ACTOR" == "slashinchi" ]]',
+            '[[ "$TRIGGERING_ACTOR" == "slashinchi" ]]',
+            "rerun",
+        ):
+            self.assertIn(token, gate, token)
+        self.assertIn('[[ "$TRIGGERING_ACTOR" == "slashinchi" ]]', gate_run)
+
+    def test_rc_pipeline_canary_namespace_is_strict_and_prefixes_all_artifacts(self):
+        workflow = RC_WORKFLOW.read_text()
+        tree = self._yaml_tree(workflow)
+        call_inputs = tree["on"]["workflow_call"]["inputs"]
+        self.assertEqual(call_inputs["canary_namespace"]["type"], "string")
+        self.assertEqual(call_inputs["canary_namespace"]["required"], "false")
+        self.assertEqual(str(call_inputs["canary_namespace"]["default"]).strip("'\""), "")
+        self.assertIn("validate_canary_namespace", tree["jobs"])
+        validate = self._job_block(workflow, "validate_canary_namespace")
+        validate_run = validate[validate.index("run: |") :]
+        self.assertIn("^u2-canary-[0-9]+-attempt-[0-9]+$", validate_run)
+        self.assertIn("CANARY_NAMESPACE", validate_run)
+        for job_id in ("build_unsigned", "build_repro"):
+            self.assertIn("validate_canary_namespace", str(tree["jobs"][job_id]["needs"]), job_id)
+
+        upload_steps = []
+        for job in tree["jobs"].values():
+            for step in (job.get("steps") or []) if isinstance(job, dict) else []:
+                if isinstance(step, dict) and str(step.get("uses", "")).startswith("actions/upload-artifact@"):
+                    upload_steps.append(step)
+        self.assertEqual(len(upload_steps), 6)
+        for step in upload_steps:
+            self.assertIn("inputs.canary_namespace", str(step.get("with", {}).get("name")), step)
+        for legacy_name in (
+            "tvbox-u2-build-evidence",
+            "tvbox-u2-repro-build-evidence",
+            "tvbox-u2-repro-comparison",
+            "tvbox-u2-sign-input",
+            "tvbox-u2-signed-output",
+            "tvbox-u2-attest-input",
+        ):
+            self.assertIn(f"format('{legacy_name}-{{0}}-{{1}}'", workflow, legacy_name)
+
+        for output_name in (
+            "unsigned_artifact_name",
+            "repro_artifact_name",
+            "reproducibility_report_artifact_name",
+            "sign_input_artifact_name",
+            "signed_artifact_name",
+            "attest_input_artifact_name",
+        ):
+            self.assertIn(output_name, tree["on"]["workflow_call"]["outputs"], output_name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "github-output"
+            env = {**os.environ, "GITHUB_OUTPUT": str(output), "CANARY_NAMESPACE": ""}
+            result = subprocess.run(
+                ["bash", "-c", validate_run], cwd=ROOT, env=env, text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("canary_namespace=", output.read_text())
+            for namespace in (
+                "u2-canary-123-attempt-1",
+                "u2-canary-123-attempt-1-extra",
+                "u2-canary-x-attempt-1",
+                "rc-control-123",
+            ):
+                output.write_text("")
+                env["CANARY_NAMESPACE"] = namespace
+                result = subprocess.run(
+                    ["bash", "-c", validate_run], cwd=ROOT, env=env, text=True, capture_output=True
+                )
+                if namespace == "u2-canary-123-attempt-1":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0, namespace)
+
+    def test_u2_canary_passes_and_verifies_every_namespaced_pipeline_artifact(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        tree = self._yaml_tree(workflow)
+        build = tree["jobs"]["build_rc"]
+        self.assertEqual(build["with"]["canary_namespace"], "${{ needs.gate.outputs.canary_namespace }}")
+        verify = self._job_block(workflow, "verify")
+        cleanup = self._job_block(workflow, "cleanup")
+        for role in (
+            "unsigned_artifact_name",
+            "repro_artifact_name",
+            "reproducibility_report_artifact_name",
+            "sign_input_artifact_name",
+            "signed_artifact_name",
+            "attest_input_artifact_name",
+        ):
+            self.assertIn(f"needs.build_rc.outputs.{role}", verify, role)
+        for role in (
+            "build-evidence",
+            "repro-build-evidence",
+            "repro-comparison",
+            "sign-input",
+            "signed-output",
+            "attest-input",
+        ):
+            self.assertIn(f'${{CANARY_NAMESPACE}}-tvbox-u2-{role}', verify, role)
+            self.assertIn(f'${{CANARY_NAMESPACE}}-tvbox-u2-{role}', cleanup, role)
+        for token in (
+            "cleanup_failures",
+            "if ! delete_artifact",
+            "continue",
+            "REVIEW_PENDING",
+            "GITHUB_STEP_SUMMARY",
+        ):
+            self.assertIn(token, cleanup, token)
+        self.assertIn("actions/runs/${GITHUB_RUN_ID}/artifacts", cleanup)
+        self.assertIn("select(.name == $expected_name)", cleanup)
+        self.assertNotIn("*", cleanup.replace("${CANARY_NAMESPACE}", ""))
+
+    def test_u2_canary_verifier_checks_signed_identity_predicate_fields(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        verifier = self._job_block(workflow, "verify")
+        verifier_run = verifier[verifier.index("run: |") :]
+        for token in (
+            "--format json",
+            "verificationResult",
+            "statement.predicate",
+            "canary_namespace",
+            "canary_release_sha",
+            "canary_source_sha",
+            "canary_signed_artifact_name",
+            "canary_signed_artifact_digest",
+            "canary_run_id",
+            "canary_run_attempt",
+            "signed_sha256",
+            "attestation-identity-mismatch",
+            "refs/heads/main",
+        ):
+            self.assertIn(token, verifier_run, token)
+
+        match = re.search(
+            r"(?ms)^[ \t]*assert_canary_predicate\(\) \{\n.*?^[ \t]*\}\n",
+            verifier_run,
+        )
+        self.assertIsNotNone(match, "predicate checker helper is missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            predicate_path = Path(tmp) / "custom-attestation.json"
+            expected = {
+                "namespace": "u2-canary-123-attempt-1",
+                "release": "a" * 40,
+                "source": "b" * 40,
+                "artifact_name": "u2-canary-123-attempt-1-tvbox-u2-signed-output-b-1",
+                "artifact_digest": "c" * 64,
+                "run": "123",
+                "attempt": "1",
+                "signed": "d" * 64,
+            }
+            predicate_path.write_text(json.dumps([{
+                "verificationResult": {
+                    "statement": {
+                        "subject": [{"digest": {"sha256": expected["signed"]}}],
+                        "predicate": {
+                            "canary_namespace": expected["namespace"],
+                            "canary_release_sha": expected["release"],
+                            "canary_source_sha": expected["source"],
+                            "canary_signed_artifact_name": expected["artifact_name"],
+                            "canary_signed_artifact_digest": expected["artifact_digest"],
+                            "canary_run_id": expected["run"],
+                            "canary_run_attempt": expected["attempt"],
+                            "signed_sha256": expected["signed"],
+                        },
+                    }
+                }
+            }]))
+            env = {
+                **os.environ,
+                "PREDICATE": str(predicate_path),
+                "CANARY_NAMESPACE": expected["namespace"],
+                "RELEASE_SHA": expected["release"],
+                "SOURCE_SHA": expected["source"],
+                "CANARY_ARTIFACT_NAME": expected["artifact_name"],
+                "SIGNED_ARTIFACT_DIGEST": expected["artifact_digest"],
+                "RUN_ID": expected["run"],
+                "RUN_ATTEMPT": expected["attempt"],
+                "SIGNED_SHA": expected["signed"],
+            }
+            check = match.group(0) + "\nassert_canary_predicate \"$PREDICATE\"\n"
+            result = subprocess.run(["bash", "-c", check], cwd=ROOT, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            env["CANARY_NAMESPACE"] = "u2-canary-123-attempt-2"
+            result = subprocess.run(["bash", "-c", check], cwd=ROOT, env=env, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_u2_canary_cleanup_continues_after_one_exact_delete_failure(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        cleanup = self._job_block(workflow, "cleanup")
+        cleanup_run = cleanup[cleanup.index("run: |") :]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "path=\"${@: -1}\"\n"
+                "if [[ \"$path\" == *\"/actions/runs/\"* ]]; then\n"
+                "  printf '{\"artifacts\":[{\"id\":101,\"name\":\"%s\"},{\"id\":102,\"name\":\"%s\"},{\"id\":103,\"name\":\"%s\"},{\"id\":104,\"name\":\"%s\"},{\"id\":105,\"name\":\"%s\"},{\"id\":106,\"name\":\"%s\"},{\"id\":107,\"name\":\"%s\"}]}\\n' \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-build-evidence-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-repro-build-evidence-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-repro-comparison-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-sign-input-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-signed-output-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-attest-input-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-verification\"\n"
+                "  exit 0\n"
+                "fi\n"
+                "id=\"${path##*/}\"\n"
+                "if [[ \"$*\" == *\"--method DELETE\"* ]]; then\n"
+                "  printf '%s\\n' \"$id\" >> \"$GH_DELETE_LOG\"\n"
+                "  [[ \"$id\" != \"102\" ]]\n"
+                "  exit\n"
+                "fi\n"
+                "case \"$id\" in\n"
+                "  101) name=\"$CANARY_NAMESPACE-tvbox-u2-build-evidence-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  102) name=\"$CANARY_NAMESPACE-tvbox-u2-repro-build-evidence-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  103) name=\"$CANARY_NAMESPACE-tvbox-u2-repro-comparison-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  104) name=\"$CANARY_NAMESPACE-tvbox-u2-sign-input-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  105) name=\"$CANARY_NAMESPACE-tvbox-u2-signed-output-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  106) name=\"$CANARY_NAMESPACE-tvbox-u2-attest-input-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  107) name=\"$CANARY_NAMESPACE-verification\";;\n"
+                "  *) exit 1;;\n"
+                "esac\n"
+                "printf '{\"workflow_run\":{\"id\":\"%s\"},\"name\":\"%s\"}\\n' \"$GITHUB_RUN_ID\" \"$name\"\n"
+            )
+            fake_gh.chmod(0o755)
+            summary = root / "summary"
+            delete_log = root / "deletes"
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "EXPECTED_SHA": "a" * 40,
+                "CANARY_NAMESPACE": "u2-canary-123-attempt-1",
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_REPOSITORY": "slashinchi/TVBoxOS-Mobile",
+                "GH_TOKEN": "test-token-not-secret",
+                "GITHUB_STEP_SUMMARY": str(summary),
+                "GH_DELETE_LOG": str(delete_log),
+                "BUILD_ARTIFACT_ID": "101",
+                "REPRO_ARTIFACT_ID": "102",
+                "COMPARISON_ARTIFACT_ID": "103",
+                "SIGN_INPUT_ARTIFACT_ID": "104",
+                "SIGNED_ARTIFACT_ID": "105",
+                "ATTEST_INPUT_ARTIFACT_ID": "106",
+                "VERIFICATION_ARTIFACT_ID": "107",
+            }
+            result = subprocess.run(
+                ["bash", "-c", cleanup_run], cwd=ROOT, env=env, text=True, capture_output=True
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(delete_log.read_text().splitlines(), ["101", "102", "103", "104", "105", "106", "107"])
+            self.assertIn("REVIEW_PENDING", summary.read_text())
 
     def test_u2_intent_is_mutually_exclusive_and_cross_job_identity_is_explicit(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()

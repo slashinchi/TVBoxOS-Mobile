@@ -1,8 +1,9 @@
 name: U2 Canary Harness (exact-run, no publish)
 
-# This is a disposable validation path. It exercises the reviewed reusable RC
-# pipeline and records only non-secret verification evidence. It deliberately
-# has no release, ref, PR, or production-metadata write path.
+# This is the explicitly authorized D-050 U2c exception. It may exercise the
+# reviewed reusable RC pipeline's isolated release-signing job to produce one
+# disposable signed APK and attestations. It deliberately has no formal
+# Release, tag, ref, PR, production-metadata, policy, or secret write path.
 
 on:
   workflow_dispatch:
@@ -44,6 +45,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           REF: ${{ github.ref }}
           GITHUB_SHA: ${{ github.sha }}
           EXPECTED_SHA: ${{ inputs.expected_sha }}
@@ -74,6 +76,10 @@ jobs:
           }
           [[ "$ACTOR" == "slashinchi" ]] || {
             echo "::error::canary harness requires actor slashinchi"
+            exit 1
+          }
+          [[ "$TRIGGERING_ACTOR" == "slashinchi" ]] || {
+            echo "::error::canary harness rejects a non-slashinchi rerun actor"
             exit 1
           }
           [[ "$REF" == "refs/heads/patched" ]] || {
@@ -138,6 +144,7 @@ jobs:
       release_sha: ${{ needs.gate.outputs.expected_sha }}
       source_sha: ${{ needs.gate.outputs.expected_sha }}
       mode: manual-local
+      canary_namespace: ${{ needs.gate.outputs.canary_namespace }}
       upstream_sha: ''
       upstream_version: ''
       upstream_code: ''
@@ -171,10 +178,23 @@ jobs:
         env:
           CANARY_NAMESPACE: ${{ needs.gate.outputs.canary_namespace }}
           RELEASE_SHA: ${{ needs.gate.outputs.expected_sha }}
+          SOURCE_SHA: ${{ needs.gate.outputs.expected_sha }}
           FAILURE_INJECTION: ${{ needs.gate.outputs.failure_injection }}
           EXPECTED_SIGNED_SHA: ${{ needs.build_rc.outputs.signed_sha256 }}
           EXPECTED_SIGNER_SHA: ${{ needs.build_rc.outputs.signer_sha256 }}
+          BUILD_ARTIFACT_ID: ${{ needs.build_rc.outputs.unsigned_artifact_id }}
+          BUILD_ARTIFACT_NAME: ${{ needs.build_rc.outputs.unsigned_artifact_name }}
+          REPRO_ARTIFACT_ID: ${{ needs.build_rc.outputs.repro_artifact_id }}
+          REPRO_ARTIFACT_NAME: ${{ needs.build_rc.outputs.repro_artifact_name }}
+          COMPARISON_ARTIFACT_ID: ${{ needs.build_rc.outputs.reproducibility_report_artifact_id }}
+          COMPARISON_ARTIFACT_NAME: ${{ needs.build_rc.outputs.reproducibility_report_artifact_name }}
+          SIGN_INPUT_ARTIFACT_ID: ${{ needs.build_rc.outputs.sign_input_artifact_id }}
+          SIGN_INPUT_ARTIFACT_NAME: ${{ needs.build_rc.outputs.sign_input_artifact_name }}
           SIGNED_ARTIFACT_ID: ${{ needs.build_rc.outputs.signed_artifact_id }}
+          CANARY_ARTIFACT_NAME: ${{ needs.build_rc.outputs.signed_artifact_name }}
+          SIGNED_ARTIFACT_DIGEST: ${{ needs.build_rc.outputs.signed_artifact_digest }}
+          ATTEST_INPUT_ARTIFACT_ID: ${{ needs.build_rc.outputs.attest_input_artifact_id }}
+          ATTEST_INPUT_ARTIFACT_NAME: ${{ needs.build_rc.outputs.attest_input_artifact_name }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
@@ -196,7 +216,59 @@ jobs:
           test ! -L "$signed"
           test ! -L "$signer_result"
 
+          expected_build_name="${CANARY_NAMESPACE}-tvbox-u2-build-evidence-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          expected_repro_name="${CANARY_NAMESPACE}-tvbox-u2-repro-build-evidence-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          expected_comparison_name="${CANARY_NAMESPACE}-tvbox-u2-repro-comparison-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          expected_sign_input_name="${CANARY_NAMESPACE}-tvbox-u2-sign-input-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          expected_signed_name="${CANARY_NAMESPACE}-tvbox-u2-signed-output-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          expected_attest_input_name="${CANARY_NAMESPACE}-tvbox-u2-attest-input-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          artifact_ids=(
+            "$BUILD_ARTIFACT_ID"
+            "$REPRO_ARTIFACT_ID"
+            "$COMPARISON_ARTIFACT_ID"
+            "$SIGN_INPUT_ARTIFACT_ID"
+            "$SIGNED_ARTIFACT_ID"
+            "$ATTEST_INPUT_ARTIFACT_ID"
+          )
+          artifact_names=(
+            "$BUILD_ARTIFACT_NAME"
+            "$REPRO_ARTIFACT_NAME"
+            "$COMPARISON_ARTIFACT_NAME"
+            "$SIGN_INPUT_ARTIFACT_NAME"
+            "$CANARY_ARTIFACT_NAME"
+            "$ATTEST_INPUT_ARTIFACT_NAME"
+          )
+          expected_names=(
+            "$expected_build_name"
+            "$expected_repro_name"
+            "$expected_comparison_name"
+            "$expected_sign_input_name"
+            "$expected_signed_name"
+            "$expected_attest_input_name"
+          )
+          for index in "${!artifact_ids[@]}"; do
+            artifact_id="${artifact_ids[$index]}"
+            expected_name="${expected_names[$index]}"
+            [[ "$artifact_id" =~ ^[0-9]+$ ]] || {
+              echo "::error::shared pipeline artifact ID is malformed"
+              exit 1
+            }
+            [[ "${artifact_names[$index]}" == "$expected_name" ]] || {
+              echo "::error::shared pipeline artifact output name mismatch"
+              exit 1
+            }
+            metadata=$(GH_TOKEN="$GH_TOKEN" gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}")
+            owner_run=$(jq -r '.workflow_run.id // empty' <<<"$metadata")
+            actual_name=$(jq -r '.name // empty' <<<"$metadata")
+            [[ "$owner_run" == "$RUN_ID" && "$actual_name" == "$expected_name" ]] || {
+              echo "::error::shared pipeline artifact is not exact-run owned"
+              exit 1
+            }
+          done
+
           actual_signed_sha=$(sha256sum "$signed" | awk '{print $1}')
+          SIGNED_SHA="$actual_signed_sha"
           expected_signed_sha="$EXPECTED_SIGNED_SHA"
           expected_signer_sha="$EXPECTED_SIGNER_SHA"
           certificate_identity='^https://github\.com/slashinchi/TVBoxOS-Mobile/\.github/workflows/rc-pipeline\.yml@refs/heads/patched$'
@@ -248,31 +320,66 @@ jobs:
             exit 1
           }
 
+          assert_canary_predicate() {
+            local attestation_json="$1"
+            if ! jq -e \
+              --arg namespace "$CANARY_NAMESPACE" \
+              --arg release "$RELEASE_SHA" \
+              --arg source "$SOURCE_SHA" \
+              --arg artifact_name "$CANARY_ARTIFACT_NAME" \
+              --arg artifact_digest "$SIGNED_ARTIFACT_DIGEST" \
+              --arg run "$RUN_ID" \
+              --arg attempt "$RUN_ATTEMPT" \
+              --arg signed "$SIGNED_SHA" \
+              'any(.[]; .verificationResult.statement as $statement |
+                ($statement.predicate.canary_namespace == $namespace and
+                 $statement.predicate.canary_release_sha == $release and
+                 $statement.predicate.canary_source_sha == $source and
+                 $statement.predicate.canary_signed_artifact_name == $artifact_name and
+                 $statement.predicate.canary_signed_artifact_digest == $artifact_digest and
+                 $statement.predicate.canary_run_id == $run and
+                 $statement.predicate.canary_run_attempt == $attempt and
+                 $statement.predicate.signed_sha256 == $signed and
+                 ([$statement.subject[].digest.sha256] | index($signed) != null)))' \
+              "$attestation_json" >/dev/null; then
+              echo "::error::release identity predicate is not bound to this canary run"
+              return 1
+            fi
+          }
+
+          default_attestation="$evidence_root/default-attestation.json"
+          custom_attestation="$evidence_root/custom-attestation.json"
           gh attestation verify "$signed" \
             --repo "$GITHUB_REPOSITORY" \
             --predicate-type https://slsa.dev/provenance/v1 \
-            --cert-identity-regex "$certificate_identity" >/dev/null || {
+            --cert-identity-regex "$certificate_identity" \
+            --format json > "$default_attestation" || {
             echo "::error::SLSA attestation or full workflow identity verification failed"
             exit 1
           }
           gh attestation verify "$signed" \
             --repo "$GITHUB_REPOSITORY" \
             --predicate-type https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v2 \
-            --cert-identity-regex "$certificate_identity" >/dev/null || {
+            --cert-identity-regex "$certificate_identity" \
+            --format json > "$custom_attestation" || {
             echo "::error::release identity attestation or full workflow identity verification failed"
             exit 1
           }
+          assert_canary_predicate "$custom_attestation"
 
           jq -n \
             --arg namespace "$CANARY_NAMESPACE" \
             --arg release_sha "$RELEASE_SHA" \
+            --arg source_sha "$SOURCE_SHA" \
             --arg run "$RUN_ID" \
             --arg attempt "$RUN_ATTEMPT" \
             --arg artifact_id "$SIGNED_ARTIFACT_ID" \
             --arg signed_sha "$actual_signed_sha" \
             --arg signer_sha "$signer_sha" \
+            --arg artifact_name "$CANARY_ARTIFACT_NAME" \
+            --arg artifact_digest "$SIGNED_ARTIFACT_DIGEST" \
             --arg workflow_identity 'https://github.com/slashinchi/TVBoxOS-Mobile/.github/workflows/rc-pipeline.yml@refs/heads/patched' \
-            '{schema:"tvbox-u2-canary-verification-v1", namespace:$namespace, release_sha:$release_sha, run:$run, attempt:$attempt, signed_artifact_id:$artifact_id, signed_sha256:$signed_sha, signer_sha256:$signer_sha, workflow_identity:$workflow_identity, slsa_attestation:"verified", release_identity_attestation:"verified"}' \
+            '{schema:"tvbox-u2-canary-verification-v1", namespace:$namespace, release_sha:$release_sha, source_sha:$source_sha, run:$run, attempt:$attempt, signed_artifact_id:$artifact_id, signed_artifact_name:$artifact_name, signed_artifact_digest:$artifact_digest, signed_sha256:$signed_sha, signer_sha256:$signer_sha, workflow_identity:$workflow_identity, slsa_attestation:"verified", release_identity_attestation:"verified"}' \
             > "$evidence_root/verification.json"
           test -s "$evidence_root/verification.json"
           echo "::notice::signed APK, signer, SLSA, and release-identity evidence verified"
@@ -303,11 +410,6 @@ jobs:
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           CANARY_NAMESPACE: ${{ needs.gate.outputs.canary_namespace }}
-          VERIFICATION_ARTIFACT_ID: ${{ needs.verify.outputs.verification_artifact_id }}
-          BUILD_ARTIFACT_ID: ${{ needs.build_rc.outputs.unsigned_artifact_id }}
-          REPRO_ARTIFACT_ID: ${{ needs.build_rc.outputs.repro_artifact_id }}
-          COMPARISON_ARTIFACT_ID: ${{ needs.build_rc.outputs.reproducibility_report_artifact_id }}
-          SIGNED_ARTIFACT_ID: ${{ needs.build_rc.outputs.signed_artifact_id }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -327,9 +429,12 @@ jobs:
             echo "::error::cleanup namespace is not owned by this run"
             exit 1
           }
+          if [[ -z "$CANARY_NAMESPACE" ]]; then
+            CANARY_NAMESPACE="$namespace"
+          fi
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "::notice::invalid expected SHA; no artifact deletion is permitted"
-            exit 0
+            echo "::error::invalid expected SHA; cleanup cannot establish exact names"
+            exit 1
           }
 
           delete_artifact() {
@@ -341,8 +446,11 @@ jobs:
               return 1
             }
             local metadata
-            metadata=$(GH_TOKEN="$GH_TOKEN" gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}")
+            if ! metadata=$(GH_TOKEN="$GH_TOKEN" gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"); then
+              echo "::error::could not read exact artifact metadata"
+              return 1
+            fi
             local owner_run
             local actual_name
             owner_run=$(jq -r '.workflow_run.id // empty' <<<"$metadata")
@@ -355,32 +463,55 @@ jobs:
               echo "::error::artifact name is not the expected exact name"
               return 1
             }
-            GH_TOKEN="$GH_TOKEN" gh api --method DELETE \
-              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}" >/dev/null
+            if ! GH_TOKEN="$GH_TOKEN" gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}" >/dev/null; then
+              echo "::error::exact artifact deletion failed"
+              return 1
+            fi
             echo "::notice::deleted exact run-owned artifact $expected_name"
           }
 
           suffix="${EXPECTED_SHA}-${GITHUB_RUN_ATTEMPT}"
-          delete_artifact "$VERIFICATION_ARTIFACT_ID" "${namespace}-verification"
-          delete_artifact "$BUILD_ARTIFACT_ID" "tvbox-u2-build-evidence-${suffix}"
-          delete_artifact "$REPRO_ARTIFACT_ID" "tvbox-u2-repro-build-evidence-${suffix}"
-          delete_artifact "$COMPARISON_ARTIFACT_ID" "tvbox-u2-repro-comparison-${suffix}"
-          delete_artifact "$SIGNED_ARTIFACT_ID" "tvbox-u2-signed-output-${suffix}"
-
-          artifacts=$(GH_TOKEN="$GH_TOKEN" gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100")
-          for expected_name in \
-            "tvbox-u2-sign-input-${suffix}" \
-            "tvbox-u2-attest-input-${suffix}"; do
-            matches=$(jq -r --arg name "$expected_name" \
-              '.artifacts[] | select(.name == $name) | .id' <<<"$artifacts")
+          expected_names=(
+            "${CANARY_NAMESPACE}-tvbox-u2-build-evidence-${suffix}"
+            "${CANARY_NAMESPACE}-tvbox-u2-repro-build-evidence-${suffix}"
+            "${CANARY_NAMESPACE}-tvbox-u2-repro-comparison-${suffix}"
+            "${CANARY_NAMESPACE}-tvbox-u2-sign-input-${suffix}"
+            "${CANARY_NAMESPACE}-tvbox-u2-signed-output-${suffix}"
+            "${CANARY_NAMESPACE}-tvbox-u2-attest-input-${suffix}"
+            "${CANARY_NAMESPACE}-verification"
+          )
+          cleanup_failures=()
+          if ! artifacts=$(GH_TOKEN="$GH_TOKEN" gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100"); then
+            cleanup_failures+=("artifact-list")
+            artifacts='{"artifacts":[]}'
+          fi
+          for index in "${!expected_names[@]}"; do
+            expected_name="${expected_names[$index]}"
+            if ! matches=$(jq -r --arg expected_name "$expected_name" \
+              '.artifacts[] | select(.name == $expected_name) | .id' <<<"$artifacts"); then
+              cleanup_failures+=("$expected_name")
+              continue
+            fi
             match_count=$(printf '%s\n' "$matches" | awk 'NF { count += 1 } END { print count + 0 }')
-            [[ "$match_count" -le 1 ]] || {
-              echo "::error::more than one exact artifact name matched"
-              exit 1
-            }
-            if [[ "$match_count" == "1" ]]; then
-              delete_artifact "$matches" "$expected_name"
+            if [[ "$match_count" == "0" ]]; then
+              continue
+            fi
+            if [[ "$match_count" != "1" ]]; then
+              cleanup_failures+=("$expected_name")
+              continue
+            fi
+            if ! delete_artifact "$matches" "$expected_name"; then
+              cleanup_failures+=("$expected_name")
+              continue
             fi
           done
+          if (( ${#cleanup_failures[@]} > 0 )); then
+            printf 'cleanup status: REVIEW_PENDING\nfailed artifacts:\n' >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "${cleanup_failures[@]}" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::canary cleanup incomplete; status=REVIEW_PENDING"
+            exit 1
+          fi
+          echo "cleanup status: verified exact run-owned artifacts" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::exact-run canary cleanup complete"
