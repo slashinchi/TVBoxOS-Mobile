@@ -89,13 +89,13 @@
 - Modify: `.github/workflows/u2-release.yml`
 - Modify: `scripts/tests/test_u2_release.py`
 
-- [ ] **Step 1: Write failing structural tests** for `release/recover/noop-smoke` choice inputs, actor/ref/expected-SHA validation, mutually exclusive routing, and a no-op dependency barrier covering every build/sign/publish/issue/ref-write job.
+- [x] **Step 1: Write failing structural tests** for `release/recover/noop-smoke` choice inputs, actor/ref/expected-SHA validation, mutually exclusive routing, and a no-op dependency barrier covering every build/sign/publish/issue/ref-write job.
 - [ ] **Step 2: Run the structural tests and confirm the current workflow fails them.
-- [ ] **Step 3:** Add the explicit dispatch intent contract and pass the intent through gate, qualify, prep, summary, watch, and publish outputs.
-- [ ] **Step 4:** Add hard `noop != true` guards to all substantive jobs; make `noop-smoke` compute baseline/debt only and stop before any write-capable job.
-- [ ] **Step 5:** Add final live baseline/version collision revalidation before CAS promote, then re-read the Release/tag/draft identity after the first create/asset operation and require exact target, tag, version, asset names, and digests for all later steps.
-- [ ] **Step 6:** Add structural assertions that no publish path uses `gh release publish`, `--clobber` for uploads, tag movement, or a second APK build.
-- [ ] **Step 7:** Run all U2 tests, shell/YAML checks, and commit the batch.
+- [x] **Step 3:** Add the explicit dispatch intent contract and pass the intent through gate, qualify, prep, summary, watch, and publish outputs.
+- [x] **Step 4:** Add hard `noop != true` guards to all substantive jobs; make `noop-smoke` compute baseline/debt only and stop before any write-capable job.
+- [x] **Step 5:** Add final live baseline/version collision revalidation before CAS promote, then re-read the Release/tag/draft identity after the first create/asset operation and require exact target, tag, version, asset names, and digests for all later steps.
+- [x] **Step 6:** Add structural assertions that no publish path uses `gh release publish`, `--clobber` for uploads, tag movement, or a second APK build.
+- [x] **Step 7:** Run all U2 tests, shell/YAML checks, and commit the batch; tag-resolution scoped re-review is clean.
 
 ### Task 5: Canary Harness, `rc-control` Retirement, and Remote Validation
 
