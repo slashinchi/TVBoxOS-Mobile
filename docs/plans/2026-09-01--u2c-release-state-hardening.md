@@ -105,8 +105,9 @@
 - Modify: `scripts/tests/test_u2_release.py`
 - Modify: `docs/plans/2026-09-01--u2c-release-state-hardening.md`
 
-- [ ] **Step 1:** Add structural tests requiring dispatch-only actor gating, exact run-owned canary namespace, no production tag/Release/update writes, same `rc-pipeline.yml` reference, and `always()` cleanup.
-- [ ] **Step 2:** Implement the harness with exact-run cleanup; it may use temporary drafts/refs only and must never wildcard-delete `rc-control-*`, formal `v*`, Releases, rulesets, or policies.
+- [x] **Step 1:** Add structural tests requiring dispatch-only actor gating, exact run-owned canary namespace, no production tag/Release/update writes, same `rc-pipeline.yml` reference, and `always()` cleanup.
+- [x] **Step 2:** Implement the harness with exact-run cleanup; it may use temporary drafts/refs only and must never wildcard-delete `rc-control-*`, formal `v*`, Releases, rulesets, or policies.
+  - Local implementation intentionally creates no draft, ref, PR, Release, or production-metadata object. It calls the existing `rc-pipeline.yml`, verifies the exact signed artifact and both attestation identities, uploads only namespaced non-secret evidence, and deletes only exact artifacts owned by the current run. Remote canary, drain, retirement, and flag changes remain pending Steps 3-6.
 - [ ] **Step 3:** Merge workflow changes through PR, run the harness with `TVBOX_U2_ENABLED=false`, and verify signer, APK, full SAN workflow identity, attestation, and zero residue.
 - [ ] **Step 4:** Drain Actions runs, queued runs, and pending deployments before changing any reviewer or signer ingress policy; record the readback.
 - [ ] **Step 5:** Disable `rc-control-v1` ingress and remove its workflow/tag policy only in a separate PR after canary evidence; if any active consumer or cleanup residue remains, return `REVIEW_PENDING` instead of deleting broadly.

@@ -36,6 +36,7 @@ RC_WORKFLOW = ROOT / ".github/workflows/rc-pipeline.yml"
 BUILD_WORKFLOW = ROOT / ".github/workflows/build.yml"
 CONTROL_WORKFLOW = ROOT / ".github/workflows/rc-control.yml"
 DIAGNOSTIC_WORKFLOW = ROOT / ".github/workflows/u2-apk-diagnostic.yml"
+CANARY_HARNESS_WORKFLOW = ROOT / ".github/workflows/u2-canary-harness.yml"
 
 
 class U2ReleaseContractTests(unittest.TestCase):
@@ -1961,6 +1962,213 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("PUSH_BEFORE", manual)
         self.assertNotIn("PUSH_AFTER", manual)
         self.assertIn('echo "source_sha=$EXPECTED_SHA"', gate_run)
+
+    def test_u2_canary_harness_is_dispatch_only_and_locks_one_live_patched_sha(self):
+        self.assertTrue(CANARY_HARNESS_WORKFLOW.is_file())
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        tree = self._yaml_tree(workflow)
+        self.assertEqual(set(tree["on"]), {"workflow_dispatch"})
+        dispatch = tree["on"]["workflow_dispatch"]
+        inputs = dispatch["inputs"]
+        self.assertEqual(inputs["expected_sha"]["type"], "string")
+        self.assertEqual(inputs["expected_sha"]["required"], "true")
+        self.assertEqual(inputs["failure_injection"]["type"], "choice")
+        self.assertEqual(
+            inputs["failure_injection"]["options"],
+            ["none", "digest-mismatch", "signer-mismatch", "attestation-identity-mismatch"],
+        )
+
+        gate = self._job_block(workflow, "gate")
+        gate_run = gate[gate.index("run: |") :]
+        for token in (
+            '[[ "$EVENT" == "workflow_dispatch" ]]',
+            '[[ "$ACTOR" == "slashinchi" ]]',
+            '[[ "$REF" == "refs/heads/patched" ]]',
+            'assert_full_sha "$EXPECTED_SHA"',
+            "git ls-remote",
+            'refs/heads/patched',
+            '[[ "$live_patched" == "$EXPECTED_SHA" ]]',
+            '[[ "$GITHUB_SHA" == "$EXPECTED_SHA" ]]',
+            '[[ "$U2_ENABLED" == "false" ]]',
+            'case "$FAILURE_INJECTION" in',
+            'canary_namespace "$RUN_ID" "$RUN_ATTEMPT"',
+        ):
+            self.assertIn(token, gate_run, token)
+        self.assertNotIn("github.event_name !=", gate_run)
+
+    def test_u2_canary_harness_namespace_and_cleanup_are_exact_run_owned(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        tree = self._yaml_tree(workflow)
+        self.assertIn("gate", tree["jobs"])
+        cleanup = tree["jobs"]["cleanup"]
+        self.assertEqual(cleanup["if"], "always()")
+        cleanup_text = self._job_block(workflow, "cleanup")
+        for token in (
+            'u2-canary-%s-attempt-%s',
+            'GITHUB_RUN_ID',
+            'GITHUB_RUN_ATTEMPT',
+            'actions/runs/${GITHUB_RUN_ID}/artifacts',
+            'actions/artifacts/${artifact_id}',
+            '--method DELETE',
+            'workflow_run.id',
+            '"$actual_name" == "$expected_name"',
+        ):
+            self.assertIn(token, cleanup_text, token)
+        self.assertIn("canary_namespace }}-verification", workflow)
+        self.assertIn("$RUNNER_TEMP/$CANARY_NAMESPACE", workflow)
+        self.assertNotIn("*", cleanup_text.replace("${CANARY_NAMESPACE}-verification", ""))
+
+        for forbidden in (
+            "gh release",
+            "gh api .*releases",
+            "git push",
+            "git update-ref",
+            "refs/tags/",
+            "contents: write",
+            "TVBOX_RELEASE_TOKEN",
+            "release-production",
+            "update.json",
+            "rulesets",
+            "policies",
+            "--cleanup-tag",
+        ):
+            self.assertNotIn(forbidden, workflow, forbidden)
+
+    def test_u2_canary_harness_calls_same_rc_pipeline_with_exact_identity(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        tree = self._yaml_tree(workflow)
+        build = tree["jobs"]["build_rc"]
+        self.assertEqual(build["uses"], "./.github/workflows/rc-pipeline.yml")
+        self.assertIn("needs", build)
+        self.assertEqual(build["with"]["release_sha"], "${{ needs.gate.outputs.expected_sha }}")
+        self.assertEqual(build["with"]["source_sha"], "${{ needs.gate.outputs.expected_sha }}")
+        self.assertEqual(build["with"]["mode"], "manual-local")
+        for field in (
+            "upstream_sha",
+            "upstream_version",
+            "upstream_code",
+            "expected_version_name",
+            "expected_version_code",
+            "release_debt",
+            "candidate_pr",
+            "provenance_marker",
+        ):
+            self.assertIn(field, build["with"], field)
+            self.assertEqual(str(build["with"][field]).strip("'\""), "")
+        self.assertNotIn("secrets", build)
+        self.assertNotIn("environment", build)
+        self.assertEqual(build["permissions"]["actions"], "read")
+        self.assertEqual(build["permissions"]["id-token"], "write")
+        self.assertEqual(build["permissions"]["attestations"], "write")
+
+        verify = tree["jobs"]["verify"]
+        verify_text = self._job_block(workflow, "verify")
+        self.assertEqual(verify["permissions"]["actions"], "read")
+        self.assertEqual(verify["permissions"]["attestations"], "read")
+        for token in (
+            "actions/download-artifact@",
+            "actions/upload-artifact@",
+            "signed_artifact_id",
+            "signed_sha256",
+            "signer_sha256",
+            "apksigner",
+            "signer-result.json",
+            "gh attestation verify",
+            "https://slsa.dev/provenance/v1",
+            "https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v2",
+            r"^https://github\.com/slashinchi/TVBoxOS-Mobile/\.github/workflows/rc-pipeline\.yml@refs/heads/patched$",
+            "verification.json",
+        ):
+            self.assertIn(token, verify_text, token)
+        self.assertEqual(verify_text.count("--cert-identity-regex"), 2)
+        self.assertNotIn("secrets.", verify_text)
+        self.assertNotIn("TVBOX_KEY", verify_text)
+
+    def test_u2_canary_gate_script_accepts_only_safe_inputs_and_builds_namespace(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        gate = self._job_block(workflow, "gate")
+        gate_run = gate[gate.index("run: |") :]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            expected = "a" * 40
+            fake_git.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"${1:-}\" == \"ls-remote\" ]]; then\n"
+                f"  printf '%s\\trefs/heads/patched\\n' '{expected}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n"
+            )
+            fake_git.chmod(0o755)
+            output = root / "github-output"
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "GITHUB_OUTPUT": str(output),
+                "EVENT": "workflow_dispatch",
+                "ACTOR": "slashinchi",
+                "REF": "refs/heads/patched",
+                "EXPECTED_SHA": expected,
+                "GITHUB_SHA": expected,
+                "U2_ENABLED": "false",
+                "FAILURE_INJECTION": "none",
+                "RUN_ID": "12345",
+                "RUN_ATTEMPT": "2",
+                "GITHUB_SERVER_URL": "https://github.com",
+                "GITHUB_REPOSITORY": "slashinchi/TVBoxOS-Mobile",
+            }
+            result = subprocess.run(
+                ["bash", "-c", gate_run],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            written = output.read_text()
+            self.assertIn("expected_sha=" + expected, written)
+            self.assertIn("canary_namespace=u2-canary-12345-attempt-2", written)
+
+            for field, value in (("ACTOR", "intruder"), ("REF", "refs/heads/main"), ("U2_ENABLED", "true")):
+                output.write_text("")
+                env[field] = value
+                result = subprocess.run(
+                    ["bash", "-c", gate_run],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertNotEqual(result.returncode, 0, field)
+                env[field] = {"ACTOR": "slashinchi", "REF": "refs/heads/patched", "U2_ENABLED": "false"}[field]
+
+            invalid_cases = (
+                ("EVENT", "push"),
+                ("EXPECTED_SHA", "short"),
+                ("GITHUB_SHA", "b" * 40),
+                ("FAILURE_INJECTION", "unapproved"),
+            )
+            for field, value in invalid_cases:
+                with self.subTest(field=field):
+                    output.write_text("")
+                    env[field] = value
+                    result = subprocess.run(
+                        ["bash", "-c", gate_run],
+                        cwd=ROOT,
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0, field)
+                    env[field] = {
+                        "EVENT": "workflow_dispatch",
+                        "EXPECTED_SHA": expected,
+                        "GITHUB_SHA": expected,
+                        "FAILURE_INJECTION": "none",
+                    }[field]
 
     def test_u2_intent_is_mutually_exclusive_and_cross_job_identity_is_explicit(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
