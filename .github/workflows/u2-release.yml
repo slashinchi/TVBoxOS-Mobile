@@ -18,6 +18,10 @@ on:
   push:
     branches:
       - patched
+    paths-ignore:
+      - docs/**
+      - scripts/tests/**
+      - .github/workflows/u2-release.yml
 
 permissions:
   contents: read
