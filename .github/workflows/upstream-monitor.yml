@@ -417,6 +417,23 @@ jobs:
            changed_paths_b64=$(jq -jr '.changed_paths | join("\u0000")' "$result_file" | base64 -w 0)
           preserved_paths_b64=$(jq -jr '.preserved | join("\u0000")' "$result_file" | base64 -w 0)
           candidate_diff_stat_b64=$(git diff --stat "$base_sha...HEAD" | base64 -w 0)
+          base_control_tree="$RUNNER_TEMP/base-control-tree.txt"
+          candidate_control_tree="$RUNNER_TEMP/candidate-control-tree.txt"
+          git ls-tree -r --full-tree "$base_sha" -- \
+            .github scripts gradle/verified-releases.json \
+            gradle/legacy-dependencies.lock.json AGENTS.md README.md update.json \
+            > "$base_control_tree"
+          git ls-tree -r --full-tree HEAD -- \
+            .github scripts gradle/verified-releases.json \
+            gradle/legacy-dependencies.lock.json AGENTS.md README.md update.json \
+            > "$candidate_control_tree"
+          diff -u "$base_control_tree" "$candidate_control_tree" >/dev/null || {
+            echo "Candidate changed fork-owned control inputs; refusing validation."
+            echo 'validation=fail' >> "$GITHUB_OUTPUT"
+            echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+            echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          }
           echo "classification=$classification" >> "$GITHUB_OUTPUT"
            echo "candidate_needed=$candidate_needed" >> "$GITHUB_OUTPUT"
            echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
@@ -614,6 +631,13 @@ jobs:
           actual_candidate_oid=$(git rev-parse "refs/remotes/origin/$candidate_branch")
           test "$actual_candidate_oid" = "$expected_candidate_oid"
           git merge-base --is-ancestor "$PATCHED_SHA" "$actual_candidate_oid"
+          if ! git diff --quiet "$PATCHED_SHA" "$actual_candidate_oid" -- \
+            .github/ scripts/ gradle/verified-releases.json \
+            gradle/legacy-dependencies.lock.json AGENTS.md README.md update.json; then
+            echo 'failure_reason=fork-control-input-changed' >> "$GITHUB_OUTPUT"
+            echo "Fork-owned control inputs changed after candidate push"
+            exit 1
+          fi
            expected_candidate_tree="$VALIDATED_TREE"
            actual_candidate_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
             if ! python3 "$trusted_helper" tree-check --actual "$actual_candidate_tree" --expected "$expected_candidate_tree"; then

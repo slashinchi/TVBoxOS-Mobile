@@ -32,8 +32,10 @@ FORK_OWNED_PATHS = {
     "scripts/tests/test_u2_release.py",
     "scripts/sync_release_metadata.sh",
     ".github/dependabot.yml",
+    "gradle/verified-releases.json",
+    "gradle/legacy-dependencies.lock.json",
 }
-FORK_OWNED_PREFIXES = (".github/workflows/",)
+FORK_OWNED_PREFIXES = (".github/", "scripts/")
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 AUTOMATION_REASONS = {
     "fixture-tests-failure",

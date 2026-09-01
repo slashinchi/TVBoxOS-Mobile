@@ -13,6 +13,8 @@ from pathlib import Path
 
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+OFFICIAL_UPSTREAM_REPOSITORY = "kukuqi666/TVBoxOS-Mobile"
+OFFICIAL_UPSTREAM_REF = "refs/heads/main"
 VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)+$")
 VERSION_CODE_RE = re.compile(r"^[0-9]+$")
 RUN_ID_RE = re.compile(r"^[0-9]+$")
@@ -155,6 +157,57 @@ def fresh_integration_replay(replayed_status, replayed_tree, actual_tree):
     return {"qualified": True, "reason": "replay-match"}
 
 
+def validate_replay_evidence(evidence, expected_upstream_repository, expected_upstream_ref):
+    """Validate the complete trusted replay proof, not just its resulting tree."""
+    if not isinstance(evidence, dict) or evidence.get("status") != "clean":
+        return {"qualified": False, "reason": "replay-not-clean"}
+
+    sha_fields = (
+        "before",
+        "source_after",
+        "candidate",
+        "upstream",
+        "fork_main",
+        "marker_tree",
+        "candidate_tree",
+        "rebuilt_tree",
+        "source_tree",
+    )
+    if any(not FULL_SHA_RE.fullmatch(evidence.get(field, "")) for field in sha_fields):
+        return {"qualified": False, "reason": "replay-evidence-invalid"}
+
+    if evidence.get("source_parents") != [evidence["before"], evidence["candidate"]]:
+        return {"qualified": False, "reason": "replay-source-parent-mismatch"}
+    if evidence.get("candidate_parents") != [evidence["before"], evidence["upstream"]]:
+        return {"qualified": False, "reason": "replay-candidate-parent-mismatch"}
+    if evidence.get("candidate_needed") is not True:
+        return {"qualified": False, "reason": "replay-candidate-not-built"}
+    if (
+        evidence.get("upstream_repository") != expected_upstream_repository
+        or evidence.get("upstream_ref") != expected_upstream_ref
+    ):
+        return {"qualified": False, "reason": "replay-upstream-source-mismatch"}
+    if evidence.get("fork_main_is_ancestor") is not True:
+        return {"qualified": False, "reason": "replay-fork-main-not-ancestor"}
+    trees = [
+        evidence["marker_tree"],
+        evidence["candidate_tree"],
+        evidence["rebuilt_tree"],
+        evidence["source_tree"],
+    ]
+    if len(set(trees)) != 1:
+        return {"qualified": False, "reason": "replay-tree-mismatch"}
+    return {
+        "qualified": True,
+        "reason": "replay-match",
+        "before": evidence["before"],
+        "source_after": evidence["source_after"],
+        "candidate": evidence["candidate"],
+        "upstream": evidence["upstream"],
+        "tree": trees[0],
+    }
+
+
 def qualify_u1_merge(
     *,
     before,
@@ -205,7 +258,24 @@ def qualify_u1_merge(
         return {"qualified": False, "reason": "provenance-object-mismatch"}
     if not upstream_is_ancestor:
         return {"qualified": False, "reason": "upstream-not-ancestor"}
-    replay_result = fresh_integration_replay(*replay)
+    if isinstance(replay, dict):
+        replay_result = validate_replay_evidence(
+            replay,
+            OFFICIAL_UPSTREAM_REPOSITORY,
+            OFFICIAL_UPSTREAM_REF,
+        )
+        if replay_result["qualified"] and any(
+            (
+                replay_result["before"] != before,
+                replay_result["source_after"] != after,
+                replay_result["candidate"] != parsed["candidate"],
+                replay_result["upstream"] != upstream_sha,
+                replay_result["tree"] != candidate_tree,
+            )
+        ):
+            return {"qualified": False, "reason": "replay-outer-identity-mismatch"}
+    else:
+        replay_result = fresh_integration_replay(*replay)
     if not replay_result["qualified"]:
         return replay_result
     return {
@@ -634,9 +704,10 @@ def main(argv=None):
     qualify_parser.add_argument("--marker", required=True)
     qualify_parser.add_argument("--candidate-tree", required=True)
     qualify_parser.add_argument("--upstream-ancestor", required=True, choices=["true", "false"])
-    qualify_parser.add_argument("--replay-status", required=True)
-    qualify_parser.add_argument("--replay-tree", required=True)
-    qualify_parser.add_argument("--replay-actual-tree", required=True)
+    qualify_parser.add_argument("--replay-file")
+    qualify_parser.add_argument("--replay-status")
+    qualify_parser.add_argument("--replay-tree")
+    qualify_parser.add_argument("--replay-actual-tree")
 
     plan_prep_parser = subparsers.add_parser("plan-prep")
     plan_prep_parser.add_argument("--upstream-name", required=True)
@@ -719,7 +790,12 @@ def main(argv=None):
             print(json.dumps({"matched": False}, sort_keys=True))
     elif args.command == "qualify-u1":
         pr = json.loads(args.pr)
-        replay = (args.replay_status, args.replay_tree, args.replay_actual_tree)
+        if args.replay_file:
+            replay = json.loads(Path(args.replay_file).read_text())
+        else:
+            if not all((args.replay_status, args.replay_tree, args.replay_actual_tree)):
+                qualify_parser.error("qualify-u1 requires --replay-file or all legacy replay fields")
+            replay = (args.replay_status, args.replay_tree, args.replay_actual_tree)
         result = qualify_u1_merge(
             before=args.before,
             after=args.after,

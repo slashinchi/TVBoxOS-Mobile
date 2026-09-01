@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts import u2_release as u2_release_module
 from scripts.u2_release import (
     build_provenance_marker,
     build_release_trailers,
@@ -159,6 +160,61 @@ class U2ReleaseContractTests(unittest.TestCase):
             )["reason"],
             "associated-pr-mismatch",
         )
+
+    def _replay_evidence(self):
+        return {
+            "status": "clean",
+            "candidate_needed": True,
+            "before": "a" * 40,
+            "source_after": "b" * 40,
+            "source_parents": ["a" * 40, "c" * 40],
+            "candidate": "c" * 40,
+            "candidate_parents": ["a" * 40, "d" * 40],
+            "upstream": "d" * 40,
+            "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
+            "upstream_ref": "refs/heads/main",
+            "fork_main": "e" * 40,
+            "fork_main_is_ancestor": True,
+            "marker_tree": "f" * 40,
+            "candidate_tree": "f" * 40,
+            "rebuilt_tree": "f" * 40,
+            "source_tree": "f" * 40,
+        }
+
+    def _assert_replay_rejected(self, evidence, reason):
+        validator = getattr(u2_release_module, "validate_replay_evidence", None)
+        self.assertIsNotNone(validator)
+        self.assertEqual(
+            validator(
+                evidence,
+                "kukuqi666/TVBoxOS-Mobile",
+                "refs/heads/main",
+            )["reason"],
+            reason,
+        )
+
+    def test_strict_replay_requires_direct_parent_and_four_tree_proof(self):
+        valid = self._replay_evidence()
+        validator = getattr(u2_release_module, "validate_replay_evidence", None)
+        self.assertIsNotNone(validator)
+        self.assertTrue(
+            validator(valid, "kukuqi666/TVBoxOS-Mobile", "refs/heads/main")["qualified"]
+        )
+
+        invalid = dict(valid, source_parents=[valid["before"], "1" * 40])
+        self._assert_replay_rejected(invalid, "replay-source-parent-mismatch")
+        invalid = dict(valid, candidate_parents=[valid["before"], "2" * 40])
+        self._assert_replay_rejected(invalid, "replay-candidate-parent-mismatch")
+        invalid = dict(valid, upstream_repository="attacker.example/repo")
+        self._assert_replay_rejected(invalid, "replay-upstream-source-mismatch")
+        invalid = dict(valid, upstream_ref="refs/heads/feature")
+        self._assert_replay_rejected(invalid, "replay-upstream-source-mismatch")
+        invalid = dict(valid, rebuilt_tree="3" * 40)
+        self._assert_replay_rejected(invalid, "replay-tree-mismatch")
+        invalid = dict(valid, fork_main_is_ancestor=False)
+        self._assert_replay_rejected(invalid, "replay-fork-main-not-ancestor")
+        invalid = dict(valid, candidate_needed=False)
+        self._assert_replay_rejected(invalid, "replay-candidate-not-built")
 
     def test_manual_integrated_upstream_and_canonical_release_baseline_fail_closed(self):
         sha = "a" * 40
@@ -1160,6 +1216,25 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("if tag_target_sha=$(", tag_ref_line)
         self.assertIn("2>/dev/null); then", tag_ref_line)
 
+    def test_auto_qualification_requires_real_trusted_replay_evidence(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        qualify = workflow[workflow.index("  qualify:"):workflow.index("  prep:")]
+        qualify_script = (ROOT / "scripts/u2_qualify.sh").read_text()
+        for token in (
+            'git show "$PUSH_BEFORE:scripts/u2_release.py"',
+            'git show "$PUSH_BEFORE:scripts/upstream_monitor.py"',
+            'refs/remotes/upstream/main',
+            'refs/remotes/origin/main',
+            'git worktree add --detach',
+            'source_parents',
+            'candidate_parents',
+            'replay_file',
+            '--replay-file',
+        ):
+            self.assertIn(token, qualify, token)
+        self.assertIn("U2_REPO_ROOT", qualify_script)
+        self.assertIn("U2_RELEASE_HELPER", qualify_script)
+
     def test_release_debt_cli_computes_canonical_baseline_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -1253,6 +1328,68 @@ class U2ReleaseContractTests(unittest.TestCase):
         )
         self.assertEqual(bad.returncode, 0, bad.stderr)
         self.assertEqual(json.loads(bad.stdout)["reason"], "merge-parent-mismatch")
+
+    def test_qualify_u1_cli_accepts_structured_replay_file(self):
+        upstream = "a" * 40
+        candidate = "b" * 40
+        tree = "c" * 40
+        before = "d" * 40
+        after = "e" * 40
+        marker = build_provenance_marker(upstream, candidate, tree, "2.1.27", 237)
+        pr = json.dumps({
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-28T00:00:00Z",
+            "base": "patched",
+            "merged_by": "slashinchi",
+            "author": "github-actions[bot]",
+            "head_repository": "slashinchi/TVBoxOS-Mobile",
+            "head": candidate_branch_name(upstream),
+            "head_sha": candidate,
+            "merge_commit_sha": after,
+        })
+        replay = {
+            "status": "clean",
+            "candidate_needed": True,
+            "before": before,
+            "source_after": after,
+            "source_parents": [before, candidate],
+            "candidate": candidate,
+            "candidate_parents": [before, upstream],
+            "upstream": upstream,
+            "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
+            "upstream_ref": "refs/heads/main",
+            "fork_main": "f" * 40,
+            "fork_main_is_ancestor": True,
+            "marker_tree": tree,
+            "candidate_tree": tree,
+            "rebuilt_tree": tree,
+            "source_tree": tree,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            replay_path = Path(tmp) / "replay.json"
+            replay_path.write_text(json.dumps(replay))
+            result = subprocess.run(
+                [
+                    "python3", "scripts/u2_release.py", "qualify-u1",
+                    "--before", before,
+                    "--after", after,
+                    "--parents", before, candidate,
+                    "--actor", "slashinchi",
+                    "--pr", pr,
+                    "--repository", "slashinchi/TVBoxOS-Mobile",
+                    "--upstream", upstream,
+                    "--marker", marker,
+                    "--candidate-tree", tree,
+                    "--upstream-ancestor", "true",
+                    "--replay-file", str(replay_path),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["qualified"])
 
     def test_plan_prep_cli_derives_version_and_trailers(self):
         published = [["2.1.26.1", 23601], ["2.1.27.1", 23701]]

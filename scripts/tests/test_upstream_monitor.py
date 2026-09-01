@@ -18,6 +18,7 @@ from scripts.upstream_monitor import (
     coverage_marker,
     event_gate,
     issue_marker,
+    is_fork_owned_path,
     is_check_day,
     main,
     marker_status,
@@ -314,6 +315,15 @@ class U1aContractTests(unittest.TestCase):
             self.assertFalse((repo / ".github/workflows/new-upstream.yml").exists())
             self.assertIn("runtime.txt", result.changed_paths)
 
+    def test_all_trusted_control_prefixes_and_manifests_are_fork_owned(self):
+        for path in (
+            ".github/actions/verify/action.yml",
+            "scripts/new-trusted-helper.py",
+            "gradle/verified-releases.json",
+            "gradle/legacy-dependencies.lock.json",
+        ):
+            self.assertTrue(is_fork_owned_path(path), path)
+
     def test_only_fork_owned_changes_do_not_need_a_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = self._new_repo(Path(tmp))
@@ -522,6 +532,13 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("validated-tree-mismatch", workflow)
         self.assertIn("candidate tree", workflow)
         self.assertIn("candidate-tree:", workflow)
+
+    def test_workflow_rechecks_fork_control_inputs_before_and_after_candidate_push(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn("git ls-tree -r --full-tree", workflow)
+        self.assertIn("gradle/verified-releases.json", workflow)
+        self.assertIn("gradle/legacy-dependencies.lock.json", workflow)
+        self.assertIn("git diff --quiet \"$PATCHED_SHA\" \"$actual_candidate_oid\"", workflow)
 
     def test_candidate_pr_binds_versioned_provenance_marker(self):
         workflow = WORKFLOW.read_text()

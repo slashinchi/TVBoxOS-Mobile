@@ -104,11 +104,25 @@ jobs:
           PUSH_AFTER: ${{ github.event.after }}
           REPO: ${{ github.repository }}
           ACTOR: ${{ github.actor }}
+          UPSTREAM_REPO: kukuqi666/TVBoxOS-Mobile
+          UPSTREAM_REF: refs/heads/main
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          chmod +x scripts/u2_qualify.sh
-          bash scripts/u2_qualify.sh
+          trusted_root="$RUNNER_TEMP/u2-trusted-control"
+          mkdir -p "$trusted_root/scripts"
+          git show "$PUSH_BEFORE:scripts/u2_release.py" > "$trusted_root/scripts/u2_release.py"
+          git show "$PUSH_BEFORE:scripts/upstream_monitor.py" > "$trusted_root/scripts/upstream_monitor.py"
+          chmod +x "$trusted_root/scripts/u2_release.py" "$trusted_root/scripts/upstream_monitor.py"
+          # u2_qualify.sh stays fork-owned; require the source merge to retain
+          # the pre-merge copy, then execute it against the checked-out repo with
+          # the pre-merge trusted u2_release helper.
+          git diff --quiet "$PUSH_BEFORE" "$PUSH_AFTER" -- scripts/u2_qualify.sh || {
+            echo "::error::U1 source merge changed the trusted qualification wrapper"; exit 1;
+          }
+          U2_REPO_ROOT="$PWD" \
+            U2_RELEASE_HELPER="$trusted_root/scripts/u2_release.py" \
+            bash scripts/u2_qualify.sh
           if [[ "$MODE" == "auto-upstream" ]]; then
             # Non-U1 push debt watcher: open one deduplicated local-release-debt Issue.
             watch_debt() {
@@ -158,7 +172,7 @@ jobs:
             pr_json=$(echo "$pr" | jq -c '{number,state,merged_at:.merged_at,base:(.base // {}),merged_by:(.merged_by.login // ""),author:(.user.login // ""),head_repository:(.head.repo.full_name // ""),head:(.head.ref // ""),head_sha:(.head.sha // ""),merge_commit_sha:.merge_commit_sha}')
             # For provenance, read the marker embedded in the PR body.
             marker=$(echo "$pr" | jq -r '.body // ""' | grep -o '<!-- tvbox-upstream-candidate-v2 .* -->' | head -1)
-            parsed=$(python3 scripts/u2_release.py parse-provenance-marker --marker "$marker" 2>/dev/null || echo "")
+            parsed=$(python3 "$trusted_root/scripts/u2_release.py" parse-provenance-marker --marker "$marker" 2>/dev/null || echo "")
             if [[ -z "$parsed" ]]; then
               echo "::error::auto-upstream PR missing valid v2 provenance marker"
               watch_debt "missing-provenance-marker"
@@ -175,9 +189,75 @@ jobs:
             if git merge-base --is-ancestor "$upstream_sha" "$candidate" 2>/dev/null; then
               upstream_is_ancestor=true
             fi
-            replay_tree="$candidate_tree"
-            actual_tree=$(git rev-parse "${PUSH_AFTER}^{tree}")
-            result=$(python3 scripts/u2_release.py qualify-u1 \
+            actual_source_tree=$(git rev-parse "${PUSH_AFTER}^{tree}")
+            actual_candidate_tree=$(git rev-parse "${candidate}^{tree}")
+            source_parents=$(git rev-list --parents -n 1 "$PUSH_AFTER" | jq -R 'rtrimstr("\n") | split(" ") | .[1:]')
+            candidate_parents=$(git rev-list --parents -n 1 "$candidate" | jq -R 'rtrimstr("\n") | split(" ") | .[1:]')
+            git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+            git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+              +refs/heads/main:refs/remotes/upstream/main
+            live_upstream=$(git rev-parse refs/remotes/upstream/main)
+            [[ "$live_upstream" == "$upstream_sha" ]] || {
+              echo "::error::provenance upstream SHA moved during strict replay";
+              watch_debt "upstream-sha-moved";
+              sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
+              echo "qualified=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            }
+            fork_main=$(git rev-parse refs/remotes/origin/main)
+            fork_main_is_ancestor=false
+            if git merge-base --is-ancestor "$fork_main" "$upstream_sha" 2>/dev/null; then
+              fork_main_is_ancestor=true
+            fi
+            replay_worktree=$(mktemp -d "$RUNNER_TEMP/u2-replay.XXXXXX")
+            rm -rf "$replay_worktree"
+            git worktree add --detach "$replay_worktree" "$PUSH_BEFORE" >/dev/null
+            replay_log="$RUNNER_TEMP/u2-replay.log"
+            replay_result_file="$RUNNER_TEMP/u2-replay-result.json"
+            set +e
+            PYTHONPATH="$trusted_root" python3 "$trusted_root/scripts/upstream_monitor.py" prepare-candidate \
+              --repo "$replay_worktree" \
+              --upstream-ref "$upstream_sha" \
+              --base-ref "$PUSH_BEFORE" > "$replay_result_file" 2> "$replay_log"
+            replay_exit=$?
+            set -e
+            git worktree remove --force "$replay_worktree"
+            if [[ "$replay_exit" -ne 0 ]] || ! jq -e . "$replay_result_file" >/dev/null 2>&1; then
+              echo "::error::trusted replay rebuild failed"
+              cat "$replay_log"
+              watch_debt "replay-rebuild-failed"
+              sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
+              echo "qualified=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            replay_status=$(jq -r '.status' "$replay_result_file")
+            replay_candidate_needed=$(jq -r '.candidate_needed' "$replay_result_file")
+            rebuilt_candidate=$(jq -r '.candidate_sha // empty' "$replay_result_file")
+            [[ -n "$rebuilt_candidate" ]] || {
+              echo "::error::trusted replay did not produce a candidate commit"; exit 1;
+            }
+            rebuilt_tree=$(git rev-parse "${rebuilt_candidate}^{tree}")
+            replay_file="$RUNNER_TEMP/u2-replay-evidence.json"
+            jq -n \
+              --arg status "$replay_status" \
+              --arg before "$PUSH_BEFORE" \
+              --arg source_after "$PUSH_AFTER" \
+              --arg candidate "$candidate" \
+              --arg upstream "$upstream_sha" \
+              --arg upstream_repository "$UPSTREAM_REPO" \
+              --arg upstream_ref "$UPSTREAM_REF" \
+              --arg fork_main "$fork_main" \
+              --arg marker_tree "$candidate_tree" \
+              --arg candidate_tree "$actual_candidate_tree" \
+              --arg rebuilt_tree "$rebuilt_tree" \
+              --arg source_tree "$actual_source_tree" \
+              --argjson source_parents "$source_parents" \
+              --argjson candidate_parents "$candidate_parents" \
+              --argjson candidate_needed "$replay_candidate_needed" \
+              --argjson fork_main_is_ancestor "$fork_main_is_ancestor" \
+              '{status:$status,candidate_needed:$candidate_needed,before:$before,source_after:$source_after,source_parents:$source_parents,candidate:$candidate,candidate_parents:$candidate_parents,upstream:$upstream,upstream_repository:$upstream_repository,upstream_ref:$upstream_ref,fork_main:$fork_main,fork_main_is_ancestor:$fork_main_is_ancestor,marker_tree:$marker_tree,candidate_tree:$candidate_tree,rebuilt_tree:$rebuilt_tree,source_tree:$source_tree}' \
+              > "$replay_file"
+            result=$(python3 "$trusted_root/scripts/u2_release.py" qualify-u1 \
               --before "$PUSH_BEFORE" \
               --after "$PUSH_AFTER" \
               --parents $parents \
@@ -188,9 +268,7 @@ jobs:
               --marker "$marker" \
               --candidate-tree "$candidate_tree" \
               --upstream-ancestor "$upstream_is_ancestor" \
-              --replay-status clean \
-              --replay-tree "$replay_tree" \
-              --replay-actual-tree "$actual_tree")
+              --replay-file "$replay_file")
             if [[ "$(jq -r '.qualified' <<<"$result")" != "true" ]]; then
               reason=$(jq -r '.reason' <<<"$result")
               echo "::error::auto-upstream qualification failed: $reason"
