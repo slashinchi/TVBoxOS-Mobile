@@ -1341,7 +1341,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         promote_step = next(s for s in steps if "Promote patched to exact release SHA" in str(s))
         promote_text = str(promote_step)
         self.assertIn("refs/tags/${tag}^{}", promote_text)
-        self.assertIn("peeled tag target commit", promote_text)
+        self.assertIn("tag target commit", promote_text)
+        self.assertIn("resolve_tag_target", promote_text)
         self.assertNotIn('gh release view "$tag"', promote_text)
         # Metadata reconciliation must fail closed when the remote baseline
         # cannot be read (never treat an empty current as "may advance").
@@ -1413,7 +1414,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         draft_step = next(s for s in steps if "Create or reconcile draft" in str(s))
         draft_run = str(draft_step).replace("\\n", "\n")
         self.assertNotIn("--silent", draft_run)
-        self.assertIn("if tag_target_sha=$(git ls-remote --exit-code", draft_run)
+        self.assertIn("tag_target_sha=$(resolve_tag_target", draft_run)
+        self.assertIn("object.type", draft_run)
         self.assertIn("refs/tags/${tag}^{}", draft_run)
 
     def test_u2_metadata_reconciliation_is_bounded_two_file_normal_cas(self):
@@ -2293,6 +2295,118 @@ class U2ReleaseContractTests(unittest.TestCase):
             condition = str(jobs[job_id].get("if", ""))
             self.assertIn("noop", condition, job_id)
             self.assertIn("noop-smoke", condition, job_id)
+
+    def _run_tag_target_resolver(self, output, object_type, status=0):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        promote = next(
+            step for step in tree["jobs"]["publish"]["steps"]
+            if step.get("name") == "Promote patched to exact release SHA (CAS)"
+        )
+        match = re.search(
+            r"(?ms)^[ \t]*resolve_tag_target\(\) \{\n.*?^[ \t]*}\n",
+            promote["run"],
+        )
+        self.assertIsNotNone(match, "typed tag resolver is missing from promote")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"${1:-}\" == \"ls-remote\" ]]; then\n"
+                "  printf '%s' \"${TAG_OUTPUT-}\"\n"
+                "  exit \"${TAG_STATUS:-0}\"\n"
+                "fi\n"
+                "exit 99\n"
+            )
+            fake_git.chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "TAG_OUTPUT": output,
+                "TAG_OBJECT_TYPE": object_type,
+                "TAG_STATUS": str(status),
+            }
+            return subprocess.run(
+                [
+                    "bash", "-c",
+                    match.group(0)
+                    + '\nresolve_tag_target "remote" "vtest" "$TAG_OBJECT_TYPE"\n',
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+    def test_u2_tag_resolver_uses_peeled_commit_for_annotated_tag(self):
+        tag_object = "a" * 40
+        commit = "b" * 40
+        output = (
+            f"{tag_object}\trefs/tags/vtest\n"
+            f"{commit}\trefs/tags/vtest^{{}}\n"
+        )
+        result = self._run_tag_target_resolver(output, "tag")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, commit + "\n")
+
+    def test_u2_tag_resolver_accepts_direct_commit_for_lightweight_tag(self):
+        commit = "c" * 40
+        result = self._run_tag_target_resolver(
+            f"{commit}\trefs/tags/vtest\n",
+            "commit",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, commit + "\n")
+
+    def test_u2_tag_resolver_rejects_tag_objects_and_malformed_remote_output(self):
+        tag_object = "d" * 40
+        commit = "e" * 40
+        cases = [
+            ("tag", f"{tag_object}\trefs/tags/vtest\n"),
+            ("commit", ""),
+            ("commit", f"{commit}\trefs/tags/vtest\n{tag_object}\trefs/tags/vtest\n"),
+            ("commit", f"{commit}\trefs/tags/vtest\n{tag_object}\trefs/tags/other\n"),
+            ("commit", f"not-a-sha\trefs/tags/vtest\n"),
+            ("unknown", f"{commit}\trefs/tags/vtest\n"),
+            (
+                "commit",
+                f"{commit}\trefs/tags/vtest\n{tag_object}\trefs/tags/vtest^{{}}\n",
+            ),
+        ]
+        for object_type, output in cases:
+            with self.subTest(object_type=object_type, output=output):
+                result = self._run_tag_target_resolver(output, object_type)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_u2_all_tag_identity_checks_use_typed_peeled_or_direct_resolver(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        steps = tree["jobs"]["publish"]["steps"]
+        names = {
+            "Promote patched to exact release SHA (CAS)": '"$tag_target_sha" == "$RELEASE_SHA"',
+            "Create or reconcile draft Release with exact identity": '"$tag_target_sha" == "$RELEASE_SHA"',
+            "Freeze Release identity after first draft/asset operation": '"$tag_target_sha" == "$RELEASE_SHA"',
+            "Revalidate frozen Release identity after asset operation": '"$tag_target_sha" == "$FROZEN_TARGET_SHA"',
+            "Publish verified draft": '"$tag_target_sha" == "$FROZEN_TARGET_SHA"',
+        }
+        resolution_text = []
+        for name, target_check in names.items():
+            step = next(step for step in steps if step.get("name") == name)
+            run = step["run"]
+            resolution_text.append(run)
+            self.assertIn("resolve_tag_target()", run, name)
+            self.assertIn("object.type", run, name)
+            self.assertIn("refs/tags/", run, name)
+            self.assertIn("^{}", run, name)
+            self.assertIn(target_check, run, name)
+        all_resolution = "\n".join(resolution_text)
+        self.assertNotIn("tag_target_sha=$(git ls-remote", all_resolution)
+        self.assertIn('case "$object_type" in', all_resolution)
+        self.assertIn("tag)", all_resolution)
+        self.assertIn("commit)", all_resolution)
 
 
 if __name__ == "__main__":

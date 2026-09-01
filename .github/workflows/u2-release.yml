@@ -1050,25 +1050,56 @@ jobs:
             tag_read_action=$(jq -er '.action' <<<"$tag_read_result") || {
               echo "::error::promotion tag read classification returned no action"; exit 1;
             }
-            if [[ "$tag_read_action" == "present" ]]; then
-              if tag_target_sha=$(git ls-remote --exit-code \
-                "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
-                "refs/tags/${tag}^{}" | awk 'NF {print $1}'); then
-                [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]] || {
-                  echo "::error::peeled tag target commit does not equal release SHA; refusing recovery"; exit 1;
-                }
-              else
-                echo "::error::tag was present but its peeled target commit could not be read; refusing to continue"; exit 1
-              fi
-            elif [[ "$tag_read_action" == "missing" ]]; then
-              tag_target_sha=""
-            else
+            if [[ "$tag_read_action" == "missing" ]]; then
+              echo "::error::formal tag ref is missing during recovery; refusing to continue"; exit 1
+            elif [[ "$tag_read_action" != "present" ]]; then
               echo "::error::promotion tag read failed (status=$tag_read_status http=$tag_http_status); only explicit HTTP 404 may report missing"; exit 1
             fi
-            if [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]]; then
-              echo "::notice::recovery: peeled tag target commit equals release SHA ($tag_target_sha); continuing"
+            resolve_tag_target() {
+              local remote="$1"
+              local tag="$2"
+              local object_type="$3"
+              local output sha ref extra direct="" peeled=""
+              output=$(git ls-remote --exit-code "$remote" \
+                "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+              [[ -n "$output" ]] || return 1
+              while IFS=$'\t' read -r sha ref extra; do
+                [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                case "$ref" in
+                  "refs/tags/${tag}^{}")
+                    [[ -z "$peeled" ]] || return 1
+                    peeled="$sha"
+                    ;;
+                  "refs/tags/${tag}")
+                    [[ -z "$direct" ]] || return 1
+                    direct="$sha"
+                    ;;
+                  *) return 1 ;;
+                esac
+              done <<<"$output"
+              case "$object_type" in
+                tag)
+                  [[ -n "$direct" && -n "$peeled" ]] || return 1
+                  printf '%s\n' "$peeled"
+                  ;;
+                commit)
+                  [[ -n "$direct" && -z "$peeled" ]] || return 1
+                  printf '%s\n' "$direct"
+                  ;;
+                *) return 1 ;;
+              esac
+            }
+            tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+              echo "::error::promotion tag object type read failed; refusing to continue"; exit 1;
+            }
+            if tag_target_sha=$(resolve_tag_target \
+              "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$tag" "$tag_object_type"); then
+              [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                echo "::error::tag target commit does not equal release SHA; refusing recovery"; exit 1;
+              }
+              echo "::notice::recovery: tag target commit equals release SHA ($tag_target_sha); continuing"
             else
-              echo "::error::patched advanced past the release SHA and formal tag target commit is not exact; pending RC is stale"
+              echo "::error::formal tag target commit is not readable or exact; pending RC is stale"
               exit 1
             fi
           else
@@ -1253,15 +1284,50 @@ jobs:
             tag_target_sha=""
             case "$tag_read_action" in
               present)
-                if tag_target_sha=$(git ls-remote --exit-code \
-                  "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
-                  "refs/tags/${tag}^{}" | awk 'NF {print $1}'); then
-                  [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]] || {
-                    echo "::error::peeled tag target commit does not equal release SHA; refusing to mutate"; exit 1;
-                  }
-                else
-                  echo "::error::tag was present but its peeled target commit could not be read; refusing to fallback"; exit 1
-                fi
+                tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+                  echo "::error::tag object type read failed; refusing to fallback"; exit 1;
+                }
+                resolve_tag_target() {
+                  local remote="$1"
+                  local tag="$2"
+                  local object_type="$3"
+                  local output sha ref extra direct="" peeled=""
+                  output=$(git ls-remote --exit-code "$remote" \
+                    "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+                  [[ -n "$output" ]] || return 1
+                  while IFS=$'\t' read -r sha ref extra; do
+                    [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                    case "$ref" in
+                      "refs/tags/${tag}^{}")
+                        [[ -z "$peeled" ]] || return 1
+                        peeled="$sha"
+                        ;;
+                      "refs/tags/${tag}")
+                        [[ -z "$direct" ]] || return 1
+                        direct="$sha"
+                        ;;
+                      *) return 1 ;;
+                    esac
+                  done <<<"$output"
+                  case "$object_type" in
+                    tag)
+                      [[ -n "$direct" && -n "$peeled" ]] || return 1
+                      printf '%s\n' "$peeled"
+                      ;;
+                    commit)
+                      [[ -n "$direct" && -z "$peeled" ]] || return 1
+                      printf '%s\n' "$direct"
+                      ;;
+                    *) return 1 ;;
+                  esac
+                }
+                tag_target_sha=$(resolve_tag_target \
+                  "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$tag" "$tag_object_type") || {
+                  echo "::error::tag target commit resolution failed; refusing to fallback"; exit 1;
+                }
+                [[ "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                  echo "::error::tag target commit does not equal release SHA; refusing to mutate"; exit 1;
+                }
                 ;;
               missing)
                 : # Drafts have no tag ref; an explicit 404 permits fallback.
@@ -1337,15 +1403,52 @@ jobs:
             }
             tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
             if [[ "$tag_read_action" == "present" ]]; then
-              tag_target_sha=$(git ls-remote --exit-code \
-                "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
-                "refs/tags/${tag}^{}" | awk 'NF {print $1}') || {
-                echo "::error::pre-create peeled tag target commit read failed; fail closed"; exit 1;
+              tag_api="repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}"
+              tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+                echo "::error::pre-create tag object type read failed; fail closed"; exit 1;
               }
-              [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]] || {
-                echo "::error::pre-create peeled tag target commit does not equal release SHA; fail closed"; exit 1;
+              resolve_tag_target() {
+                local remote="$1"
+                local tag="$2"
+                local object_type="$3"
+                local output sha ref extra direct="" peeled=""
+                output=$(git ls-remote --exit-code "$remote" \
+                  "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+                [[ -n "$output" ]] || return 1
+                while IFS=$'\t' read -r sha ref extra; do
+                  [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                  case "$ref" in
+                    "refs/tags/${tag}^{}")
+                      [[ -z "$peeled" ]] || return 1
+                      peeled="$sha"
+                      ;;
+                    "refs/tags/${tag}")
+                      [[ -z "$direct" ]] || return 1
+                      direct="$sha"
+                      ;;
+                    *) return 1 ;;
+                  esac
+                done <<<"$output"
+                case "$object_type" in
+                  tag)
+                    [[ -n "$direct" && -n "$peeled" ]] || return 1
+                    printf '%s\n' "$peeled"
+                    ;;
+                  commit)
+                    [[ -n "$direct" && -z "$peeled" ]] || return 1
+                    printf '%s\n' "$direct"
+                    ;;
+                  *) return 1 ;;
+                esac
               }
-              echo "::notice::pre-create peeled tag target commit equals release SHA ($tag_target_sha)"
+              tag_target_sha=$(resolve_tag_target \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$tag" "$tag_object_type") || {
+                echo "::error::pre-create tag target commit resolution failed; fail closed"; exit 1;
+              }
+              [[ "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                echo "::error::pre-create tag target commit does not equal release SHA; fail closed"; exit 1;
+              }
+              echo "::notice::pre-create tag target commit equals release SHA ($tag_target_sha)"
             elif [[ "$tag_read_action" != "missing" ]]; then
               echo "::error::pre-create tag identity is unreadable; fail closed"; exit 1
             fi
@@ -1409,18 +1512,53 @@ jobs:
              --status "$tag_read_status" --http-status "$tag_http_status") || {
              echo "::error::first Release tag identity classification failed; fail closed"; exit 1;
            }
-           tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
-            tag_target_sha=""
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
             if [[ "$tag_read_action" == "present" ]]; then
-              if tag_target_sha=$(git ls-remote --exit-code \
-                "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
-                "refs/tags/${tag}^{}" | awk 'NF {print $1}'); then
-                [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]] || {
-                  echo "::error::first Release peeled tag target commit does not equal release SHA; fail closed"; exit 1;
-                }
-              else
-                echo "::error::first Release peeled tag target commit read failed; fail closed"; exit 1;
-              fi
+              tag_api="repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}"
+              tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+                echo "::error::first Release tag object type read failed; fail closed"; exit 1;
+              }
+              resolve_tag_target() {
+                local remote="$1"
+                local tag="$2"
+                local object_type="$3"
+                local output sha ref extra direct="" peeled=""
+                output=$(git ls-remote --exit-code "$remote" \
+                  "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+                [[ -n "$output" ]] || return 1
+                while IFS=$'\t' read -r sha ref extra; do
+                  [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                  case "$ref" in
+                    "refs/tags/${tag}^{}")
+                      [[ -z "$peeled" ]] || return 1
+                      peeled="$sha"
+                      ;;
+                    "refs/tags/${tag}")
+                      [[ -z "$direct" ]] || return 1
+                      direct="$sha"
+                      ;;
+                    *) return 1 ;;
+                  esac
+                done <<<"$output"
+                case "$object_type" in
+                  tag)
+                    [[ -n "$direct" && -n "$peeled" ]] || return 1
+                    printf '%s\n' "$peeled"
+                    ;;
+                  commit)
+                    [[ -n "$direct" && -z "$peeled" ]] || return 1
+                    printf '%s\n' "$direct"
+                    ;;
+                  *) return 1 ;;
+                esac
+              }
+              tag_target_sha=$(resolve_tag_target \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$tag" "$tag_object_type") || {
+                echo "::error::first Release tag target commit resolution failed; fail closed"; exit 1;
+              }
+              [[ "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                echo "::error::first Release tag target commit changed; fail closed"; exit 1;
+              }
             elif [[ "$tag_read_action" != "missing" ]]; then
               echo "::error::first Release tag read failed; fail closed"; exit 1
             fi
@@ -1540,21 +1678,56 @@ jobs:
              --status "$tag_read_status" --http-status "$tag_http_status") || {
              echo "::error::post-asset tag identity classification failed; fail closed"; exit 1;
            }
-           tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
-            tag_target_sha=""
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
             if [[ "$tag_read_action" == "present" ]]; then
-              if tag_target_sha=$(git ls-remote --exit-code \
-                "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
-                "refs/tags/${FROZEN_TAG}^{}" | awk 'NF {print $1}'); then
-                [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
-                  echo "::error::post-asset peeled tag target commit changed; fail closed"; exit 1;
-                }
-              else
-                echo "::error::post-asset peeled tag target commit read failed; fail closed"; exit 1;
-              fi
-           elif [[ "$tag_read_action" != "missing" ]]; then
-             echo "::error::post-asset tag read failed; fail closed"; exit 1
-           fi
+              tag_api="repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${FROZEN_TAG}"
+              tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+                echo "::error::post-asset tag object type read failed; fail closed"; exit 1;
+              }
+              resolve_tag_target() {
+                local remote="$1"
+                local tag="$2"
+                local object_type="$3"
+                local output sha ref extra direct="" peeled=""
+                output=$(git ls-remote --exit-code "$remote" \
+                  "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+                [[ -n "$output" ]] || return 1
+                while IFS=$'\t' read -r sha ref extra; do
+                  [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                  case "$ref" in
+                    "refs/tags/${tag}^{}")
+                      [[ -z "$peeled" ]] || return 1
+                      peeled="$sha"
+                      ;;
+                    "refs/tags/${tag}")
+                      [[ -z "$direct" ]] || return 1
+                      direct="$sha"
+                      ;;
+                    *) return 1 ;;
+                  esac
+                done <<<"$output"
+                case "$object_type" in
+                  tag)
+                    [[ -n "$direct" && -n "$peeled" ]] || return 1
+                    printf '%s\n' "$peeled"
+                    ;;
+                  commit)
+                    [[ -n "$direct" && -z "$peeled" ]] || return 1
+                    printf '%s\n' "$direct"
+                    ;;
+                  *) return 1 ;;
+                esac
+              }
+              tag_target_sha=$(resolve_tag_target \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$FROZEN_TAG" "$tag_object_type") || {
+                echo "::error::post-asset tag target commit resolution failed; fail closed"; exit 1;
+              }
+              [[ "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
+                echo "::error::post-asset tag target commit changed; fail closed"; exit 1;
+              }
+            elif [[ "$tag_read_action" != "missing" ]]; then
+              echo "::error::post-asset tag read failed; fail closed"; exit 1
+            fi
            if [[ "$is_draft" == "true" ]]; then
              [[ "$target_commitish" == "$FROZEN_TARGET_SHA" ]] || {
                echo "::error::post-asset draft target changed; fail closed"; exit 1;
@@ -1656,15 +1829,51 @@ jobs:
             tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
             tag_target_sha=""
             if [[ "$tag_read_action" == "present" ]]; then
-              if tag_target_sha=$(git ls-remote --exit-code \
-                "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
-                "refs/tags/${tag}^{}" | awk 'NF {print $1}'); then
-                [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
-                  echo "::error::pre-publish peeled tag target commit changed; fail closed"; exit 1;
-                }
-              else
-                echo "::error::pre-publish peeled tag target commit read failed; fail closed"; exit 1;
-              fi
+              tag_api="repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}"
+              tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+                echo "::error::pre-publish tag object type read failed; fail closed"; exit 1;
+              }
+              resolve_tag_target() {
+                local remote="$1"
+                local tag="$2"
+                local object_type="$3"
+                local output sha ref extra direct="" peeled=""
+                output=$(git ls-remote --exit-code "$remote" \
+                  "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+                [[ -n "$output" ]] || return 1
+                while IFS=$'\t' read -r sha ref extra; do
+                  [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                  case "$ref" in
+                    "refs/tags/${tag}^{}")
+                      [[ -z "$peeled" ]] || return 1
+                      peeled="$sha"
+                      ;;
+                    "refs/tags/${tag}")
+                      [[ -z "$direct" ]] || return 1
+                      direct="$sha"
+                      ;;
+                    *) return 1 ;;
+                  esac
+                done <<<"$output"
+                case "$object_type" in
+                  tag)
+                    [[ -n "$direct" && -n "$peeled" ]] || return 1
+                    printf '%s\n' "$peeled"
+                    ;;
+                  commit)
+                    [[ -n "$direct" && -z "$peeled" ]] || return 1
+                    printf '%s\n' "$direct"
+                    ;;
+                  *) return 1 ;;
+                esac
+              }
+              tag_target_sha=$(resolve_tag_target \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$tag" "$tag_object_type") || {
+                echo "::error::pre-publish tag target commit resolution failed; fail closed"; exit 1;
+              }
+              [[ "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
+                echo "::error::pre-publish tag target commit changed; fail closed"; exit 1;
+              }
             elif [[ "$tag_read_action" == "missing" && "$is_draft" == "true" ]]; then
               : # Draft Releases have no formal tag ref yet.
             else
