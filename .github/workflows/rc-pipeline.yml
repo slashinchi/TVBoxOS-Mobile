@@ -352,6 +352,7 @@ jobs:
       actions: read
     outputs:
       report_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      report_artifact_name: ${{ steps.outputs.outputs.artifact_name }}
       report_artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
       primary_artifact_id: ${{ needs.build_unsigned.outputs.artifact_id }}
       primary_artifact_digest: ${{ needs.build_unsigned.outputs.artifact_digest }}
