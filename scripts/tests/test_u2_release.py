@@ -976,6 +976,10 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("release-production", workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("push:", workflow)
+        push_trigger = workflow[workflow.index("  push:") : workflow.index("\n\npermissions:")]
+        self.assertIn("paths-ignore:", push_trigger)
+        for ignored_path in ("docs/**", "scripts/tests/**", ".github/workflows/u2-release.yml"):
+            self.assertIn(ignored_path, push_trigger)
         for path in (ROOT / ".github/workflows").glob("*.yml"):
             text = path.read_text()
             if path.name in {"u2-release.yml", "rc-pipeline.yml"}:
