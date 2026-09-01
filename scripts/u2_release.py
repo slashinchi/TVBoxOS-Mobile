@@ -13,6 +13,8 @@ from pathlib import Path
 
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+OFFICIAL_UPSTREAM_REPOSITORY = "kukuqi666/TVBoxOS-Mobile"
+OFFICIAL_UPSTREAM_REF = "refs/heads/main"
 VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)+$")
 VERSION_CODE_RE = re.compile(r"^[0-9]+$")
 RUN_ID_RE = re.compile(r"^[0-9]+$")
@@ -31,6 +33,7 @@ PROVENANCE_RE = re.compile(
     r"upstream=(?P<upstream>[0-9a-f]{40}) "
     r"candidate=(?P<candidate>[0-9a-f]{40}) "
     r"tree=(?P<tree>[0-9a-f]{40}) "
+    r"forkMain=(?P<forkMain>[0-9a-f]{40}) "
     r"upstreamVersion=(?P<upstreamVersion>[0-9]+(?:\.[0-9]+)+) "
     r"upstreamCode=(?P<upstreamCode>[0-9]+) -->$"
 )
@@ -45,6 +48,48 @@ FORK_CONTROL_FILES = {
     "NOTICE.md",
 }
 DOC_SUFFIXES = (".md", ".markdown", ".txt", ".adoc", ".rst")
+LEGACY_RELEASE_FIELDS = frozenset({
+    "tag",
+    "target",
+    "versionName",
+    "versionCode",
+    "assetSha256",
+    "signerSha256",
+    "verified",
+    "tag_ancestor",
+})
+COMPLETE_RELEASE_FIELDS = frozenset({
+    *LEGACY_RELEASE_FIELDS,
+    "updateSha256",
+    "sourceSha",
+    "debt",
+    "runId",
+    "runAttempt",
+})
+
+
+def _reject_duplicate_object_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def strict_json_loads(value):
+    """Parse JSON without silently accepting duplicate object keys."""
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("JSON must be valid UTF-8") from exc
+    if not isinstance(value, str):
+        raise ValueError("JSON input must be text or UTF-8 bytes")
+    try:
+        return json.loads(value, object_pairs_hook=_reject_duplicate_object_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid JSON") from exc
 
 
 def _full_sha(value, label):
@@ -125,16 +170,17 @@ def normalize_version_overlay(base_text, ours_text, theirs_text):
     return merged, theirs_version
 
 
-def build_provenance_marker(upstream, candidate, tree, upstream_version, upstream_code):
+def build_provenance_marker(upstream, candidate, tree, fork_main, upstream_version, upstream_code):
     _full_sha(upstream, "upstream SHA")
     _full_sha(candidate, "candidate SHA")
     _full_sha(tree, "candidate tree")
+    _full_sha(fork_main, "fork main SHA")
     _version_tuple(upstream_version)
     if int(upstream_code) <= 0:
         raise ValueError("upstreamCode must be positive")
     return (
         "<!-- tvbox-upstream-candidate-v2 "
-        f"upstream={upstream} candidate={candidate} tree={tree} "
+        f"upstream={upstream} candidate={candidate} tree={tree} forkMain={fork_main} "
         f"upstreamVersion={upstream_version} upstreamCode={int(upstream_code)} -->"
     )
 
@@ -146,13 +192,59 @@ def parse_provenance_marker(marker):
     return match.groupdict()
 
 
-def fresh_integration_replay(replayed_status, replayed_tree, actual_tree):
-    """Accept only a clean trusted replay whose tree equals the human merge."""
-    if replayed_status != "clean":
+def validate_replay_evidence(evidence, expected_upstream_repository, expected_upstream_ref):
+    """Validate the complete trusted replay proof, not just its resulting tree."""
+    if not isinstance(evidence, dict) or evidence.get("status") != "clean":
         return {"qualified": False, "reason": "replay-not-clean"}
-    if not FULL_SHA_RE.fullmatch(replayed_tree or "") or replayed_tree != actual_tree:
+
+    sha_fields = (
+        "before",
+        "source_after",
+        "candidate",
+        "upstream",
+        "fork_main",
+        "marker_fork_main",
+        "marker_tree",
+        "candidate_tree",
+        "rebuilt_tree",
+        "source_tree",
+    )
+    if any(not FULL_SHA_RE.fullmatch(evidence.get(field, "")) for field in sha_fields):
+        return {"qualified": False, "reason": "replay-evidence-invalid"}
+
+    if evidence.get("source_parents") != [evidence["before"], evidence["candidate"]]:
+        return {"qualified": False, "reason": "replay-source-parent-mismatch"}
+    if evidence.get("candidate_parents") != [evidence["before"], evidence["upstream"]]:
+        return {"qualified": False, "reason": "replay-candidate-parent-mismatch"}
+    if evidence.get("candidate_needed") is not True:
+        return {"qualified": False, "reason": "replay-candidate-not-built"}
+    if evidence["marker_fork_main"] != evidence["fork_main"]:
+        return {"qualified": False, "reason": "replay-fork-main-mismatch"}
+    if (
+        evidence.get("upstream_repository") != expected_upstream_repository
+        or evidence.get("upstream_ref") != expected_upstream_ref
+    ):
+        return {"qualified": False, "reason": "replay-upstream-source-mismatch"}
+    if evidence.get("fork_main_is_ancestor") is not True:
+        return {"qualified": False, "reason": "replay-fork-main-not-ancestor"}
+    trees = [
+        evidence["marker_tree"],
+        evidence["candidate_tree"],
+        evidence["rebuilt_tree"],
+        evidence["source_tree"],
+    ]
+    if len(set(trees)) != 1:
         return {"qualified": False, "reason": "replay-tree-mismatch"}
-    return {"qualified": True, "reason": "replay-match"}
+    return {
+        "qualified": True,
+        "reason": "replay-match",
+        "before": evidence["before"],
+        "source_after": evidence["source_after"],
+        "candidate": evidence["candidate"],
+        "upstream": evidence["upstream"],
+        "fork_main": evidence["fork_main"],
+        "tree": trees[0],
+    }
 
 
 def qualify_u1_merge(
@@ -167,6 +259,8 @@ def qualify_u1_merge(
     marker,
     candidate_tree,
     upstream_is_ancestor,
+    upstream_version,
+    upstream_code,
     replay,
 ):
     """Strictly qualify the automatic U1 merge ingress without trusting prose."""
@@ -203,9 +297,38 @@ def qualify_u1_merge(
         return {"qualified": False, "reason": "associated-pr-mismatch"}
     if parsed["upstream"] != upstream_sha or parsed["tree"] != candidate_tree:
         return {"qualified": False, "reason": "provenance-object-mismatch"}
+    if parsed["forkMain"] != upstream_sha:
+        return {"qualified": False, "reason": "provenance-fork-main-mismatch"}
+    try:
+        expected_upstream_version = _version_tuple(upstream_version)
+        expected_upstream_code = int(upstream_code)
+    except (TypeError, ValueError):
+        return {"qualified": False, "reason": "upstream-version-evidence-invalid"}
+    if expected_upstream_code <= 0 or _version_tuple(parsed["upstreamVersion"]) != expected_upstream_version:
+        return {"qualified": False, "reason": "provenance-version-mismatch"}
+    if int(parsed["upstreamCode"]) != expected_upstream_code:
+        return {"qualified": False, "reason": "provenance-version-mismatch"}
     if not upstream_is_ancestor:
         return {"qualified": False, "reason": "upstream-not-ancestor"}
-    replay_result = fresh_integration_replay(*replay)
+    if not isinstance(replay, dict):
+        return {"qualified": False, "reason": "replay-evidence-required"}
+    replay_result = validate_replay_evidence(
+        replay,
+        OFFICIAL_UPSTREAM_REPOSITORY,
+        OFFICIAL_UPSTREAM_REF,
+    )
+    if replay_result["qualified"] and replay_result["fork_main"] != parsed["forkMain"]:
+        return {"qualified": False, "reason": "provenance-fork-main-mismatch"}
+    if replay_result["qualified"] and any(
+        (
+            replay_result["before"] != before,
+            replay_result["source_after"] != after,
+            replay_result["candidate"] != parsed["candidate"],
+            replay_result["upstream"] != upstream_sha,
+            replay_result["tree"] != candidate_tree,
+        )
+    ):
+        return {"qualified": False, "reason": "replay-outer-identity-mismatch"}
     if not replay_result["qualified"]:
         return replay_result
     return {
@@ -228,23 +351,89 @@ def derive_integrated_upstream_sha(merge_bases, upstream_history, current_patche
 
 def canonical_release_baseline(releases, update_version=None, delivery_hold=False):
     """Select one internally consistent published release, never from tag text alone."""
+    if not isinstance(releases, list):
+        raise ValueError("verified release ledger must be a JSON array")
     valid = []
+    identities = set()
+    tags = set()
+    versions = set()
+    version_codes = set()
+    targets = set()
+    previous_version = None
+    previous_version_code = None
+    complete_seen = False
     for release in releases:
+        if not isinstance(release, dict):
+            raise ValueError("verified release ledger entry must be an object")
+        fields = set(release)
+        if fields not in {LEGACY_RELEASE_FIELDS, COMPLETE_RELEASE_FIELDS}:
+            raise ValueError("malformed verified release ledger entry")
+        is_complete = fields == COMPLETE_RELEASE_FIELDS
+        if complete_seen and not is_complete:
+            raise ValueError("legacy verified release entry after complete identity")
+        if is_complete:
+            complete_seen = True
         required = ("tag", "target", "versionName", "versionCode", "assetSha256", "signerSha256")
-        if any(not release.get(key) for key in required):
-            continue
-        if not release.get("verified") or not release.get("tag_ancestor"):
-            continue
-        if not FULL_SHA_RE.fullmatch(release["target"]):
-            continue
-        _version_tuple(release["versionName"])
+        if any(key not in release or release.get(key) in (None, "") for key in required):
+            raise ValueError("malformed verified release ledger entry")
+        if not isinstance(release["tag"], str) or not re.fullmatch(r"v[0-9]+(?:\.[0-9]+){3}", release["tag"]):
+            raise ValueError("verified release tag is invalid")
+        if not isinstance(release["target"], str) or not FULL_SHA_RE.fullmatch(release["target"]):
+            raise ValueError("verified release target SHA is invalid")
+        if not isinstance(release["versionName"], str):
+            raise ValueError("verified release version is invalid")
+        release_version = _version_tuple(release["versionName"])
+        if release["tag"] != f"v{release['versionName']}":
+            raise ValueError("verified release tag/version mismatch")
         if (
-            int(release["versionCode"]) <= 0
+            isinstance(release["versionCode"], bool)
+            or not isinstance(release["versionCode"], int)
+            or int(release["versionCode"]) <= 0
+            or not isinstance(release["assetSha256"], str)
             or not HEX64_RE.fullmatch(release["assetSha256"])
+            or not isinstance(release["signerSha256"], str)
             or not HEX64_RE.fullmatch(release["signerSha256"])
         ):
-            continue
+            raise ValueError("verified release version or digest is invalid")
+        if release.get("verified") is not True or release.get("tag_ancestor") is not True:
+            raise ValueError("verified release flags must be true")
+        identity = (release["tag"], release["versionName"], release["target"])
+        if (
+            identity in identities
+            or release["tag"] in tags
+            or release["versionName"] in versions
+            or release["versionCode"] in version_codes
+            or release["target"] in targets
+        ):
+            raise ValueError("duplicate verified release identity")
+        release_version_code = release["versionCode"]
+        if previous_version is not None and (
+            release_version <= previous_version
+            or release_version_code <= previous_version_code
+        ):
+            raise ValueError("verified release ledger is not strictly increasing")
+        if is_complete:
+            if (
+                not isinstance(release["updateSha256"], str)
+                or not HEX64_RE.fullmatch(release["updateSha256"])
+                or not isinstance(release["sourceSha"], str)
+                or not FULL_SHA_RE.fullmatch(release["sourceSha"])
+                or not isinstance(release["debt"], str)
+                or not HEX64_RE.fullmatch(release["debt"])
+                or not isinstance(release["runId"], str)
+                or not isinstance(release["runAttempt"], str)
+                or not re.fullmatch(r"[1-9][0-9]*", release["runId"])
+                or not re.fullmatch(r"[1-9][0-9]*", release["runAttempt"])
+            ):
+                raise ValueError("verified release identity is invalid")
         valid.append(release)
+        identities.add(identity)
+        tags.add(release["tag"])
+        versions.add(release["versionName"])
+        version_codes.add(release["versionCode"])
+        targets.add(release["target"])
+        previous_version = release_version
+        previous_version_code = release_version_code
     if not valid:
         raise ValueError("no internally consistent formal release")
     valid.sort(key=lambda item: (int(item["versionCode"]), _version_tuple(item["versionName"])), reverse=True)
@@ -563,6 +752,7 @@ def main(argv=None):
     marker_parser.add_argument("--upstream", required=True)
     marker_parser.add_argument("--candidate", required=True)
     marker_parser.add_argument("--tree", required=True)
+    marker_parser.add_argument("--fork-main", required=True)
     marker_parser.add_argument("--upstream-version", required=True)
     marker_parser.add_argument("--upstream-code", required=True, type=int)
 
@@ -634,9 +824,9 @@ def main(argv=None):
     qualify_parser.add_argument("--marker", required=True)
     qualify_parser.add_argument("--candidate-tree", required=True)
     qualify_parser.add_argument("--upstream-ancestor", required=True, choices=["true", "false"])
-    qualify_parser.add_argument("--replay-status", required=True)
-    qualify_parser.add_argument("--replay-tree", required=True)
-    qualify_parser.add_argument("--replay-actual-tree", required=True)
+    qualify_parser.add_argument("--upstream-version", required=True)
+    qualify_parser.add_argument("--upstream-code", required=True, type=int)
+    qualify_parser.add_argument("--replay-file", required=True)
 
     plan_prep_parser = subparsers.add_parser("plan-prep")
     plan_prep_parser.add_argument("--upstream-name", required=True)
@@ -657,7 +847,7 @@ def main(argv=None):
     if args.command == "parse-app-version":
         print(json.dumps(dict(zip(("versionName", "versionCode"), parse_app_version(Path(args.file).read_text())))))
     elif args.command == "provenance-marker":
-        print(build_provenance_marker(args.upstream, args.candidate, args.tree, args.upstream_version, args.upstream_code))
+        print(build_provenance_marker(args.upstream, args.candidate, args.tree, args.fork_main, args.upstream_version, args.upstream_code))
     elif args.command == "parse-provenance-marker":
         print(json.dumps(parse_provenance_marker(args.marker), sort_keys=True))
     elif args.command == "normalize-version-overlay":
@@ -673,16 +863,16 @@ def main(argv=None):
     elif args.command == "debt-manifest":
         print(json.dumps(debt_manifest(Path(args.repo), args.baseline, args.current, args.exclude), ensure_ascii=True))
     elif args.command == "fingerprint-manifest":
-        print(fingerprint_manifest(json.loads(Path(args.file).read_text())))
+        print(fingerprint_manifest(strict_json_loads(Path(args.file).read_text())))
     elif args.command == "plan-version":
-        print(json.dumps(plan_version(args.upstream_name, args.upstream_code, json.loads(Path(args.published_file).read_text()))))
+        print(json.dumps(plan_version(args.upstream_name, args.upstream_code, strict_json_loads(Path(args.published_file).read_text()))))
     elif args.command == "release-trailers":
         print(build_release_trailers(args.source, args.mode, args.upstream, args.version, args.debt, args.pr, args.code))
     elif args.command == "canonical-runtime-dependencies":
         result = canonical_runtime_dependencies(Path(args.file).read_text(), args.configuration)
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     elif args.command == "release-debt":
-        releases = json.loads(Path(args.releases_file).read_text())
+        releases = strict_json_loads(Path(args.releases_file).read_text())
         baseline = canonical_release_baseline(releases)
         debt = cumulative_release_debt(Path(args.repo), baseline["target"], args.current, args.exclude)
         print(json.dumps({
@@ -697,7 +887,7 @@ def main(argv=None):
             "path_count": len(debt["paths"]),
         }, sort_keys=True))
     elif args.command == "canonical-release-baseline":
-        baseline = canonical_release_baseline(json.loads(Path(args.file).read_text()))
+        baseline = canonical_release_baseline(strict_json_loads(Path(args.file).read_text()))
         print(json.dumps({
             "tag": baseline["tag"],
             "target": baseline["target"],
@@ -718,8 +908,8 @@ def main(argv=None):
         else:
             print(json.dumps({"matched": False}, sort_keys=True))
     elif args.command == "qualify-u1":
-        pr = json.loads(args.pr)
-        replay = (args.replay_status, args.replay_tree, args.replay_actual_tree)
+        pr = strict_json_loads(args.pr)
+        replay = strict_json_loads(Path(args.replay_file).read_text())
         result = qualify_u1_merge(
             before=args.before,
             after=args.after,
@@ -731,12 +921,14 @@ def main(argv=None):
             marker=args.marker,
             candidate_tree=args.candidate_tree,
             upstream_is_ancestor=(args.upstream_ancestor == "true"),
+            upstream_version=args.upstream_version,
+            upstream_code=args.upstream_code,
             replay=replay,
         )
         print(json.dumps(result, sort_keys=True))
     elif args.command == "plan-prep":
         if args.upstream_name:
-            published = json.loads(Path(args.published_file).read_text())
+            published = strict_json_loads(Path(args.published_file).read_text())
             pairs = []
             for item in published:
                 if isinstance(item, dict):

@@ -13,6 +13,72 @@ RELEASE_TAG_RE = re.compile(r"^v[0-9]+(?:\.[0-9]+){3}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 INCIDENT_REASON_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+RUN_ID_RE = re.compile(r"^[1-9][0-9]*$")
+NFF_HINTS = {
+    "hint: Updates were rejected because the remote contains work that you do not",
+    "hint: have locally. This is usually caused by another repository pushing",
+    "hint: have locally. This is usually caused by another repository pushing to",
+    "hint: the same ref. You may want to first integrate the remote changes",
+    "hint: the same ref. If you want to integrate the remote changes use",
+    "hint: the same ref. If you want to integrate the remote changes, use",
+    "hint: (e.g., 'git pull ...') before pushing again.",
+    "hint: 'git pull ...') before pushing again.",
+    "hint: 'git pull' before pushing again.",
+    "hint: See the 'Note about fast-forwards' in 'git push --help' for details.",
+}
+
+
+def _reject_duplicate_object_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def strict_json_loads(value):
+    """Parse JSON without silently accepting duplicate object keys."""
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("JSON must be valid UTF-8") from exc
+    if not isinstance(value, str):
+        raise ValueError("JSON input must be text or UTF-8 bytes")
+    try:
+        return json.loads(value, object_pairs_hook=_reject_duplicate_object_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid JSON") from exc
+
+VERIFIED_RELEASE_FIELDS = (
+    "tag",
+    "target",
+    "versionName",
+    "versionCode",
+    "assetSha256",
+    "updateSha256",
+    "signerSha256",
+    "sourceSha",
+    "debt",
+    "runId",
+    "runAttempt",
+    "verified",
+    "tag_ancestor",
+)
+VERIFIED_RELEASE_STABLE_FIELDS = tuple(
+    field for field in VERIFIED_RELEASE_FIELDS if field != "runAttempt"
+)
+LEGACY_RELEASE_FIELDS = (
+    "tag",
+    "target",
+    "versionName",
+    "versionCode",
+    "assetSha256",
+    "signerSha256",
+    "verified",
+    "tag_ancestor",
+)
 
 
 def expected_asset_set(version):
@@ -30,15 +96,417 @@ def _asset_digest(item):
 
 
 def _require_full_sha(value, label):
-    if not FULL_SHA_RE.fullmatch(value or ""):
+    if not isinstance(value, str) or not FULL_SHA_RE.fullmatch(value):
         raise ValueError(f"{label} must be a full 40-char SHA")
     return value
 
 
 def _require_hex64(value, label):
-    if not HEX64_RE.fullmatch(value or ""):
+    if not isinstance(value, str) or not HEX64_RE.fullmatch(value):
         raise ValueError(f"{label} must be a 64-char hex digest")
     return value.lower()
+
+
+def _require_positive_integer(value, label):
+    text = str(value)
+    if isinstance(value, bool) or not RUN_ID_RE.fullmatch(text):
+        raise ValueError(f"{label} must be a positive integer")
+    return int(text)
+
+
+def verified_release_entry(
+    tag,
+    target,
+    version_name,
+    version_code,
+    asset_sha256,
+    update_sha256,
+    signer_sha256,
+    source_sha,
+    debt,
+    run_id,
+    run_attempt,
+):
+    """Build the complete immutable identity persisted for a verified Release."""
+    if not isinstance(tag, str) or not RELEASE_TAG_RE.fullmatch(tag):
+        raise ValueError("verified release tag must be a formal v* tag")
+    if not isinstance(version_name, str) or not VERSION_RE.fullmatch(version_name):
+        raise ValueError("verified release version must be 4-part numeric")
+    if tag != f"v{version_name}":
+        raise ValueError("verified release tag/version mismatch")
+    _require_full_sha(target, "verified release target SHA")
+    _require_full_sha(source_sha, "verified release source SHA")
+    code = _require_positive_integer(version_code, "verified release versionCode")
+    _require_hex64(asset_sha256, "verified release APK SHA-256")
+    _require_hex64(update_sha256, "verified release update SHA-256")
+    _require_hex64(signer_sha256, "verified release signer SHA-256")
+    _require_hex64(debt, "verified release debt fingerprint")
+    run = str(_require_positive_integer(run_id, "verified release run ID"))
+    attempt = str(_require_positive_integer(run_attempt, "verified release run attempt"))
+    return {
+        "tag": tag,
+        "target": target,
+        "versionName": version_name,
+        "versionCode": code,
+        "assetSha256": asset_sha256.lower(),
+        "updateSha256": update_sha256.lower(),
+        "signerSha256": signer_sha256.lower(),
+        "sourceSha": source_sha,
+        "debt": debt.lower(),
+        "runId": run,
+        "runAttempt": attempt,
+        "verified": True,
+        "tag_ancestor": True,
+    }
+
+
+def _validate_verified_release_entry(entry):
+    if not isinstance(entry, dict) or set(entry) != set(VERIFIED_RELEASE_FIELDS):
+        raise ValueError("malformed verified release entry")
+    expected = verified_release_entry(
+        tag=entry["tag"],
+        target=entry["target"],
+        version_name=entry["versionName"],
+        version_code=entry["versionCode"],
+        asset_sha256=entry["assetSha256"],
+        update_sha256=entry["updateSha256"],
+        signer_sha256=entry["signerSha256"],
+        source_sha=entry["sourceSha"],
+        debt=entry["debt"],
+        run_id=entry["runId"],
+        run_attempt=entry["runAttempt"],
+    )
+    if entry != expected:
+        raise ValueError("verified release entry is not canonical")
+    return entry
+
+
+def _validate_ledger_entry(entry):
+    if not isinstance(entry, dict):
+        raise ValueError("verified release ledger entry must be an object")
+    if set(entry) == set(VERIFIED_RELEASE_FIELDS):
+        return _validate_verified_release_entry(entry)
+    if set(entry) != set(LEGACY_RELEASE_FIELDS):
+        raise ValueError("malformed verified release ledger entry")
+    if not RELEASE_TAG_RE.fullmatch(entry.get("tag") or ""):
+        raise ValueError("legacy verified release tag is invalid")
+    if not VERSION_RE.fullmatch(entry.get("versionName") or ""):
+        raise ValueError("legacy verified release version is invalid")
+    if entry["tag"] != f"v{entry['versionName']}":
+        raise ValueError("legacy verified release tag/version mismatch")
+    _require_full_sha(entry.get("target"), "legacy verified release target SHA")
+    if isinstance(entry.get("versionCode"), bool) or not isinstance(entry.get("versionCode"), int):
+        raise ValueError("legacy verified release versionCode must be an integer")
+    _require_positive_integer(entry.get("versionCode"), "legacy verified release versionCode")
+    _require_hex64(entry.get("assetSha256"), "legacy verified release APK SHA-256")
+    _require_hex64(entry.get("signerSha256"), "legacy verified release signer SHA-256")
+    if entry.get("verified") is not True or entry.get("tag_ancestor") is not True:
+        raise ValueError("legacy verified release flags must be true")
+    return entry
+
+
+def _validate_ledger(ledger):
+    if not isinstance(ledger, list):
+        raise ValueError("verified release ledger must be a JSON array")
+    identities = set()
+    tags = set()
+    versions = set()
+    version_codes = set()
+    targets = set()
+    previous_version = None
+    previous_version_code = None
+    complete_seen = False
+    for entry in ledger:
+        validated = _validate_ledger_entry(entry)
+        fields = set(validated)
+        if complete_seen and fields == set(LEGACY_RELEASE_FIELDS):
+            raise ValueError("legacy verified release entry after complete identity")
+        if fields == set(VERIFIED_RELEASE_FIELDS):
+            complete_seen = True
+        version = tuple(int(part) for part in validated["versionName"].split("."))
+        version_code = validated["versionCode"]
+        if previous_version is not None and (
+            version <= previous_version or version_code <= previous_version_code
+        ):
+            raise ValueError("verified release ledger is not strictly increasing")
+        identity = (validated["tag"], validated["versionName"], validated["target"])
+        if (
+            identity in identities
+            or validated["tag"] in tags
+            or validated["versionName"] in versions
+            or validated["versionCode"] in version_codes
+            or validated["target"] in targets
+        ):
+            raise ValueError("duplicate verified release identity")
+        identities.add(identity)
+        tags.add(validated["tag"])
+        versions.add(validated["versionName"])
+        version_codes.add(validated["versionCode"])
+        targets.add(validated["target"])
+        previous_version = version
+        previous_version_code = version_code
+    return ledger
+
+
+def reconcile_verified_releases(ledger, entry):
+    """Reconcile one verified identity without rewriting a conflicting release."""
+    _validate_ledger(ledger)
+    _validate_verified_release_entry(entry)
+    identity = (entry["tag"], entry["versionName"], entry["target"])
+    for existing in ledger:
+        existing_identity = (
+            existing.get("tag"),
+            existing.get("versionName"),
+            existing.get("target"),
+        )
+        if existing == entry:
+            return {"action": "exact-reuse", "ledger": list(ledger)}
+        if all(existing.get(field) == entry[field] for field in VERIFIED_RELEASE_STABLE_FIELDS):
+            # A rerun can have a new workflow attempt after the Release already
+            # exists. Preserve the first durable run identity and reuse it.
+            return {"action": "exact-reuse", "ledger": list(ledger)}
+        if (
+            existing_identity == identity
+            or existing.get("tag") == entry["tag"]
+            or existing.get("versionName") == entry["versionName"]
+            or existing.get("versionCode") == entry["versionCode"]
+            or existing.get("target") == entry["target"]
+        ):
+            raise ValueError("verified release identity conflict")
+
+    versions = [
+        tuple(int(part) for part in existing["versionName"].split("."))
+        for existing in ledger
+    ]
+    version_codes = [int(existing["versionCode"]) for existing in ledger]
+    candidate_version = tuple(int(part) for part in entry["versionName"].split("."))
+    if versions and candidate_version < max(versions):
+        raise ValueError("verified release version is not monotonic")
+    if version_codes and entry["versionCode"] <= max(version_codes):
+        raise ValueError("verified release versionCode is not monotonic")
+    return {"action": "append", "ledger": [*ledger, dict(entry)]}
+
+
+def parse_update_metadata(metadata_bytes):
+    """Parse and semantically validate the strict two-field update manifest."""
+    payload = strict_json_loads(metadata_bytes)
+    if not isinstance(payload, dict) or set(payload) != {"version", "apk_url"}:
+        raise ValueError("update metadata must contain exactly version and apk_url")
+    build_update_json(payload["version"], payload["apk_url"])
+    return payload
+
+
+def reconcile_verified_release_metadata(
+    current_update_bytes,
+    current_ledger_bytes,
+    candidate_update_bytes,
+    entry,
+):
+    """Read and reconcile both metadata blobs without mutating either input."""
+    current = parse_update_metadata(current_update_bytes)
+    candidate = parse_update_metadata(candidate_update_bytes)
+    ledger = strict_json_loads(current_ledger_bytes)
+    _validate_ledger(ledger)
+    _validate_verified_release_entry(entry)
+    if not isinstance(current_update_bytes, (bytes, bytearray)) or not isinstance(
+        candidate_update_bytes, (bytes, bytearray)
+    ):
+        raise ValueError("metadata update blobs must be bytes")
+    if ledger and "updateSha256" in ledger[-1]:
+        if hashlib.sha256(current_update_bytes).hexdigest() != ledger[-1]["updateSha256"]:
+            raise ValueError("current update metadata digest does not match latest verified release")
+    if candidate["version"] != entry["versionName"]:
+        raise ValueError("candidate update version does not match verified release entry")
+    if hashlib.sha256(candidate_update_bytes).hexdigest() != entry["updateSha256"]:
+        raise ValueError("candidate update digest does not match verified release entry")
+
+    current_version = tuple(int(part) for part in current["version"].split("."))
+    candidate_version = tuple(int(part) for part in candidate["version"].split("."))
+    if candidate_version < current_version:
+        raise ValueError("candidate update version is not monotonic")
+    if candidate_version == current_version and candidate != current:
+        raise ValueError("same-version update metadata has a different identity")
+    if ledger and current["version"] != ledger[-1]["versionName"]:
+        raise ValueError("update metadata does not match the latest verified release")
+
+    result = reconcile_verified_releases(ledger, entry)
+    return {
+        "action": result["action"],
+        "ledger": result["ledger"],
+        "current": current,
+        "candidate": candidate,
+    }
+
+
+def classify_metadata_push(
+    push_status,
+    porcelain_status,
+    local_parent,
+    remote_head_before,
+    remote_head_after,
+    attempt,
+    max_attempts,
+):
+    """Classify a normal metadata push using status and fresh remote refs."""
+    if isinstance(push_status, bool) or not isinstance(push_status, int) or push_status < 0:
+        raise ValueError("push status must be a non-negative integer")
+    _require_full_sha(local_parent, "local metadata parent")
+    _require_full_sha(remote_head_before, "remote metadata head before push")
+    _require_full_sha(remote_head_after, "remote metadata head after push")
+    attempt = _require_positive_integer(attempt, "metadata CAS attempt")
+    max_attempts = _require_positive_integer(max_attempts, "metadata CAS maximum attempts")
+    if attempt > max_attempts:
+        raise ValueError("metadata CAS attempt exceeds maximum")
+
+    if not isinstance(porcelain_status, str):
+        return {"action": "fail", "reason": "push-output-not-text"}
+
+    lines = [raw_line.rstrip("\r") for raw_line in porcelain_status.splitlines()]
+    if not lines or any(not line for line in lines):
+        return {"action": "fail", "reason": "blank-or-empty-push-output"}
+
+    header_remote = None
+    status_row = None
+    footer_seen = False
+    diagnostics = []
+    for line in lines:
+        if header_remote is None:
+            if not line.startswith("To ") or len(line) <= 3 or "\t" in line:
+                return {"action": "fail", "reason": "push-header-order"}
+            header_remote = line[3:]
+            continue
+        if status_row is None:
+            if line == "Done" or line.startswith("To "):
+                return {"action": "fail", "reason": "push-status-order"}
+            fields = line.split("\t")
+            if len(fields) != 3 or len(fields[0]) != 1 or ":" not in fields[1]:
+                return {"action": "fail", "reason": "unrecognized-push-output"}
+            flag, refspec, summary = fields
+            if flag not in {" ", "=", "*", "!"}:
+                return {"action": "fail", "reason": "unknown-push-status"}
+            source, destination = refspec.split(":", 1)
+            if not source or not destination:
+                return {"action": "fail", "reason": "malformed-push-ref-status"}
+            if destination != "refs/heads/patched":
+                return {"action": "fail", "reason": "push-ref-status-target-mismatch"}
+            allowed_summary = {
+                "=": {"[up to date]"},
+                "*": {"[new branch]"},
+                "!": {
+                    "[rejected] (non-fast-forward)",
+                    "[rejected] (fetch first)",
+                },
+            }
+            if flag == " " and not re.fullmatch(r"[0-9a-f]{40}\.\.[0-9a-f]{40}", summary):
+                return {"action": "fail", "reason": "unknown-push-summary"}
+            if flag != " " and summary not in allowed_summary[flag]:
+                return {"action": "fail", "reason": "unknown-push-summary"}
+            status_row = (flag, destination, summary)
+            continue
+        if not footer_seen:
+            if line != "Done":
+                return {"action": "fail", "reason": "push-footer-order"}
+            footer_seen = True
+            continue
+
+        if line.startswith("error: failed to push some refs to "):
+            expected_error = f"error: failed to push some refs to '{header_remote}'"
+            if line != expected_error or any(item.startswith("error: ") for item in diagnostics):
+                return {"action": "fail", "reason": "unrecognized-push-diagnostic"}
+            diagnostics.append(line)
+            continue
+        if line in NFF_HINTS:
+            if line in diagnostics:
+                return {"action": "fail", "reason": "duplicate-push-diagnostic"}
+            diagnostics.append(line)
+            continue
+        return {"action": "fail", "reason": "unrecognized-push-diagnostic"}
+
+    if status_row is None or not footer_seen:
+        return {"action": "fail", "reason": "push-ref-status-or-footer-missing"}
+    flag, destination, summary = status_row
+    nff_rejected = flag == "!" and summary in {
+        "[rejected] (non-fast-forward)",
+        "[rejected] (fetch first)",
+    }
+    if diagnostics and not nff_rejected:
+        return {"action": "fail", "reason": "diagnostic-without-nff"}
+    confirmed_nff = (
+        push_status != 0
+        and nff_rejected
+        and remote_head_after != remote_head_before
+    )
+    if confirmed_nff and not diagnostics:
+        # A porcelain NFF row is sufficient; Git may omit stderr diagnostics.
+        return {
+            "action": "retry" if attempt < max_attempts else "retry-exhausted",
+            "reason": "fresh-remote-head-changed",
+        }
+    if confirmed_nff and diagnostics:
+        return {
+            "action": "retry" if attempt < max_attempts else "retry-exhausted",
+            "reason": "fresh-remote-head-changed",
+        }
+    if (
+        push_status == 0
+        and flag in {" ", "=", "*"}
+        and not diagnostics
+        and (
+            (flag == "=" and summary == "[up to date]")
+            or (flag == " " and re.fullmatch(r"[0-9a-f]{40}\.\.[0-9a-f]{40}", summary))
+            or (flag == "*" and summary == "[new branch]")
+        )
+    ):
+        return {"action": "success", "reason": "push-ok"}
+    if nff_rejected and remote_head_after == remote_head_before:
+        return {"action": "fail", "reason": "remote-head-unchanged"}
+    return {"action": "fail", "reason": "push-failure-not-confirmed-nff"}
+
+
+def persisted_verified_release_entry(metadata_bytes, expected_entry):
+    """Select the persisted entry while allowing only a new runAttempt."""
+    try:
+        ledger = strict_json_loads(metadata_bytes)
+        _validate_ledger(ledger)
+        expected = _validate_verified_release_entry(expected_entry)
+    except (TypeError, ValueError):
+        return {"verified": False, "reason": "invalid-ledger"}
+    matches = [
+        entry for entry in ledger
+        if all(entry[field] == expected[field] for field in VERIFIED_RELEASE_STABLE_FIELDS)
+    ]
+    if len(matches) != 1:
+        return {"verified": False, "reason": "entry-mismatch"}
+    return {"verified": True, "reason": "", "entry": matches[0]}
+
+
+def classify_release_read(exit_status, http_status):
+    """Classify a Release/tag GET without treating errors as absence."""
+    if (
+        isinstance(exit_status, int)
+        and not isinstance(exit_status, bool)
+        and isinstance(http_status, int)
+        and not isinstance(http_status, bool)
+    ):
+        if exit_status == 0 and http_status == 200:
+            return {"action": "present", "reason": "ok"}
+        if exit_status != 0 and http_status == 404:
+            return {"action": "missing", "reason": "not-found"}
+    return {"action": "fail", "reason": "release-read-failed"}
+
+
+def verify_verified_releases(metadata_bytes, expected_entry):
+    """Verify that remote ledger bytes contain exactly one canonical entry."""
+    try:
+        ledger = strict_json_loads(metadata_bytes)
+        _validate_ledger(ledger)
+        expected = _validate_verified_release_entry(expected_entry)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return {"verified": False, "reason": "invalid-ledger"}
+    matches = [entry for entry in ledger if entry == expected]
+    if len(matches) != 1:
+        return {"verified": False, "reason": "entry-mismatch"}
+    return {"verified": True, "reason": ""}
 
 
 def reconcile_draft_assets(draft, version, expected_digests=None):
@@ -232,11 +700,9 @@ def verify_release_assets(release, version, expected_digests, download_dir):
 def verify_remote_metadata(metadata_bytes, expected_version, expected_apk_url):
     """Byte-exact remote metadata readback."""
     try:
-        payload = json.loads(metadata_bytes.decode("utf-8"))
-    except Exception:
+        payload = parse_update_metadata(metadata_bytes)
+    except (TypeError, ValueError):
         return {"verified": False, "reason": "invalid-json"}
-    if not isinstance(payload, dict):
-        return {"verified": False, "reason": "invalid-shape"}
     if payload.get("version") != expected_version:
         return {"verified": False, "reason": "version-mismatch"}
     if payload.get("apk_url") != expected_apk_url:
@@ -273,9 +739,9 @@ def verify_delivery_url(url, expected_sha256, fetched_sha256):
 
 def build_update_json(version, apk_url):
     """The canonical root update.json payload for a formal release."""
-    if not VERSION_RE.fullmatch(version or ""):
+    if not isinstance(version, str) or not VERSION_RE.fullmatch(version):
         raise ValueError("update version must be a 4-part numeric version")
-    if not apk_url.startswith("https://"):
+    if not isinstance(apk_url, str) or not apk_url.startswith("https://"):
         raise ValueError("update apk_url must be https")
     return {"version": version, "apk_url": apk_url}
 
@@ -368,6 +834,34 @@ def main(argv=None):
     verify_meta.add_argument("--expected-version", required=True)
     verify_meta.add_argument("--expected-apk-url", required=True)
 
+    verified_releases = subparsers.add_parser("reconcile-verified-releases")
+    verified_releases.add_argument("--ledger", required=True)
+    verified_releases.add_argument("--entry", required=True)
+    verified_releases.add_argument("--output", required=True)
+
+    metadata_preflight = subparsers.add_parser("reconcile-verified-release-metadata")
+    metadata_preflight.add_argument("--current-update", required=True)
+    metadata_preflight.add_argument("--current-ledger", required=True)
+    metadata_preflight.add_argument("--candidate-update", required=True)
+    metadata_preflight.add_argument("--entry", required=True)
+    metadata_preflight.add_argument("--output", required=True)
+
+    parse_update = subparsers.add_parser("parse-update-metadata")
+    parse_update.add_argument("--metadata-file", required=True)
+
+    push = subparsers.add_parser("classify-metadata-push")
+    push.add_argument("--status", required=True, type=int)
+    push.add_argument("--porcelain-file", required=True)
+    push.add_argument("--local-parent", required=True)
+    push.add_argument("--remote-before", required=True)
+    push.add_argument("--remote-after", required=True)
+    push.add_argument("--attempt", required=True, type=int)
+    push.add_argument("--max-attempts", required=True, type=int)
+
+    release_read = subparsers.add_parser("classify-release-read")
+    release_read.add_argument("--status", required=True, type=int)
+    release_read.add_argument("--http-status", required=True, type=int)
+
     released = subparsers.add_parser("released-identity")
     released.add_argument("--release", required=True)
     released.add_argument("--version", required=True)
@@ -403,7 +897,7 @@ def main(argv=None):
     elif args.command == "delivery-compare":
         print(json.dumps({"verified": verify_delivery_url(args.url, args.expected_sha, args.fetched_sha)}, sort_keys=True))
     elif args.command == "reconcile-draft":
-        draft = json.loads(args.draft)
+        draft = strict_json_loads(args.draft)
         decision = reconcile_draft_decision(
             draft,
             args.version,
@@ -415,7 +909,7 @@ def main(argv=None):
         )
         print(json.dumps({"decision": decision, "reuse": decision == "exact-reuse"}, sort_keys=True))
     elif args.command == "verify-release-assets":
-        release = json.loads(args.release)
+        release = strict_json_loads(args.release)
         print(json.dumps(verify_release_assets(
             release,
             args.version,
@@ -428,8 +922,39 @@ def main(argv=None):
             args.expected_version,
             args.expected_apk_url,
         ), sort_keys=True))
+    elif args.command == "reconcile-verified-releases":
+        result = reconcile_verified_releases(
+            strict_json_loads(Path(args.ledger).read_text()),
+            strict_json_loads(Path(args.entry).read_text()),
+        )
+        Path(args.output).write_text(json.dumps(result["ledger"], indent=2) + "\n")
+        print(json.dumps({"action": result["action"]}, sort_keys=True))
+    elif args.command == "reconcile-verified-release-metadata":
+        result = reconcile_verified_release_metadata(
+            Path(args.current_update).read_bytes(),
+            Path(args.current_ledger).read_bytes(),
+            Path(args.candidate_update).read_bytes(),
+            strict_json_loads(Path(args.entry).read_text()),
+        )
+        Path(args.output).write_text(json.dumps(result["ledger"], indent=2) + "\n")
+        print(json.dumps({"action": result["action"]}, sort_keys=True))
+    elif args.command == "parse-update-metadata":
+        print(json.dumps(parse_update_metadata(Path(args.metadata_file).read_bytes()), sort_keys=True))
+    elif args.command == "classify-metadata-push":
+        result = classify_metadata_push(
+            args.status,
+            Path(args.porcelain_file).read_text(),
+            args.local_parent,
+            args.remote_before,
+            args.remote_after,
+            args.attempt,
+            args.max_attempts,
+        )
+        print(json.dumps(result, sort_keys=True))
+    elif args.command == "classify-release-read":
+        print(json.dumps(classify_release_read(args.status, args.http_status), sort_keys=True))
     elif args.command == "released-identity":
-        release = json.loads(args.release)
+        release = strict_json_loads(args.release)
         decision = released_identity_decision(
             release,
             args.version,

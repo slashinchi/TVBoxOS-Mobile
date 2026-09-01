@@ -10,7 +10,8 @@
 # Fail-closed: unverified baseline, empty debt, or any inconsistency => noop.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="${U2_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+U2_RELEASE_HELPER="${U2_RELEASE_HELPER:-$ROOT/scripts/u2_release.py}"
 SOURCE_SHA="${SOURCE_SHA:-}"
 MODE="${MODE:-}"
 NOOP="${NOOP:-false}"
@@ -42,7 +43,7 @@ emit() {
 
 # Derive version from the checked-out app/build.gradle.
 if [[ -f "$ROOT/app/build.gradle" ]]; then
-  version_json=$(python3 "$ROOT/scripts/u2_release.py" parse-app-version --file "$ROOT/app/build.gradle")
+  version_json=$(python3 "$U2_RELEASE_HELPER" parse-app-version --file "$ROOT/app/build.gradle")
   EXPECTED_VERSION_NAME=$(jq -r '.versionName' <<<"$version_json")
   EXPECTED_VERSION_CODE=$(jq -r '.versionCode' <<<"$version_json")
 fi
@@ -64,7 +65,7 @@ if [[ ! -f "$verified_file" ]]; then
   exit 1
 fi
 
-debt_json=$(python3 "$ROOT/scripts/u2_release.py" release-debt \
+debt_json=$(python3 "$U2_RELEASE_HELPER" release-debt \
   --repo "$ROOT" \
   --releases-file "$verified_file" \
   --current "$SOURCE_SHA" \

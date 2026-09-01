@@ -18,6 +18,7 @@ from scripts.upstream_monitor import (
     coverage_marker,
     event_gate,
     issue_marker,
+    is_fork_owned_path,
     is_check_day,
     main,
     marker_status,
@@ -280,6 +281,9 @@ class U1aContractTests(unittest.TestCase):
             (repo / "scripts").mkdir()
             (repo / "scripts/upstream_monitor.py").write_text("fork helper\n")
             (repo / "scripts/sync_release_metadata.sh").write_text("fork metadata\n")
+            (repo / "gradle").mkdir()
+            (repo / "gradle/verified-releases.json").write_text("{\"fork\":true}\n")
+            (repo / "gradle/legacy-dependencies.lock.json").write_text("{\"fork\":true}\n")
             self._commit(repo, "fork control plane")
             _git(repo, "checkout", "-b", "upstream", "main")
             (repo / "AGENTS.md").write_text("upstream rules\n")
@@ -289,6 +293,9 @@ class U1aContractTests(unittest.TestCase):
             (repo / "scripts").mkdir()
             (repo / "scripts/upstream_monitor.py").write_text("upstream helper\n")
             (repo / "scripts/sync_release_metadata.sh").write_text("upstream metadata\n")
+            (repo / "gradle").mkdir()
+            (repo / "gradle/verified-releases.json").write_text("{\"upstream\":true}\n")
+            (repo / "gradle/legacy-dependencies.lock.json").write_text("{\"upstream\":true}\n")
             (repo / "runtime.txt").write_text("upstream runtime\n")
             self._commit(repo, "upstream control plane changes")
 
@@ -300,6 +307,8 @@ class U1aContractTests(unittest.TestCase):
                     ".github/workflows/new-upstream.yml",
                     ".github/workflows/upstream-monitor.yml",
                     "AGENTS.md",
+                    "gradle/legacy-dependencies.lock.json",
+                    "gradle/verified-releases.json",
                     "scripts/sync_release_metadata.sh",
                     "scripts/upstream_monitor.py",
                 ],
@@ -311,8 +320,22 @@ class U1aContractTests(unittest.TestCase):
             )
             self.assertEqual((repo / "scripts/upstream_monitor.py").read_text(), "fork helper\n")
             self.assertEqual((repo / "scripts/sync_release_metadata.sh").read_text(), "fork metadata\n")
+            self.assertEqual((repo / "gradle/verified-releases.json").read_text(), "{\"fork\":true}\n")
+            self.assertEqual(
+                (repo / "gradle/legacy-dependencies.lock.json").read_text(),
+                "{\"fork\":true}\n",
+            )
             self.assertFalse((repo / ".github/workflows/new-upstream.yml").exists())
             self.assertIn("runtime.txt", result.changed_paths)
+
+    def test_all_trusted_control_prefixes_and_manifests_are_fork_owned(self):
+        for path in (
+            ".github/actions/verify/action.yml",
+            "scripts/new-trusted-helper.py",
+            "gradle/verified-releases.json",
+            "gradle/legacy-dependencies.lock.json",
+        ):
+            self.assertTrue(is_fork_owned_path(path), path)
 
     def test_only_fork_owned_changes_do_not_need_a_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -515,6 +538,12 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("--preview-candidate-needed", probe)
         self.assertIn("needs.probe.outputs.state == 'actionable-main-ahead'", workflow)
 
+    def test_probe_derives_fork_main_before_downstream_baseline_checks(self):
+        workflow = WORKFLOW.read_text()
+        probe = workflow[workflow.index("      - id: probe"):workflow.index("\n\n  coverage:")]
+        self.assertIn("fork_main_sha=$(git rev-parse refs/remotes/origin/main)", probe)
+        self.assertNotIn("$FORK_MAIN_SHA", probe)
+
     def test_workflow_binds_validated_tree_before_pr_creation(self):
         workflow = WORKFLOW.read_text()
         self.assertIn("validated_tree", workflow)
@@ -523,12 +552,28 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("candidate tree", workflow)
         self.assertIn("candidate-tree:", workflow)
 
+    def test_workflow_rechecks_fork_control_inputs_before_and_after_candidate_push(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn("git ls-tree -r --full-tree", workflow)
+        self.assertIn("gradle/verified-releases.json", workflow)
+        self.assertIn("gradle/legacy-dependencies.lock.json", workflow)
+        self.assertIn("git diff --quiet \"$PATCHED_SHA\" \"$actual_candidate_oid\"", workflow)
+        self.assertIn("FORK_MAIN_SHA", workflow)
+        self.assertIn("--fork-main", workflow)
+        self.assertIn('--fork-main "$UPSTREAM_SHA"', workflow)
+        self.assertNotIn('--fork-main "$FORK_MAIN_SHA"', workflow)
+        self.assertNotIn("origin +refs/heads/main", workflow)
+
     def test_candidate_pr_binds_versioned_provenance_marker(self):
         workflow = WORKFLOW.read_text()
         self.assertIn("provenance_marker", workflow)
-        self.assertIn("EXPECTED_PROVENANCE_MARKER", workflow)
         self.assertIn("provenance-marker", workflow)
         self.assertIn("parse-app-version", workflow)
+        self.assertIn("fork-main", workflow)
+        self.assertIn('candidate_sha=$(git rev-parse HEAD)', workflow)
+        self.assertIn('test "$candidate_sha" = "$(jq -r \'.candidate_sha\' "$result_file")"', workflow)
+        self.assertNotIn('candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}', workflow)
+        self.assertNotIn('needs.candidate_validation.outputs.candidate_sha', workflow)
 
     def test_candidate_jobs_continue_using_a_trusted_helper_copy(self):
         workflow = WORKFLOW.read_text()

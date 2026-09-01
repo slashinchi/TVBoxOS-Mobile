@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts import u2_release as u2_release_module
 from scripts.u2_release import (
     build_provenance_marker,
     build_release_trailers,
@@ -19,7 +20,6 @@ from scripts.u2_release import (
     debt_manifest,
     derive_integrated_upstream_sha,
     fingerprint_manifest,
-    fresh_integration_replay,
     normalize_version_overlay,
     parse_app_version,
     parse_provenance_marker,
@@ -36,6 +36,7 @@ RC_WORKFLOW = ROOT / ".github/workflows/rc-pipeline.yml"
 BUILD_WORKFLOW = ROOT / ".github/workflows/build.yml"
 CONTROL_WORKFLOW = ROOT / ".github/workflows/rc-control.yml"
 DIAGNOSTIC_WORKFLOW = ROOT / ".github/workflows/u2-apk-diagnostic.yml"
+CANARY_HARNESS_WORKFLOW = ROOT / ".github/workflows/u2-canary-harness.yml"
 
 
 class U2ReleaseContractTests(unittest.TestCase):
@@ -89,6 +90,7 @@ class U2ReleaseContractTests(unittest.TestCase):
             "a" * 40,
             "b" * 40,
             "c" * 40,
+            "d" * 40,
             "2.1.27",
             237,
         )
@@ -98,12 +100,15 @@ class U2ReleaseContractTests(unittest.TestCase):
                 "upstream": "a" * 40,
                 "candidate": "b" * 40,
                 "tree": "c" * 40,
+                "forkMain": "d" * 40,
                 "upstreamVersion": "2.1.27",
                 "upstreamCode": "237",
             },
         )
         with self.assertRaises(ValueError):
             parse_provenance_marker(marker.replace("tree=" + "c" * 40, "tree=short"))
+        with self.assertRaises(ValueError):
+            parse_provenance_marker(marker.replace(" forkMain=" + "d" * 40, ""))
 
     def test_strict_u1_merge_requires_pr_lineage_and_replay(self):
         upstream = "a" * 40
@@ -111,7 +116,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         tree = "c" * 40
         before = "d" * 40
         after = "e" * 40
-        marker = build_provenance_marker(upstream, candidate, tree, "2.1.27", 237)
+        marker = build_provenance_marker(upstream, candidate, tree, upstream, "2.1.27", 237)
         pr = {
             "number": 7,
             "state": "closed",
@@ -123,6 +128,25 @@ class U2ReleaseContractTests(unittest.TestCase):
             "head": candidate_branch_name(upstream),
             "head_sha": candidate,
             "merge_commit_sha": after,
+        }
+        replay = {
+            "status": "clean",
+            "candidate_needed": True,
+            "before": before,
+            "source_after": after,
+            "source_parents": [before, candidate],
+            "candidate": candidate,
+            "candidate_parents": [before, upstream],
+            "upstream": upstream,
+            "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
+            "upstream_ref": "refs/heads/main",
+            "fork_main": upstream,
+            "marker_fork_main": upstream,
+            "fork_main_is_ancestor": True,
+            "marker_tree": tree,
+            "candidate_tree": tree,
+            "rebuilt_tree": tree,
+            "source_tree": tree,
         }
 
         qualified = qualify_u1_merge(
@@ -136,12 +160,29 @@ class U2ReleaseContractTests(unittest.TestCase):
             marker=marker,
             candidate_tree=tree,
             upstream_is_ancestor=True,
-            replay=("clean", tree, tree),
+            upstream_version="2.1.27",
+            upstream_code=237,
+            replay=replay,
         )
 
         self.assertTrue(qualified["qualified"])
-        self.assertEqual(fresh_integration_replay("clean", tree, tree)["reason"], "replay-match")
-        self.assertEqual(fresh_integration_replay("clean", tree, "f" * 40)["reason"], "replay-tree-mismatch")
+        wrong_marker = build_provenance_marker(upstream, candidate, tree, "f" * 40, "2.1.27", 237)
+        wrong = qualify_u1_merge(
+            before=before,
+            after=after,
+            parents=[before, candidate],
+            push_actor="slashinchi",
+            pr=pr,
+            repository="slashinchi/TVBoxOS-Mobile",
+            upstream_sha=upstream,
+            marker=wrong_marker,
+            candidate_tree=tree,
+            upstream_is_ancestor=True,
+            upstream_version="2.1.27",
+            upstream_code=237,
+            replay=replay,
+        )
+        self.assertEqual(wrong["reason"], "provenance-fork-main-mismatch")
         pr["author"] = "human"
         self.assertEqual(
             qualify_u1_merge(
@@ -155,16 +196,178 @@ class U2ReleaseContractTests(unittest.TestCase):
                 marker=marker,
                 candidate_tree=tree,
                 upstream_is_ancestor=True,
-                replay=("clean", tree, tree),
+                upstream_version="2.1.27",
+                upstream_code=237,
+                replay=replay,
             )["reason"],
             "associated-pr-mismatch",
         )
+
+    def _replay_evidence(self):
+        return {
+            "status": "clean",
+            "candidate_needed": True,
+            "before": "a" * 40,
+            "source_after": "b" * 40,
+            "source_parents": ["a" * 40, "c" * 40],
+            "candidate": "c" * 40,
+            "candidate_parents": ["a" * 40, "d" * 40],
+            "upstream": "d" * 40,
+            "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
+            "upstream_ref": "refs/heads/main",
+            "fork_main": "e" * 40,
+            "marker_fork_main": "e" * 40,
+            "fork_main_is_ancestor": True,
+            "marker_tree": "f" * 40,
+            "candidate_tree": "f" * 40,
+            "rebuilt_tree": "f" * 40,
+            "source_tree": "f" * 40,
+        }
+
+    def _assert_replay_rejected(self, evidence, reason):
+        validator = getattr(u2_release_module, "validate_replay_evidence", None)
+        self.assertIsNotNone(validator)
+        self.assertEqual(
+            validator(
+                evidence,
+                "kukuqi666/TVBoxOS-Mobile",
+                "refs/heads/main",
+            )["reason"],
+            reason,
+        )
+
+    def test_strict_replay_requires_direct_parent_and_four_tree_proof(self):
+        valid = self._replay_evidence()
+        validator = getattr(u2_release_module, "validate_replay_evidence", None)
+        self.assertIsNotNone(validator)
+        self.assertTrue(
+            validator(valid, "kukuqi666/TVBoxOS-Mobile", "refs/heads/main")["qualified"]
+        )
+
+        invalid = dict(valid, source_parents=[valid["before"], "1" * 40])
+        self._assert_replay_rejected(invalid, "replay-source-parent-mismatch")
+        invalid = dict(valid, candidate_parents=[valid["before"], "2" * 40])
+        self._assert_replay_rejected(invalid, "replay-candidate-parent-mismatch")
+        invalid = dict(valid, upstream_repository="attacker.example/repo")
+        self._assert_replay_rejected(invalid, "replay-upstream-source-mismatch")
+        invalid = dict(valid, upstream_ref="refs/heads/feature")
+        self._assert_replay_rejected(invalid, "replay-upstream-source-mismatch")
+        invalid = dict(valid, rebuilt_tree="3" * 40)
+        self._assert_replay_rejected(invalid, "replay-tree-mismatch")
+        invalid = dict(valid, fork_main_is_ancestor=False)
+        self._assert_replay_rejected(invalid, "replay-fork-main-not-ancestor")
+        invalid = dict(valid, candidate_needed=False)
+        self._assert_replay_rejected(invalid, "replay-candidate-not-built")
+        invalid = dict(valid, marker_fork_main="0" * 40)
+        self._assert_replay_rejected(invalid, "replay-fork-main-mismatch")
+
+        marker = build_provenance_marker(
+            valid["upstream"], valid["candidate"], valid["marker_tree"], "0" * 40, "2.1.27", 237
+        )
+        pr = {
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-28T00:00:00Z",
+            "base": "patched",
+            "merged_by": "slashinchi",
+            "author": "github-actions[bot]",
+            "head_repository": "slashinchi/TVBoxOS-Mobile",
+            "head": candidate_branch_name(valid["upstream"]),
+            "head_sha": valid["candidate"],
+            "merge_commit_sha": valid["source_after"],
+        }
+        result = qualify_u1_merge(
+            before=valid["before"],
+            after=valid["source_after"],
+            parents=valid["source_parents"],
+            push_actor="slashinchi",
+            pr=pr,
+            repository="slashinchi/TVBoxOS-Mobile",
+            upstream_sha=valid["upstream"],
+            marker=marker,
+            candidate_tree=valid["marker_tree"],
+            upstream_is_ancestor=True,
+            upstream_version="2.1.27",
+            upstream_code=237,
+            replay=valid,
+        )
+        self.assertEqual(result["reason"], "provenance-fork-main-mismatch")
+
+    def test_strict_qualifier_rejects_legacy_replay_tuple(self):
+        evidence = self._replay_evidence()
+        marker = build_provenance_marker(
+            evidence["upstream"], evidence["candidate"], evidence["marker_tree"], evidence["upstream"], "2.1.27", 237
+        )
+        pr = {
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-28T00:00:00Z",
+            "base": "patched",
+            "merged_by": "slashinchi",
+            "author": "github-actions[bot]",
+            "head_repository": "slashinchi/TVBoxOS-Mobile",
+            "head": candidate_branch_name(evidence["upstream"]),
+            "head_sha": evidence["candidate"],
+            "merge_commit_sha": evidence["source_after"],
+        }
+        result = qualify_u1_merge(
+            before=evidence["before"],
+            after=evidence["source_after"],
+            parents=evidence["source_parents"],
+            push_actor="slashinchi",
+            pr=pr,
+            repository="slashinchi/TVBoxOS-Mobile",
+            upstream_sha=evidence["upstream"],
+            marker=marker,
+            candidate_tree=evidence["marker_tree"],
+            upstream_is_ancestor=True,
+            upstream_version="2.1.27",
+            upstream_code=237,
+            replay=("clean", evidence["marker_tree"], evidence["marker_tree"]),
+        )
+        self.assertEqual(result["reason"], "replay-evidence-required")
+
+    def test_u1_marker_version_must_match_fixed_upstream_object(self):
+        evidence = self._replay_evidence()
+        marker = build_provenance_marker(
+            evidence["upstream"], evidence["candidate"], evidence["marker_tree"], evidence["upstream"], "99.99.99", 9999
+        )
+        pr = {
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-28T00:00:00Z",
+            "base": "patched",
+            "merged_by": "slashinchi",
+            "author": "github-actions[bot]",
+            "head_repository": "slashinchi/TVBoxOS-Mobile",
+            "head": candidate_branch_name(evidence["upstream"]),
+            "head_sha": evidence["candidate"],
+            "merge_commit_sha": evidence["source_after"],
+        }
+        result = qualify_u1_merge(
+            before=evidence["before"],
+            after=evidence["source_after"],
+            parents=evidence["source_parents"],
+            push_actor="slashinchi",
+            pr=pr,
+            repository="slashinchi/TVBoxOS-Mobile",
+            upstream_sha=evidence["upstream"],
+            marker=marker,
+            candidate_tree=evidence["marker_tree"],
+            upstream_is_ancestor=True,
+            upstream_version="2.1.27",
+            upstream_code=237,
+            replay=evidence,
+        )
+        self.assertEqual(result["reason"], "provenance-version-mismatch")
 
     def test_manual_integrated_upstream_and_canonical_release_baseline_fail_closed(self):
         sha = "a" * 40
         self.assertEqual(derive_integrated_upstream_sha([sha], {sha}, {sha}), sha)
         with self.assertRaises(ValueError):
             derive_integrated_upstream_sha([sha, "b" * 40], {sha, "b" * 40}, {sha, "b" * 40})
+        with self.assertRaises(ValueError):
+            canonical_release_baseline(["malformed-ledger-entry"])
         release = {
             "tag": "v2.1.26.1",
             "target": "c" * 40,
@@ -184,6 +387,61 @@ class U2ReleaseContractTests(unittest.TestCase):
             canonical_release_baseline([release], update_version="2.1.26", delivery_hold=True)['tag'],
             "v2.1.26.1",
         )
+        newer = dict(
+            release,
+            tag="v2.1.27.1",
+            target="f" * 40,
+            versionName="2.1.27.1",
+            versionCode=23701,
+            assetSha256="a" * 64,
+        )
+        with self.assertRaises(ValueError):
+            canonical_release_baseline([newer, release])
+        for version_code in (23601.0, "23601", True):
+            with self.subTest(version_code=version_code):
+                with self.assertRaises(ValueError):
+                    canonical_release_baseline([dict(release, versionCode=version_code)])
+
+    def test_canonical_release_baseline_matches_strict_ledger_shapes_and_production_legacy(self):
+        production = json.loads((ROOT / "gradle/verified-releases.json").read_text())
+        baseline = canonical_release_baseline(production)
+        self.assertEqual(baseline["tag"], "v2.1.26.1")
+
+        complete = dict(
+            production[0],
+            tag="v2.1.27.1",
+            versionName="2.1.27.1",
+            versionCode=23701,
+            target="a" * 40,
+            updateSha256="b" * 64,
+            sourceSha="c" * 40,
+            debt="d" * 64,
+            runId="123456",
+            runAttempt="1",
+        )
+        self.assertEqual(canonical_release_baseline([complete])["tag"], "v2.1.27.1")
+
+        with self.assertRaises(ValueError):
+            canonical_release_baseline([dict(production[0], unexpected="field")])
+        duplicate_target = dict(
+            production[0],
+            tag="v2.1.27.1",
+            versionName="2.1.27.1",
+            versionCode=23701,
+        )
+        with self.assertRaises(ValueError):
+            canonical_release_baseline([production[0], duplicate_target])
+        with self.assertRaises(ValueError):
+            canonical_release_baseline([dict(complete, updateSha256="invalid")])
+        legacy_after_complete = dict(
+            production[0],
+            tag="v2.1.28.1",
+            versionName="2.1.28.1",
+            versionCode=23801,
+            target="e" * 40,
+        )
+        with self.assertRaises(ValueError):
+            canonical_release_baseline([complete, legacy_after_complete])
 
     def test_delivery_hold_is_identity_bound_not_boolean(self):
         release = {
@@ -731,7 +989,8 @@ class U2ReleaseContractTests(unittest.TestCase):
             for line_no, line in enumerate(text.splitlines(), 1):
                 if "environment: release-signing" in line:
                     consumers.append(f"{path.name}:{line_no}")
-        self.assertEqual(consumers, ["rc-pipeline.yml:490"])
+        self.assertEqual(len(consumers), 1)
+        self.assertTrue(consumers[0].startswith("rc-pipeline.yml:"), consumers)
 
     def test_u2_publish_is_the_only_release_write_workflow(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
@@ -1083,8 +1342,9 @@ class U2ReleaseContractTests(unittest.TestCase):
         # (drafts have no git tag ref; gh release view succeeds for drafts).
         promote_step = next(s for s in steps if "Promote patched to exact release SHA" in str(s))
         promote_text = str(promote_step)
-        self.assertIn("git/ref/tags/${tag}", promote_text)
-        self.assertIn("tag object $tag exists", promote_text)
+        self.assertIn("refs/tags/${tag}^{}", promote_text)
+        self.assertIn("tag target commit", promote_text)
+        self.assertIn("resolve_tag_target", promote_text)
         self.assertNotIn('gh release view "$tag"', promote_text)
         # Metadata reconciliation must fail closed when the remote baseline
         # cannot be read (never treat an empty current as "may advance").
@@ -1155,10 +1415,207 @@ class U2ReleaseContractTests(unittest.TestCase):
         # fallback (gh api prints the error body to stdout even on exit 1).
         draft_step = next(s for s in steps if "Create or reconcile draft" in str(s))
         draft_run = str(draft_step).replace("\\n", "\n")
-        tag_ref_line = next(l for l in draft_run.splitlines() if "git/ref/tags" in l)
-        self.assertNotIn("--silent", tag_ref_line)
-        self.assertIn("if tag_target_sha=$(", tag_ref_line)
-        self.assertIn("2>/dev/null); then", tag_ref_line)
+        self.assertNotIn("--silent", draft_run)
+        self.assertIn("tag_target_sha=$(resolve_tag_target", draft_run)
+        self.assertIn("object.type", draft_run)
+        self.assertIn("refs/tags/${tag}^{}", draft_run)
+
+    def test_u2_metadata_reconciliation_is_bounded_two_file_normal_cas(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        publish = tree["jobs"]["publish"]
+        steps = publish["steps"]
+        metadata_step = next(
+            s for s in steps if "Reconcile verified release metadata" in str(s)
+        )
+        metadata_text = str(metadata_step)
+        for token in (
+            "gradle/verified-releases.json",
+            "reconcile-verified-releases",
+            "verify_verified_releases",
+            "verify-remote-metadata",
+            "current-canonical-update.json",
+            "keys | sort",
+            "git fetch --no-tags origin",
+            "refs/heads/patched",
+            "non-fast-forward",
+            "retry exhaustion",
+            "git add update.json gradle/verified-releases.json",
+        ):
+            self.assertIn(token, metadata_text, token)
+        self.assertIn("for attempt in 1 2 3", metadata_text)
+        self.assertNotIn("git push --atomic", metadata_text)
+        self.assertNotIn("git push --force", metadata_text)
+        self.assertNotIn("git push -f", metadata_text)
+
+    def test_u2_metadata_preflight_precedes_all_formal_release_mutations(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        steps = tree["jobs"]["publish"]["steps"]
+        names = [step.get("name", "") for step in steps]
+        preflight_index = names.index("Preflight verified release metadata")
+        promote_index = names.index("Promote patched to exact release SHA (CAS)")
+        mutation_indexes = [
+            names.index("Create or reconcile draft Release with exact identity"),
+            names.index("Attach missing assets only (no clobber)"),
+            names.index("Publish verified draft"),
+        ]
+        self.assertLess(preflight_index, promote_index)
+        self.assertLess(promote_index, min(mutation_indexes))
+        preflight = str(steps[preflight_index])
+        for token in (
+            "update.json",
+            "gradle/verified-releases.json",
+            "reconcile-verified-release-metadata",
+            "current-update",
+            "current-ledger",
+        ):
+            self.assertIn(token, preflight, token)
+
+    def test_u2_promote_is_locked_to_the_preflight_live_patched_sha(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        steps = tree["jobs"]["publish"]["steps"]
+        preflight = next(s for s in steps if s.get("name") == "Preflight verified release metadata")
+        self.assertEqual(preflight.get("id"), "preflight")
+        preflight_text = str(preflight)
+        self.assertIn('echo "remote_head_before=$remote_head_before" >> "$GITHUB_OUTPUT"', preflight_text)
+
+        promote = next(s for s in steps if s.get("name") == "Promote patched to exact release SHA (CAS)")
+        promote_text = promote["run"]
+        self.assertIn("steps.preflight.outputs.remote_head_before", str(promote))
+        live_read = promote_text.index("git ls-remote")
+        current_decision = promote_text.index('if [[ "$current" == "$RELEASE_SHA" ]]')
+        recovery_decision = promote_text.index('git merge-base --is-ancestor "$RELEASE_SHA" "$current"')
+        self.assertLess(live_read, min(current_decision, recovery_decision))
+        self.assertIn('[[ "$live_remote_sha" == "$preflight_sha" ]]', promote_text)
+        self.assertIn('[[ "$current" == "$preflight_sha" ]]', promote_text)
+        self.assertIn("refusing to continue", promote_text)
+
+    def test_u2_metadata_retry_uses_porcelain_status_and_remote_sha_not_log_grep(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        publish = tree["jobs"]["publish"]
+        metadata_step = next(
+            step for step in publish["steps"]
+            if step.get("name") == "Reconcile verified release metadata with bounded normal CAS"
+        )
+        metadata_text = str(metadata_step)
+        for token in (
+            "git push --porcelain",
+            "git ls-remote",
+            "remote_head_before",
+            "remote_head_after",
+            "push_is_non_fast_forward",
+            "awk",
+        ):
+            self.assertIn(token, metadata_text, token)
+        self.assertNotIn("grep -Eq", metadata_text)
+
+    def test_strict_json_parser_is_used_for_release_ledger_cli_input(self):
+        duplicate = '{"tag":"v2.1.26.1","tag":"v2.1.26.1"}'
+        with self.assertRaises(ValueError):
+            u2_release_module.strict_json_loads(duplicate)
+        with tempfile.NamedTemporaryFile(mode="w+", suffix=".json") as file:
+            file.write(duplicate)
+            file.flush()
+            result = subprocess.run(
+                ["python3", "scripts/u2_release.py", "canonical-release-baseline", "--file", file.name],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_metadata_postpublish_reuses_shared_pair_preflight_and_persisted_entry(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        metadata_step = next(
+            step for step in tree["jobs"]["publish"]["steps"]
+            if step.get("name") == "Reconcile verified release metadata with bounded normal CAS"
+        )
+        metadata_text = str(metadata_step)
+        self.assertIn("reconcile-verified-release-metadata", metadata_text)
+        self.assertIn("persisted_verified_release_entry", metadata_text)
+        self.assertIn("metadata_ledger", metadata_text)
+
+    def test_metadata_postpublish_readback_requires_stable_branch_snapshot_and_fresh_retry(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        metadata_step = next(
+            step for step in tree["jobs"]["publish"]["steps"]
+            if step.get("name") == "Reconcile verified release metadata with bounded normal CAS"
+        )
+        metadata_text = str(metadata_step)
+        for token in (
+            "readback_head_before",
+            "readback_head_after",
+            "patched moved during metadata readback",
+            "fresh fetch and remote read",
+            "continue",
+        ):
+            self.assertIn(token, metadata_text, token)
+        self.assertIn("if verify_remote_blobs", metadata_text)
+
+    def test_release_and_tag_reads_allow_only_explicit_404_fallback(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        promote_step = next(
+            step for step in tree["jobs"]["publish"]["steps"]
+            if step.get("name") == "Promote patched to exact release SHA (CAS)"
+        )
+        self.assertIn("classify-release-read", str(promote_step))
+        release_step = next(
+            step for step in tree["jobs"]["publish"]["steps"]
+            if step.get("name") == "Create or reconcile draft Release with exact identity"
+        )
+        release_text = str(release_step)
+        self.assertIn("classify-release-read", release_text)
+        self.assertIn("release_http_status", release_text)
+        self.assertIn("release_read_action", release_text)
+        self.assertNotIn("gh release view \"$tag\" --repo slashinchi/TVBoxOS-Mobile \\\n            --json tagName,targetCommitish,isDraft,assets \\\n            --jq '.' 2>/dev/null || echo \"\"", release_text)
+        self.assertIn("tag_read_action", release_text)
+        self.assertIn("tag_http_status", release_text)
+
+    def test_auto_qualification_requires_real_trusted_replay_evidence(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        qualify = workflow[workflow.index("  qualify:"):workflow.index("  prep:")]
+        qualify_script = (ROOT / "scripts/u2_qualify.sh").read_text()
+        for token in (
+            'git show "$PUSH_BEFORE:scripts/u2_release.py"',
+            'git show "$PUSH_BEFORE:scripts/upstream_monitor.py"',
+            'git show "$PUSH_BEFORE:scripts/u2_qualify.sh"',
+            'refs/remotes/upstream/main',
+            'refs/remotes/origin/main',
+            'git worktree add --detach',
+            'source_parents',
+            'candidate_parents',
+            'replay_file',
+            '--replay-file',
+            '--upstream-version',
+            '--upstream-code',
+            'marker_fork_main',
+        ):
+            self.assertIn(token, qualify, token)
+        self.assertIn('git show "$SOURCE_SHA:scripts/u2_release.py"', qualify)
+        self.assertIn('git show "$SOURCE_SHA:scripts/upstream_monitor.py"', qualify)
+        self.assertIn('git show "$SOURCE_SHA:scripts/u2_qualify.sh"', qualify)
+        self.assertIn('bash "$trusted_root/scripts/u2_qualify.sh"', qualify)
+        self.assertIn("head -1 || true", qualify)
+        self.assertNotIn("--replay-status", qualify)
+        self.assertNotIn("--replay-tree", qualify)
+        self.assertNotIn("--replay-actual-tree", qualify)
+        self.assertIn("U2_REPO_ROOT", qualify_script)
+        self.assertIn("U2_RELEASE_HELPER", qualify_script)
+
+    def test_manual_dispatch_does_not_depend_on_push_event_shas(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        qualify = workflow[workflow.index("  qualify:"):workflow.index("  prep:")]
+        self.assertIn('if [[ "$MODE" == "auto-upstream" ]]; then', qualify)
+        self.assertIn('git show "$SOURCE_SHA:scripts/u2_release.py"', qualify)
+        self.assertIn('git show "$SOURCE_SHA:scripts/upstream_monitor.py"', qualify)
+        auto_section = qualify[qualify.index('if [[ "$MODE" == "auto-upstream" ]]; then'):]
+        self.assertIn('[[ -n "$PUSH_BEFORE" && -n "$PUSH_AFTER" ]]', auto_section)
 
     def test_release_debt_cli_computes_canonical_baseline_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1213,7 +1670,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         tree = "c" * 40
         before = "d" * 40
         after = "e" * 40
-        marker = build_provenance_marker(upstream, candidate, tree, "2.1.27", 237)
+        marker = build_provenance_marker(upstream, candidate, tree, upstream, "2.1.27", 237)
         pr = json.dumps({
             "number": 7,
             "state": "closed",
@@ -1226,33 +1683,120 @@ class U2ReleaseContractTests(unittest.TestCase):
             "head_sha": candidate,
             "merge_commit_sha": after,
         })
-        base = [
-            "python3", "scripts/u2_release.py", "qualify-u1",
-            "--before", before,
-            "--after", after,
-            "--parents", before, candidate,
-            "--actor", "slashinchi",
-            "--pr", pr,
-            "--repository", "slashinchi/TVBoxOS-Mobile",
-            "--upstream", upstream,
-            "--marker", marker,
-            "--candidate-tree", tree,
-            "--upstream-ancestor", "true",
-            "--replay-status", "clean",
-            "--replay-tree", tree,
-            "--replay-actual-tree", tree,
-        ]
-        ok = subprocess.run(base, cwd=ROOT, text=True, capture_output=True)
-        self.assertEqual(ok.returncode, 0, ok.stderr)
-        self.assertEqual(json.loads(ok.stdout)["qualified"], True)
-        bad = subprocess.run(
-            base + ["--parents", before, "f" * 40],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(bad.returncode, 0, bad.stderr)
-        self.assertEqual(json.loads(bad.stdout)["reason"], "merge-parent-mismatch")
+        replay = {
+            "status": "clean",
+            "candidate_needed": True,
+            "before": before,
+            "source_after": after,
+            "source_parents": [before, candidate],
+            "candidate": candidate,
+            "candidate_parents": [before, upstream],
+            "upstream": upstream,
+            "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
+            "upstream_ref": "refs/heads/main",
+            "fork_main": upstream,
+            "marker_fork_main": upstream,
+            "fork_main_is_ancestor": True,
+            "marker_tree": tree,
+            "candidate_tree": tree,
+            "rebuilt_tree": tree,
+            "source_tree": tree,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            replay_path = Path(tmp) / "replay.json"
+            replay_path.write_text(json.dumps(replay))
+            base = [
+                "python3", "scripts/u2_release.py", "qualify-u1",
+                "--before", before,
+                "--after", after,
+                "--parents", before, candidate,
+                "--actor", "slashinchi",
+                "--pr", pr,
+                "--repository", "slashinchi/TVBoxOS-Mobile",
+                "--upstream", upstream,
+                "--marker", marker,
+                "--candidate-tree", tree,
+                "--upstream-ancestor", "true",
+                "--upstream-version", "2.1.27",
+                "--upstream-code", "237",
+                "--replay-file", str(replay_path),
+            ]
+            ok = subprocess.run(base, cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertEqual(json.loads(ok.stdout)["qualified"], True)
+            bad = subprocess.run(
+                base + ["--parents", before, "f" * 40],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(bad.returncode, 0, bad.stderr)
+            self.assertEqual(json.loads(bad.stdout)["reason"], "merge-parent-mismatch")
+
+    def test_qualify_u1_cli_accepts_structured_replay_file(self):
+        upstream = "a" * 40
+        candidate = "b" * 40
+        tree = "c" * 40
+        before = "d" * 40
+        after = "e" * 40
+        marker = build_provenance_marker(upstream, candidate, tree, upstream, "2.1.27", 237)
+        pr = json.dumps({
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-28T00:00:00Z",
+            "base": "patched",
+            "merged_by": "slashinchi",
+            "author": "github-actions[bot]",
+            "head_repository": "slashinchi/TVBoxOS-Mobile",
+            "head": candidate_branch_name(upstream),
+            "head_sha": candidate,
+            "merge_commit_sha": after,
+        })
+        replay = {
+            "status": "clean",
+            "candidate_needed": True,
+            "before": before,
+            "source_after": after,
+            "source_parents": [before, candidate],
+            "candidate": candidate,
+            "candidate_parents": [before, upstream],
+            "upstream": upstream,
+            "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
+            "upstream_ref": "refs/heads/main",
+            "fork_main": upstream,
+            "marker_fork_main": upstream,
+            "fork_main_is_ancestor": True,
+            "marker_tree": tree,
+            "candidate_tree": tree,
+            "rebuilt_tree": tree,
+            "source_tree": tree,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            replay_path = Path(tmp) / "replay.json"
+            replay_path.write_text(json.dumps(replay))
+            result = subprocess.run(
+                [
+                    "python3", "scripts/u2_release.py", "qualify-u1",
+                    "--before", before,
+                    "--after", after,
+                    "--parents", before, candidate,
+                    "--actor", "slashinchi",
+                    "--pr", pr,
+                    "--repository", "slashinchi/TVBoxOS-Mobile",
+                    "--upstream", upstream,
+                    "--marker", marker,
+                    "--candidate-tree", tree,
+                    "--upstream-ancestor", "true",
+                    "--upstream-version", "2.1.27",
+                    "--upstream-code", "237",
+                    "--replay-file", str(replay_path),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["qualified"])
 
     def test_plan_prep_cli_derives_version_and_trailers(self):
         published = [["2.1.26.1", 23601], ["2.1.27.1", 23701]]
@@ -1382,6 +1926,1099 @@ class U2ReleaseContractTests(unittest.TestCase):
             written = output.read()
             self.assertIn("noop=true", written)
             self.assertIn("qualified=false", written)
+
+    def test_u2_manual_dispatch_has_explicit_intent_and_live_sha_lock(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        dispatch = tree["on"]["workflow_dispatch"]
+        self.assertIn("inputs", dispatch)
+        inputs = dispatch["inputs"]
+        self.assertEqual(inputs["intent"]["type"], "choice")
+        self.assertTrue(inputs["intent"]["required"] == "true")
+        self.assertEqual(
+            inputs["intent"]["options"],
+            ["release", "recover", "noop-smoke"],
+        )
+        self.assertEqual(inputs["expected_sha"]["type"], "string")
+        self.assertTrue(inputs["expected_sha"]["required"] == "true")
+
+        gate = self._job_block(workflow, "gate")
+        gate_run = gate[gate.index("run: |") :]
+        for token in (
+            "INPUT_INTENT",
+            "EXPECTED_SHA",
+            '[[ "$ACTOR" == "slashinchi" ]]',
+            '[[ "$REF" == "refs/heads/patched" ]]',
+            '[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]',
+            "git ls-remote",
+            "live_patched",
+            '[[ "$live_patched" == "$EXPECTED_SHA" ]]',
+            '[[ "$GITHUB_SHA" == "$EXPECTED_SHA" ]]',
+            'echo "intent=$INPUT_INTENT"',
+        ):
+            self.assertIn(token, gate_run, token)
+
+        manual = gate_run[gate_run.index('elif [[ "$EVENT" == "workflow_dispatch" ]]') :]
+        manual = manual[: manual.index("else")]
+        self.assertNotIn("PUSH_BEFORE", manual)
+        self.assertNotIn("PUSH_AFTER", manual)
+        self.assertIn('echo "source_sha=$EXPECTED_SHA"', gate_run)
+
+    def test_u2_canary_harness_is_dispatch_only_and_locks_one_live_patched_sha(self):
+        self.assertTrue(CANARY_HARNESS_WORKFLOW.is_file())
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        tree = self._yaml_tree(workflow)
+        self.assertEqual(set(tree["on"]), {"workflow_dispatch"})
+        dispatch = tree["on"]["workflow_dispatch"]
+        inputs = dispatch["inputs"]
+        self.assertEqual(inputs["expected_sha"]["type"], "string")
+        self.assertEqual(inputs["expected_sha"]["required"], "true")
+        self.assertEqual(inputs["failure_injection"]["type"], "choice")
+        self.assertEqual(
+            inputs["failure_injection"]["options"],
+            ["none", "digest-mismatch", "signer-mismatch", "attestation-identity-mismatch"],
+        )
+
+        gate = self._job_block(workflow, "gate")
+        gate_run = gate[gate.index("run: |") :]
+        for token in (
+            '[[ "$EVENT" == "workflow_dispatch" ]]',
+            '[[ "$ACTOR" == "slashinchi" ]]',
+            '[[ "$REF" == "refs/heads/patched" ]]',
+            'assert_full_sha "$EXPECTED_SHA"',
+            "git ls-remote",
+            'refs/heads/patched',
+            '[[ "$live_patched" == "$EXPECTED_SHA" ]]',
+            '[[ "$GITHUB_SHA" == "$EXPECTED_SHA" ]]',
+            '[[ "$U2_ENABLED" == "false" ]]',
+            'case "$FAILURE_INJECTION" in',
+            'canary_namespace "$RUN_ID" "$RUN_ATTEMPT"',
+        ):
+            self.assertIn(token, gate_run, token)
+        self.assertNotIn("github.event_name !=", gate_run)
+
+    def test_u2_canary_harness_namespace_and_cleanup_are_exact_run_owned(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        tree = self._yaml_tree(workflow)
+        self.assertIn("gate", tree["jobs"])
+        cleanup = tree["jobs"]["cleanup"]
+        self.assertEqual(cleanup["if"], "always()")
+        cleanup_text = self._job_block(workflow, "cleanup")
+        for token in (
+            'u2-canary-%s-attempt-%s',
+            'GITHUB_RUN_ID',
+            'GITHUB_RUN_ATTEMPT',
+            'actions/runs/${GITHUB_RUN_ID}/artifacts',
+            'actions/artifacts/${artifact_id}',
+            '--method DELETE',
+            'workflow_run.id',
+            '"$actual_name" == "$expected_name"',
+        ):
+            self.assertIn(token, cleanup_text, token)
+        self.assertIn("canary_namespace }}-verification", workflow)
+        self.assertIn("$RUNNER_TEMP/$CANARY_NAMESPACE", workflow)
+        self.assertNotIn("*", cleanup_text.replace("${CANARY_NAMESPACE}-verification", ""))
+
+        for forbidden in (
+            "gh release",
+            "gh api .*releases",
+            "git push",
+            "git update-ref",
+            "refs/tags/",
+            "contents: write",
+            "TVBOX_RELEASE_TOKEN",
+            "release-production",
+            "update.json",
+            "rulesets",
+            "policies",
+            "--cleanup-tag",
+        ):
+            self.assertNotIn(forbidden, workflow, forbidden)
+
+    def test_u2_canary_harness_calls_same_rc_pipeline_with_exact_identity(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        tree = self._yaml_tree(workflow)
+        build = tree["jobs"]["build_rc"]
+        self.assertEqual(build["uses"], "./.github/workflows/rc-pipeline.yml")
+        self.assertIn("needs", build)
+        self.assertEqual(build["with"]["release_sha"], "${{ needs.gate.outputs.expected_sha }}")
+        self.assertEqual(build["with"]["source_sha"], "${{ needs.gate.outputs.expected_sha }}")
+        self.assertEqual(build["with"]["mode"], "manual-local")
+        for field in (
+            "upstream_sha",
+            "upstream_version",
+            "upstream_code",
+            "expected_version_name",
+            "expected_version_code",
+            "release_debt",
+            "candidate_pr",
+            "provenance_marker",
+        ):
+            self.assertIn(field, build["with"], field)
+            self.assertEqual(str(build["with"][field]).strip("'\""), "")
+        self.assertNotIn("secrets", build)
+        self.assertNotIn("environment", build)
+        self.assertEqual(build["permissions"]["actions"], "read")
+        self.assertEqual(build["permissions"]["id-token"], "write")
+        self.assertEqual(build["permissions"]["attestations"], "write")
+
+        verify = tree["jobs"]["verify"]
+        verify_text = self._job_block(workflow, "verify")
+        self.assertEqual(verify["permissions"]["actions"], "read")
+        self.assertEqual(verify["permissions"]["attestations"], "read")
+        for token in (
+            "actions/download-artifact@",
+            "actions/upload-artifact@",
+            "signed_artifact_id",
+            "signed_sha256",
+            "signer_sha256",
+            "apksigner",
+            "signer-result.json",
+            "gh attestation verify",
+            "https://slsa.dev/provenance/v1",
+            "https://slashinchi.github.io/TVBoxOS-Mobile/tvbox-release-identity/v2",
+            r"^https://github\.com/slashinchi/TVBoxOS-Mobile/\.github/workflows/rc-pipeline\.yml@refs/heads/patched$",
+            "verification.json",
+        ):
+            self.assertIn(token, verify_text, token)
+        self.assertEqual(verify_text.count("--cert-identity-regex"), 2)
+        self.assertNotIn("secrets.", verify_text)
+        self.assertNotIn("TVBOX_KEY", verify_text)
+
+    def test_u2_canary_gate_script_accepts_only_safe_inputs_and_builds_namespace(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        gate = self._job_block(workflow, "gate")
+        gate_run = gate[gate.index("run: |") :]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            expected = "a" * 40
+            fake_git.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"${1:-}\" == \"ls-remote\" ]]; then\n"
+                f"  printf '%s\\trefs/heads/patched\\n' '{expected}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n"
+            )
+            fake_git.chmod(0o755)
+            output = root / "github-output"
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "GITHUB_OUTPUT": str(output),
+                "EVENT": "workflow_dispatch",
+                "ACTOR": "slashinchi",
+                "TRIGGERING_ACTOR": "slashinchi",
+                "REF": "refs/heads/patched",
+                "EXPECTED_SHA": expected,
+                "GITHUB_SHA": expected,
+                "U2_ENABLED": "false",
+                "FAILURE_INJECTION": "none",
+                "RUN_ID": "12345",
+                "RUN_ATTEMPT": "2",
+                "GITHUB_SERVER_URL": "https://github.com",
+                "GITHUB_REPOSITORY": "slashinchi/TVBoxOS-Mobile",
+            }
+            result = subprocess.run(
+                ["bash", "-c", gate_run],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            written = output.read_text()
+            self.assertIn("expected_sha=" + expected, written)
+            self.assertIn("canary_namespace=u2-canary-12345-attempt-2", written)
+
+            for field, value in (
+                ("ACTOR", "intruder"),
+                ("TRIGGERING_ACTOR", "intruder"),
+                ("REF", "refs/heads/main"),
+                ("U2_ENABLED", "true"),
+            ):
+                output.write_text("")
+                env[field] = value
+                result = subprocess.run(
+                    ["bash", "-c", gate_run],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertNotEqual(result.returncode, 0, field)
+                env[field] = {
+                    "ACTOR": "slashinchi",
+                    "TRIGGERING_ACTOR": "slashinchi",
+                    "REF": "refs/heads/patched",
+                    "U2_ENABLED": "false",
+                }[field]
+
+            invalid_cases = (
+                ("EVENT", "push"),
+                ("EXPECTED_SHA", "short"),
+                ("GITHUB_SHA", "b" * 40),
+                ("FAILURE_INJECTION", "unapproved"),
+            )
+            for field, value in invalid_cases:
+                with self.subTest(field=field):
+                    output.write_text("")
+                    env[field] = value
+                    result = subprocess.run(
+                        ["bash", "-c", gate_run],
+                        cwd=ROOT,
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0, field)
+                    env[field] = {
+                        "EVENT": "workflow_dispatch",
+                        "EXPECTED_SHA": expected,
+                        "GITHUB_SHA": expected,
+                        "FAILURE_INJECTION": "none",
+                    }[field]
+
+    def test_u2_canary_gate_requires_original_and_triggering_actor(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        gate = self._job_block(workflow, "gate")
+        gate_run = gate[gate.index("run: |") :]
+        for token in (
+            "TRIGGERING_ACTOR: ${{ github.triggering_actor }}",
+            '[[ "$ACTOR" == "slashinchi" ]]',
+            '[[ "$TRIGGERING_ACTOR" == "slashinchi" ]]',
+            "rerun",
+        ):
+            self.assertIn(token, gate, token)
+        self.assertIn('[[ "$TRIGGERING_ACTOR" == "slashinchi" ]]', gate_run)
+
+    def test_rc_pipeline_canary_namespace_is_strict_and_prefixes_all_artifacts(self):
+        workflow = RC_WORKFLOW.read_text()
+        tree = self._yaml_tree(workflow)
+        call_inputs = tree["on"]["workflow_call"]["inputs"]
+        self.assertEqual(call_inputs["canary_namespace"]["type"], "string")
+        self.assertEqual(call_inputs["canary_namespace"]["required"], "false")
+        self.assertEqual(str(call_inputs["canary_namespace"]["default"]).strip("'\""), "")
+        self.assertIn("validate_canary_namespace", tree["jobs"])
+        validate = self._job_block(workflow, "validate_canary_namespace")
+        validate_run = validate[validate.index("run: |") :]
+        self.assertIn("^u2-canary-[0-9]+-attempt-[0-9]+$", validate_run)
+        self.assertIn("CANARY_NAMESPACE", validate_run)
+        for token in (
+            "RUN_ID",
+            "RUN_ATTEMPT",
+            "CALLER_WORKFLOW_REF",
+            "github.workflow_ref",
+            "expected_namespace",
+            "namespace does not match the current run and attempt",
+        ):
+            self.assertIn(token, validate, token)
+        for job_id in ("build_unsigned", "build_repro"):
+            self.assertIn("validate_canary_namespace", str(tree["jobs"][job_id]["needs"]), job_id)
+
+        upload_steps = []
+        for job in tree["jobs"].values():
+            for step in (job.get("steps") or []) if isinstance(job, dict) else []:
+                if isinstance(step, dict) and str(step.get("uses", "")).startswith("actions/upload-artifact@"):
+                    upload_steps.append(step)
+        self.assertEqual(len(upload_steps), 6)
+        for step in upload_steps:
+            self.assertIn("inputs.canary_namespace", str(step.get("with", {}).get("name")), step)
+        for legacy_name in (
+            "tvbox-u2-build-evidence",
+            "tvbox-u2-repro-build-evidence",
+            "tvbox-u2-repro-comparison",
+            "tvbox-u2-sign-input",
+            "tvbox-u2-signed-output",
+            "tvbox-u2-attest-input",
+        ):
+            self.assertIn(f"format('{legacy_name}-{{0}}-{{1}}'", workflow, legacy_name)
+
+        for output_name in (
+            "unsigned_artifact_name",
+            "repro_artifact_name",
+            "reproducibility_report_artifact_name",
+            "sign_input_artifact_name",
+            "signed_artifact_name",
+            "attest_input_artifact_name",
+        ):
+            self.assertIn(output_name, tree["on"]["workflow_call"]["outputs"], output_name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "github-output"
+            env = {
+                **os.environ,
+                "GITHUB_OUTPUT": str(output),
+                "CANARY_NAMESPACE": "",
+                "RUN_ID": "123",
+                "RUN_ATTEMPT": "1",
+                "CALLER_WORKFLOW_REF": "slashinchi/TVBoxOS-Mobile/.github/workflows/u2-canary-harness.yml@refs/heads/patched",
+            }
+            result = subprocess.run(
+                ["bash", "-c", validate_run], cwd=ROOT, env=env, text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("canary_namespace=", output.read_text())
+            for namespace in (
+                "u2-canary-123-attempt-1",
+                "u2-canary-122-attempt-1",
+                "u2-canary-123-attempt-2",
+                "u2-canary-123-attempt-1-extra",
+                "u2-canary-x-attempt-1",
+                "rc-control-123",
+            ):
+                output.write_text("")
+                env["CANARY_NAMESPACE"] = namespace
+                result = subprocess.run(
+                    ["bash", "-c", validate_run], cwd=ROOT, env=env, text=True, capture_output=True
+                )
+                if namespace == "u2-canary-123-attempt-1":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0, namespace)
+
+            output.write_text("")
+            env["CANARY_NAMESPACE"] = "u2-canary-123-attempt-1"
+            env["CALLER_WORKFLOW_REF"] = "slashinchi/TVBoxOS-Mobile/.github/workflows/rc-control.yml@refs/heads/patched"
+            result = subprocess.run(
+                ["bash", "-c", validate_run], cwd=ROOT, env=env, text=True, capture_output=True
+            )
+            self.assertNotEqual(result.returncode, 0, "non-harness caller")
+            output.write_text("")
+            env["CANARY_NAMESPACE"] = ""
+            result = subprocess.run(
+                ["bash", "-c", validate_run], cwd=ROOT, env=env, text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_u2_canary_passes_and_verifies_every_namespaced_pipeline_artifact(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        tree = self._yaml_tree(workflow)
+        build = tree["jobs"]["build_rc"]
+        self.assertEqual(build["with"]["canary_namespace"], "${{ needs.gate.outputs.canary_namespace }}")
+        verify = self._job_block(workflow, "verify")
+        cleanup = self._job_block(workflow, "cleanup")
+        for role in (
+            "unsigned_artifact_name",
+            "repro_artifact_name",
+            "reproducibility_report_artifact_name",
+            "sign_input_artifact_name",
+            "signed_artifact_name",
+            "attest_input_artifact_name",
+        ):
+            self.assertIn(f"needs.build_rc.outputs.{role}", verify, role)
+        for role in (
+            "build-evidence",
+            "repro-build-evidence",
+            "repro-comparison",
+            "sign-input",
+            "signed-output",
+            "attest-input",
+        ):
+            self.assertIn(f'${{CANARY_NAMESPACE}}-tvbox-u2-{role}', verify, role)
+            self.assertIn(f'${{CANARY_NAMESPACE}}-tvbox-u2-{role}', cleanup, role)
+        for token in (
+            "cleanup_failures",
+            "if ! delete_artifact",
+            "continue",
+            "REVIEW_PENDING",
+            "GITHUB_STEP_SUMMARY",
+            "needs.gate.result",
+            "needs.build_rc.result",
+            "needs.verify.result",
+            "upstream-run-incomplete",
+            "empty-artifact-list",
+        ):
+            self.assertIn(token, cleanup, token)
+        self.assertIn("actions/runs/${GITHUB_RUN_ID}/artifacts", cleanup)
+        self.assertIn("--paginate", cleanup)
+        self.assertIn("--slurp", cleanup)
+        self.assertIn("select(.name == $expected_name)", cleanup)
+        self.assertIn("unknown-artifact", cleanup)
+        self.assertNotIn("*", cleanup.replace("${CANARY_NAMESPACE}", ""))
+
+    def test_u2_canary_verifier_checks_signed_identity_predicate_fields(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        verifier = self._job_block(workflow, "verify")
+        verifier_run = verifier[verifier.index("run: |") :]
+        for token in (
+            "--format json",
+            "verificationResult",
+            "statement.predicate",
+            "canary_namespace",
+            "canary_release_sha",
+            "canary_source_sha",
+            "canary_signed_artifact_name",
+            "canary_signed_artifact_digest",
+            "canary_run_id",
+            "canary_run_attempt",
+            "signed_sha256",
+            "normalize_artifact_digest",
+            "SIGNED_ARTIFACT_API_DIGEST",
+            ".digest",
+            "actual_digest",
+            "sha256:",
+            "attestation-identity-mismatch",
+            "refs/heads/main",
+        ):
+            self.assertIn(token, verifier_run, token)
+
+        match = re.search(
+            r"(?ms)^[ \t]*assert_canary_predicate\(\) \{\n.*?^[ \t]*\}\n",
+            verifier_run,
+        )
+        self.assertIsNotNone(match, "predicate checker helper is missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            predicate_path = Path(tmp) / "custom-attestation.json"
+            expected = {
+                "namespace": "u2-canary-123-attempt-1",
+                "release": "a" * 40,
+                "source": "b" * 40,
+                "artifact_name": "u2-canary-123-attempt-1-tvbox-u2-signed-output-b-1",
+                "artifact_digest": "sha256:" + "c" * 64,
+                "run": "123",
+                "attempt": "1",
+                "signed": "d" * 64,
+            }
+            predicate_path.write_text(json.dumps([{
+                "verificationResult": {
+                    "statement": {
+                        "subject": [{"digest": {"sha256": expected["signed"]}}],
+                        "predicate": {
+                            "canary_namespace": expected["namespace"],
+                            "canary_release_sha": expected["release"],
+                            "canary_source_sha": expected["source"],
+                            "canary_signed_artifact_name": expected["artifact_name"],
+                            "canary_signed_artifact_digest": expected["artifact_digest"],
+                            "canary_run_id": expected["run"],
+                            "canary_run_attempt": expected["attempt"],
+                            "signed_sha256": expected["signed"],
+                        },
+                    }
+                }
+            }]))
+            env = {
+                **os.environ,
+                "PREDICATE": str(predicate_path),
+                "CANARY_NAMESPACE": expected["namespace"],
+                "RELEASE_SHA": expected["release"],
+                "SOURCE_SHA": expected["source"],
+                "CANARY_ARTIFACT_NAME": expected["artifact_name"],
+                "SIGNED_ARTIFACT_DIGEST": expected["artifact_digest"],
+                "SIGNED_ARTIFACT_DIGEST_NORMALIZED": expected["artifact_digest"],
+                "RUN_ID": expected["run"],
+                "RUN_ATTEMPT": expected["attempt"],
+                "SIGNED_SHA": expected["signed"],
+            }
+            check = match.group(0) + "\nassert_canary_predicate \"$PREDICATE\"\n"
+            result = subprocess.run(["bash", "-c", check], cwd=ROOT, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            env["CANARY_NAMESPACE"] = "u2-canary-123-attempt-2"
+            result = subprocess.run(["bash", "-c", check], cwd=ROOT, env=env, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_u2_canary_artifact_digest_helper_normalizes_and_rejects_wrong_api_digest(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        verifier = self._job_block(workflow, "verify")
+        verifier_run = verifier[verifier.index("run: |") :]
+        normalize = re.search(
+            r"(?ms)^[ \t]*normalize_artifact_digest\(\) \{\n.*?^[ \t]*\}\n",
+            verifier_run,
+        )
+        compare = re.search(
+            r"(?ms)^[ \t]*assert_artifact_digest\(\) \{\n.*?^[ \t]*\}\n",
+            verifier_run,
+        )
+        self.assertIsNotNone(normalize, "artifact digest normalizer is missing")
+        self.assertIsNotNone(compare, "artifact digest comparison helper is missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            check = (
+                normalize.group(0)
+                + compare.group(0)
+                + "\nprintf '%s\\n' \"$(normalize_artifact_digest \"$PIPELINE_DIGEST\")\"\n"
+                + "assert_artifact_digest \"$PIPELINE_DIGEST\" \"$API_DIGEST\"\n"
+            )
+            env = {
+                **os.environ,
+                "PIPELINE_DIGEST": "c" * 64,
+                "API_DIGEST": "sha256:" + "c" * 64,
+            }
+            result = subprocess.run(["bash", "-c", check], cwd=ROOT, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("sha256:" + "c" * 64, result.stdout)
+            env["API_DIGEST"] = "sha256:" + "d" * 64
+            result = subprocess.run(["bash", "-c", check], cwd=ROOT, env=env, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_u2_canary_cleanup_continues_after_one_exact_delete_failure(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        cleanup = self._job_block(workflow, "cleanup")
+        cleanup_run = cleanup[cleanup.index("run: |") :]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "path=\"${@: -1}\"\n"
+                "if [[ \"$path\" == *\"/actions/runs/\"* ]]; then\n"
+                "  printf '[{\"artifacts\":[{\"id\":101,\"name\":\"%s\"},{\"id\":102,\"name\":\"%s\"},{\"id\":103,\"name\":\"%s\"},{\"id\":104,\"name\":\"%s\"},{\"id\":105,\"name\":\"%s\"},{\"id\":106,\"name\":\"%s\"}]},{\"artifacts\":[{\"id\":107,\"name\":\"%s\"},{\"id\":108,\"name\":\"unexpected-current-run-artifact\"}]}]\\n' \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-build-evidence-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-repro-build-evidence-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-repro-comparison-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-sign-input-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-signed-output-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-tvbox-u2-attest-input-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\" \\\n"
+                "    \"$CANARY_NAMESPACE-verification\"\n"
+                "  exit 0\n"
+                "fi\n"
+                "id=\"${path##*/}\"\n"
+                "if [[ \"$*\" == *\"--method DELETE\"* ]]; then\n"
+                "  printf '%s\\n' \"$id\" >> \"$GH_DELETE_LOG\"\n"
+                "  [[ \"$id\" != \"102\" ]]\n"
+                "  exit\n"
+                "fi\n"
+                "case \"$id\" in\n"
+                "  101) name=\"$CANARY_NAMESPACE-tvbox-u2-build-evidence-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  102) name=\"$CANARY_NAMESPACE-tvbox-u2-repro-build-evidence-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  103) name=\"$CANARY_NAMESPACE-tvbox-u2-repro-comparison-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  104) name=\"$CANARY_NAMESPACE-tvbox-u2-sign-input-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  105) name=\"$CANARY_NAMESPACE-tvbox-u2-signed-output-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  106) name=\"$CANARY_NAMESPACE-tvbox-u2-attest-input-$EXPECTED_SHA-$GITHUB_RUN_ATTEMPT\";;\n"
+                "  107) name=\"$CANARY_NAMESPACE-verification\";;\n"
+                "  *) exit 1;;\n"
+                "esac\n"
+                "printf '{\"workflow_run\":{\"id\":\"%s\"},\"name\":\"%s\"}\\n' \"$GITHUB_RUN_ID\" \"$name\"\n"
+            )
+            fake_gh.chmod(0o755)
+            summary = root / "summary"
+            delete_log = root / "deletes"
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "EXPECTED_SHA": "a" * 40,
+                "CANARY_NAMESPACE": "u2-canary-123-attempt-1",
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_REPOSITORY": "slashinchi/TVBoxOS-Mobile",
+                "GH_TOKEN": "test-token-not-secret",
+                "GITHUB_STEP_SUMMARY": str(summary),
+                "GH_DELETE_LOG": str(delete_log),
+                "GATE_RESULT": "success",
+                "BUILD_RESULT": "success",
+                "VERIFY_RESULT": "success",
+                "BUILD_ARTIFACT_ID": "101",
+                "REPRO_ARTIFACT_ID": "102",
+                "COMPARISON_ARTIFACT_ID": "103",
+                "SIGN_INPUT_ARTIFACT_ID": "104",
+                "SIGNED_ARTIFACT_ID": "105",
+                "ATTEST_INPUT_ARTIFACT_ID": "106",
+                "VERIFICATION_ARTIFACT_ID": "107",
+            }
+            result = subprocess.run(
+                ["bash", "-c", cleanup_run], cwd=ROOT, env=env, text=True, capture_output=True
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(delete_log.read_text().splitlines(), ["101", "102", "103", "104", "105", "106", "107"])
+            summary_text = summary.read_text()
+            self.assertIn("REVIEW_PENDING", summary_text)
+            self.assertIn("unknown-artifact:unexpected-current-run-artifact", summary_text)
+
+    def test_u2_canary_cleanup_never_reports_complete_for_empty_failed_or_cancelled_run(self):
+        workflow = CANARY_HARNESS_WORKFLOW.read_text()
+        cleanup = self._job_block(workflow, "cleanup")
+        cleanup_run = cleanup[cleanup.index("run: |") :]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$*\" == *\"--paginate\"* ]]; then\n"
+                "  printf '[{\"artifacts\":[]}]\\n'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n"
+            )
+            fake_gh.chmod(0o755)
+            for result_value in ("failure", "cancelled", "skipped"):
+                with self.subTest(result=result_value):
+                    summary = root / f"summary-{result_value}"
+                    env = {
+                        **os.environ,
+                        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                        "EXPECTED_SHA": "a" * 40,
+                        "CANARY_NAMESPACE": "u2-canary-123-attempt-1",
+                        "GITHUB_RUN_ID": "123",
+                        "GITHUB_RUN_ATTEMPT": "1",
+                        "GITHUB_REPOSITORY": "slashinchi/TVBoxOS-Mobile",
+                        "GH_TOKEN": "test-token-not-secret",
+                        "GITHUB_STEP_SUMMARY": str(summary),
+                        "GATE_RESULT": result_value,
+                        "BUILD_RESULT": result_value,
+                        "VERIFY_RESULT": result_value,
+                    }
+                    run = subprocess.run(
+                        ["bash", "-c", cleanup_run],
+                        cwd=ROOT,
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(run.returncode, 0)
+                    self.assertIn("REVIEW_PENDING", summary.read_text())
+
+    def test_u2_intent_is_mutually_exclusive_and_cross_job_identity_is_explicit(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        jobs = tree["jobs"]
+        gate = jobs["gate"]
+        gate_outputs = gate["outputs"]
+        self.assertIn("intent", gate_outputs)
+        self.assertIn("noop", gate_outputs)
+        gate_run = self._job_block(workflow, "gate")
+        self.assertIn('case "$INPUT_INTENT" in', gate_run)
+        for intent in ("release", "recover", "noop-smoke"):
+            self.assertIn(intent, gate_run)
+        self.assertIn("intent=$INPUT_INTENT", gate_run)
+
+        for job_id in ("qualify", "prep"):
+            self.assertIn("intent", jobs[job_id]["outputs"], job_id)
+            self.assertIn("noop", jobs[job_id]["outputs"], job_id)
+            self.assertIn("INTENT", self._job_block(workflow, job_id), job_id)
+
+        summary = jobs["rc_summary"]
+        self.assertIn("INTENT", summary["outputs"])
+        self.assertIn("NOOP", summary["outputs"])
+        summary_text = self._job_block(workflow, "rc_summary")
+        self.assertIn("needs.qualify.outputs.intent", summary_text)
+        self.assertIn("needs.qualify.outputs.noop", summary_text)
+
+        watch = self._job_block(workflow, "watch_approval")
+        self.assertIn("needs.rc_summary.outputs.INTENT", watch)
+        self.assertIn("needs.rc_summary.outputs.NOOP", watch)
+
+        publish = jobs["publish"]
+        self.assertIn("outputs", publish)
+        self.assertIn("intent", publish["outputs"])
+        self.assertIn("noop", publish["outputs"])
+        publish_text = self._job_block(workflow, "publish")
+        self.assertIn("needs.rc_summary.outputs.INTENT", publish_text)
+        self.assertIn("needs.rc_summary.outputs.NOOP", publish_text)
+
+    def test_u2_noop_smoke_has_a_read_only_dependency_barrier(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        jobs = tree["jobs"]
+        for job_id in ("prep", "build_rc", "rc_summary", "watch_approval", "publish"):
+            condition = str(jobs[job_id].get("if", ""))
+            self.assertIn("needs.qualify.outputs.noop != 'true'", condition, job_id)
+            self.assertIn("needs.qualify.outputs.intent != 'noop-smoke'", condition, job_id)
+
+        qualify = self._job_block(workflow, "qualify")
+        for token in (
+            'INTENT: ${{ needs.gate.outputs.intent }}',
+            'if [[ "$INTENT" == "noop-smoke" ]]',
+            'NOOP=true',
+            'INTENT" == "noop-smoke"',
+            "baseline",
+            'bash "$trusted_root/scripts/u2_qualify.sh"',
+        ):
+            self.assertIn(token, qualify, token)
+        self.assertIn("return 0", qualify)
+        watcher = qualify[qualify.index("watch_debt()") : qualify.index("# Strict U1 qualification")]
+        self.assertIn('[[ "$INTENT" == "noop-smoke" || "$NOOP" == "true" ]]', watcher)
+        debt_watcher = self._job_block(workflow, "debt_watcher")
+        self.assertIn("gh issue create", debt_watcher)
+
+        for job_id in ("prep", "build_rc", "publish"):
+            text = self._job_block(workflow, job_id)
+            self.assertNotIn('if: always()', text)
+
+    def test_u2_promote_revalidates_live_baseline_and_version_collision(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        publish_steps = tree["jobs"]["publish"]["steps"]
+        names = [step.get("name", "") for step in publish_steps]
+        preflight_index = names.index("Preflight verified release metadata")
+        promote_index = names.index("Promote patched to exact release SHA (CAS)")
+        self.assertLess(preflight_index, promote_index)
+
+        preflight = publish_steps[preflight_index]
+        self.assertIn("baseline_tag", str(preflight))
+        self.assertIn("baseline_target", str(preflight))
+        self.assertIn("current_version", str(preflight))
+        self.assertIn("current_update_digest", str(preflight))
+        self.assertIn("current_ledger_digest", str(preflight))
+
+        promote = publish_steps[promote_index]
+        promote_text = promote["run"]
+        for token in (
+            "PREFLIGHT_BASELINE_TAG",
+            "PREFLIGHT_BASELINE_TARGET",
+            "PREFLIGHT_CURRENT_VERSION",
+            "PREFLIGHT_UPDATE_DIGEST",
+            "PREFLIGHT_LEDGER_DIGEST",
+            "canonical-release-baseline",
+            "parse-update-metadata",
+            "monotonic-compare",
+            "version collision",
+            "current update.json",
+            "current verified-releases.json",
+        ):
+            self.assertIn(token, promote_text, token)
+        live_read = promote_text.index("git ls-remote")
+        decision = promote_text.index('if [[ "$current" == "$RELEASE_SHA" ]]')
+        self.assertLess(live_read, decision)
+        self.assertIn("refusing to continue", promote_text)
+
+    def test_u2_freezes_release_identity_after_first_operation_and_reuses_it(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        steps = tree["jobs"]["publish"]["steps"]
+        names = [step.get("name", "") for step in steps]
+        create_index = names.index("Create or reconcile draft Release with exact identity")
+        self.assertIn("Freeze Release identity after first draft/asset operation", names)
+        freeze_index = names.index("Freeze Release identity after first draft/asset operation")
+        attach_index = names.index("Attach missing assets only (no clobber)")
+        revalidate_index = names.index("Revalidate frozen Release identity after asset operation")
+        verify_index = names.index("Verify both assets before publish (API digest + download bytes)")
+        publish_index = names.index("Publish verified draft")
+        self.assertLess(create_index, freeze_index)
+        self.assertLess(freeze_index, attach_index)
+        self.assertLess(attach_index, revalidate_index)
+        self.assertLess(revalidate_index, verify_index)
+        self.assertLess(verify_index, publish_index)
+
+        freeze = str(steps[freeze_index])
+        for token in (
+            "gh release view",
+            "git/ref/tags",
+            "tag_target_sha",
+            "targetCommitish",
+            "EXPECTED_VERSION",
+            "EXPECTED_APK",
+            "update_digest",
+            "exact target",
+            "asset",
+            "GITHUB_OUTPUT",
+        ):
+            self.assertIn(token, freeze, token)
+        self.assertIn("frozen_tag", freeze)
+        self.assertIn("frozen_target_sha", freeze)
+
+        revalidate = str(steps[revalidate_index])
+        for token in (
+            "gh release view",
+            "git/ref/tags",
+            "FROZEN_TAG",
+            "FROZEN_TARGET_SHA",
+            "FROZEN_VERSION",
+            "FROZEN_APK_DIGEST",
+            "FROZEN_UPDATE_DIGEST",
+            "exactly 2 assets",
+            "fail closed",
+        ):
+            self.assertIn(token, revalidate, token)
+
+        later_steps = steps[attach_index:]
+        later_text = "\n".join(str(step) for step in later_steps)
+        for token in (
+            "steps.freeze.outputs.frozen_tag",
+            "steps.freeze.outputs.frozen_target_sha",
+            "steps.freeze.outputs.frozen_version",
+            "steps.freeze.outputs.frozen_apk_digest",
+            "steps.freeze.outputs.frozen_update_digest",
+        ):
+            self.assertIn(token, later_text, token)
+
+    def test_u2_publish_forbids_publish_command_upload_clobber_tag_movement_and_second_build(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        steps = tree["jobs"]["publish"]["steps"]
+        run_text = "\n".join(step.get("run", "") for step in steps)
+        self.assertNotIn("gh release publish", run_text)
+        attach = next(step for step in steps if step.get("name") == "Attach missing assets only (no clobber)")
+        self.assertIn("gh release upload", attach.get("run", ""))
+        self.assertNotIn("--clobber", attach.get("run", ""))
+        self.assertNotIn("./gradlew", run_text)
+        self.assertNotIn("assembleRelease", run_text)
+        self.assertNotIn("git tag -f", run_text)
+        self.assertNotIn("git update-ref", run_text)
+        push_lines = [
+            line
+            for step in steps
+            for line in step.get("run", "").splitlines()
+            if "git push" in line
+        ]
+        self.assertNotIn("refs/tags/", "\n".join(push_lines))
+        self.assertEqual(run_text.count("actions/artifacts/${{ needs.build_rc.outputs.signed_artifact_id }}/zip"), 1)
+
+    def test_u2_manual_source_identity_is_used_for_all_read_only_checkouts(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        jobs = tree["jobs"]
+
+        qualify_checkout = jobs["qualify"]["steps"][0]["with"]["ref"]
+        watch_checkout = jobs["watch_approval"]["steps"][0]["with"]["ref"]
+        publish_checkout = jobs["publish"]["steps"][0]["with"]["ref"]
+        self.assertEqual(qualify_checkout, "${{ needs.gate.outputs.source_sha }}")
+        self.assertEqual(watch_checkout, "${{ needs.rc_summary.outputs.RELEASE_SHA }}")
+        self.assertEqual(publish_checkout, "${{ needs.rc_summary.outputs.RELEASE_SHA }}")
+        for ref in (qualify_checkout, watch_checkout, publish_checkout):
+            self.assertNotEqual(ref, "refs/heads/patched")
+
+    def test_u2_disabled_noop_smoke_gate_is_executable_and_enters_read_only_path(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        gate_run = self._yaml_tree(workflow)["jobs"]["gate"]["steps"][0]["run"]
+        expected = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$1\" == \"ls-remote\" ]]; then\n"
+                f"  printf '%s\\trefs/heads/patched\\n' '{expected}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exec /usr/bin/git \"$@\"\n"
+            )
+            fake_git.chmod(0o755)
+            output = root / "github-output"
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "GITHUB_OUTPUT": str(output),
+                "U2_ENABLED": "false",
+                "NOOP_CONFIG": "false",
+                "EVENT": "workflow_dispatch",
+                "ACTOR": "slashinchi",
+                "REF": "refs/heads/patched",
+                "INPUT_INTENT": "noop-smoke",
+                "EXPECTED_SHA": expected,
+                "GITHUB_SHA": expected,
+                "REPO": "slashinchi/TVBoxOS-Mobile",
+            }
+            result = subprocess.run(
+                ["bash", "-c", gate_run],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output_text = output.read_text()
+            self.assertIn("enabled=true", output_text)
+            self.assertIn("mode=manual-noop", output_text)
+            self.assertIn("source_sha=" + expected, output_text)
+            self.assertIn("intent=noop-smoke", output_text)
+            self.assertIn("noop=true", output_text)
+            for intent in ("release", "recover"):
+                output.write_text("")
+                env["INPUT_INTENT"] = intent
+                result = subprocess.run(
+                    ["bash", "-c", gate_run],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("enabled=false", output.read_text())
+
+    def test_u2_recovery_forward_requires_recover_intent_and_peeled_tag_target(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        publish = tree["jobs"]["publish"]
+        promote = next(
+            step for step in publish["steps"]
+            if step.get("name") == "Promote patched to exact release SHA (CAS)"
+        )
+        promote_text = str(promote)
+        promote_run = promote["run"]
+        self.assertIn("INTENT", promote["env"])
+        self.assertEqual(promote["env"]["INTENT"], "${{ needs.rc_summary.outputs.INTENT }}")
+        self.assertIn('elif [[ "$INTENT" == "recover" ]] && git merge-base --is-ancestor', promote_run)
+        self.assertNotRegex(promote_run, r"elif git merge-base --is-ancestor")
+        local_baseline = promote_run.index('git fetch --no-tags origin "+refs/heads/patched:refs/heads/patched"')
+        current_read = promote_run.index('current=$(git rev-parse refs/heads/patched)')
+        self.assertLess(local_baseline, current_read)
+        self.assertIn("refs/tags/${tag}^{}", promote_run)
+        self.assertIn("peeled", promote_text)
+        self.assertIn('"$tag_target_sha" == "$RELEASE_SHA"', promote_run)
+
+        for step_name in (
+            "Create or reconcile draft Release with exact identity",
+            "Freeze Release identity after first draft/asset operation",
+            "Revalidate frozen Release identity after asset operation",
+            "Publish verified draft",
+        ):
+            step = next(step for step in publish["steps"] if step.get("name") == step_name)
+            text = str(step)
+            self.assertIn("peeled", text, step_name)
+            self.assertRegex(text, r"refs/tags/\$\{(?:tag|FROZEN_TAG)\}\^\{\}", step_name)
+        create = next(
+            step for step in publish["steps"]
+            if step.get("name") == "Create or reconcile draft Release with exact identity"
+        )
+        self.assertLess(
+            create["run"].index("refs/tags/${tag}^{}"),
+            create["run"].index('gh release create "$tag"'),
+        )
+
+    def test_u2_noop_has_a_separate_issue_watcher_and_no_issue_permission_on_qualify(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        jobs = tree["jobs"]
+        self.assertNotIn("issues", jobs["qualify"]["permissions"])
+        self.assertNotIn("gh issue", self._job_block(workflow, "qualify"))
+        self.assertIn("debt_watcher", jobs)
+
+        watcher = jobs["debt_watcher"]
+        watcher_if = str(watcher["if"])
+        for token in (
+            "needs.gate.outputs.intent != 'noop-smoke'",
+            "needs.gate.outputs.noop != 'true'",
+            "needs.gate.outputs.mode == 'auto-upstream'",
+        ):
+            self.assertIn(token, watcher_if, token)
+        watcher_text = self._job_block(workflow, "debt_watcher")
+        self.assertIn("gh issue create", watcher_text)
+        self.assertIn("gh issue list", watcher_text)
+        self.assertEqual(
+            watcher["steps"][0]["with"]["ref"],
+            "${{ needs.qualify.outputs.source_sha }}",
+        )
+
+        for job_id in ("prep", "build_rc", "rc_summary", "watch_approval", "publish"):
+            condition = str(jobs[job_id].get("if", ""))
+            self.assertIn("noop", condition, job_id)
+            self.assertIn("noop-smoke", condition, job_id)
+
+    def _run_tag_target_resolver(self, output, object_type, status=0):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        promote = next(
+            step for step in tree["jobs"]["publish"]["steps"]
+            if step.get("name") == "Promote patched to exact release SHA (CAS)"
+        )
+        match = re.search(
+            r"(?ms)^[ \t]*resolve_tag_target\(\) \{\n.*?^[ \t]*}\n",
+            promote["run"],
+        )
+        self.assertIsNotNone(match, "typed tag resolver is missing from promote")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"${1:-}\" == \"ls-remote\" ]]; then\n"
+                "  printf '%s' \"${TAG_OUTPUT-}\"\n"
+                "  exit \"${TAG_STATUS:-0}\"\n"
+                "fi\n"
+                "exit 99\n"
+            )
+            fake_git.chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "TAG_OUTPUT": output,
+                "TAG_OBJECT_TYPE": object_type,
+                "TAG_STATUS": str(status),
+            }
+            return subprocess.run(
+                [
+                    "bash", "-c",
+                    match.group(0)
+                    + '\nresolve_tag_target "remote" "vtest" "$TAG_OBJECT_TYPE"\n',
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+    def test_u2_tag_resolver_uses_peeled_commit_for_annotated_tag(self):
+        tag_object = "a" * 40
+        commit = "b" * 40
+        output = (
+            f"{tag_object}\trefs/tags/vtest\n"
+            f"{commit}\trefs/tags/vtest^{{}}\n"
+        )
+        result = self._run_tag_target_resolver(output, "tag")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, commit + "\n")
+
+    def test_u2_tag_resolver_accepts_direct_commit_for_lightweight_tag(self):
+        commit = "c" * 40
+        result = self._run_tag_target_resolver(
+            f"{commit}\trefs/tags/vtest\n",
+            "commit",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, commit + "\n")
+
+    def test_u2_tag_resolver_rejects_tag_objects_and_malformed_remote_output(self):
+        tag_object = "d" * 40
+        commit = "e" * 40
+        cases = [
+            ("tag", f"{tag_object}\trefs/tags/vtest\n"),
+            ("commit", ""),
+            ("commit", f"{commit}\trefs/tags/vtest\n{tag_object}\trefs/tags/vtest\n"),
+            ("commit", f"{commit}\trefs/tags/vtest\n{tag_object}\trefs/tags/other\n"),
+            ("commit", f"not-a-sha\trefs/tags/vtest\n"),
+            ("unknown", f"{commit}\trefs/tags/vtest\n"),
+            (
+                "commit",
+                f"{commit}\trefs/tags/vtest\n{tag_object}\trefs/tags/vtest^{{}}\n",
+            ),
+        ]
+        for object_type, output in cases:
+            with self.subTest(object_type=object_type, output=output):
+                result = self._run_tag_target_resolver(output, object_type)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_u2_all_tag_identity_checks_use_typed_peeled_or_direct_resolver(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        steps = tree["jobs"]["publish"]["steps"]
+        names = {
+            "Promote patched to exact release SHA (CAS)": '"$tag_target_sha" == "$RELEASE_SHA"',
+            "Create or reconcile draft Release with exact identity": '"$tag_target_sha" == "$RELEASE_SHA"',
+            "Freeze Release identity after first draft/asset operation": '"$tag_target_sha" == "$RELEASE_SHA"',
+            "Revalidate frozen Release identity after asset operation": '"$tag_target_sha" == "$FROZEN_TARGET_SHA"',
+            "Publish verified draft": '"$tag_target_sha" == "$FROZEN_TARGET_SHA"',
+        }
+        resolution_text = []
+        for name, target_check in names.items():
+            step = next(step for step in steps if step.get("name") == name)
+            run = step["run"]
+            resolution_text.append(run)
+            self.assertIn("resolve_tag_target()", run, name)
+            self.assertIn("object.type", run, name)
+            self.assertIn("refs/tags/", run, name)
+            self.assertIn("^{}", run, name)
+            self.assertIn(target_check, run, name)
+        all_resolution = "\n".join(resolution_text)
+        self.assertNotIn("tag_target_sha=$(git ls-remote", all_resolution)
+        self.assertIn('case "$object_type" in', all_resolution)
+        self.assertIn("tag)", all_resolution)
+        self.assertIn("commit)", all_resolution)
 
 
 if __name__ == "__main__":

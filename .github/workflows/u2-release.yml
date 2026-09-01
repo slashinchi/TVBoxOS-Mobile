@@ -2,6 +2,19 @@ name: TVBox U2 Release Orchestrator
 
 on:
   workflow_dispatch:
+    inputs:
+      intent:
+        description: Release intent
+        required: true
+        type: choice
+        options:
+          - release
+          - recover
+          - noop-smoke
+      expected_sha:
+        description: Full live patched SHA expected for this manual run
+        required: true
+        type: string
   push:
     branches:
       - patched
@@ -19,13 +32,20 @@ jobs:
       enabled: ${{ steps.gate.outputs.enabled }}
       mode: ${{ steps.gate.outputs.mode }}
       source_sha: ${{ steps.gate.outputs.source_sha }}
+      intent: ${{ steps.gate.outputs.intent }}
+      noop: ${{ steps.gate.outputs.noop }}
     steps:
       - id: gate
         env:
           U2_ENABLED: ${{ vars.TVBOX_U2_ENABLED }}
+          NOOP_CONFIG: ${{ vars.TVBOX_U2_NOOP }}
           EVENT: ${{ github.event_name }}
           ACTOR: ${{ github.actor }}
           REF: ${{ github.ref }}
+          INPUT_INTENT: ${{ inputs.intent }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          GITHUB_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           if [[ "$EVENT" == "push" ]]; then
@@ -37,6 +57,8 @@ jobs:
             }
             echo "mode=auto-upstream" >> "$GITHUB_OUTPUT"
             echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "intent=release" >> "$GITHUB_OUTPUT"
+            echo "noop=${NOOP_CONFIG:-false}" >> "$GITHUB_OUTPUT"
           elif [[ "$EVENT" == "workflow_dispatch" ]]; then
             [[ "$ACTOR" == "slashinchi" ]] || {
               echo "::error::manual dispatch requires actor slashinchi"
@@ -48,13 +70,54 @@ jobs:
               echo "enabled=false" >> "$GITHUB_OUTPUT"
               exit 1
             }
+            case "$INPUT_INTENT" in
+              release|recover|noop-smoke)
+                ;;
+              *)
+                echo "::error::manual dispatch intent must be release, recover, or noop-smoke"
+                echo "enabled=false" >> "$GITHUB_OUTPUT"
+                exit 1
+                ;;
+            esac
+            [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::manual dispatch expected_sha must be a full lowercase 40-character SHA"
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            }
+            [[ "$GITHUB_SHA" == "$EXPECTED_SHA" ]] || {
+              echo "::error::manual dispatch selected SHA does not equal expected_sha"
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            }
+            live_patched=$(git ls-remote "https://github.com/${REPO}.git" refs/heads/patched | awk 'NF {print $1}')
+            [[ "$live_patched" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::manual dispatch could not read a full live patched SHA"
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            }
+            [[ "$live_patched" == "$EXPECTED_SHA" ]] || {
+              echo "::error::manual dispatch expected_sha does not equal live patched"
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            }
+            if [[ "$INPUT_INTENT" == "noop-smoke" ]]; then
+              echo "mode=manual-noop" >> "$GITHUB_OUTPUT"
+              echo "source_sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+              echo "intent=noop-smoke" >> "$GITHUB_OUTPUT"
+              echo "noop=true" >> "$GITHUB_OUTPUT"
+              echo "enabled=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::U2 disabled gate permits only trusted noop-smoke read-only qualification"
+              exit 0
+            fi
             [[ "${U2_ENABLED:-}" == "true" ]] || {
               echo "U2 is disabled (TVBOX_U2_ENABLED is not 'true'). Manual release is gated."
               echo "enabled=false" >> "$GITHUB_OUTPUT"
               exit 0
             }
             echo "mode=manual-local" >> "$GITHUB_OUTPUT"
-            echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "noop=${NOOP_CONFIG:-false}" >> "$GITHUB_OUTPUT"
+            echo "source_sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+            echo "intent=$INPUT_INTENT" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -70,7 +133,6 @@ jobs:
       contents: read
       actions: read
       pull-requests: read
-      issues: write
     outputs:
       source_sha: ${{ steps.qualify.outputs.source_sha }}
       release_sha: ${{ steps.qualify.outputs.release_sha }}
@@ -87,61 +149,74 @@ jobs:
       upstream_code: ${{ steps.qualify.outputs.upstream_code }}
       candidate_pr: ${{ steps.qualify.outputs.candidate_pr }}
       provenance_marker: ${{ steps.qualify.outputs.provenance_marker }}
+      intent: ${{ steps.qualify.outputs.intent }}
+      debt_issue_reason: ${{ steps.qualify.outputs.debt_issue_reason }}
     steps:
       - name: Check out patched
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: refs/heads/patched
+          ref: ${{ needs.gate.outputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
       - id: qualify
         env:
           MODE: ${{ needs.gate.outputs.mode }}
           SOURCE_SHA: ${{ needs.gate.outputs.source_sha }}
-          NOOP: ${{ vars.TVBOX_U2_NOOP }}
+          INTENT: ${{ needs.gate.outputs.intent }}
+          NOOP: ${{ needs.gate.outputs.noop }}
           EVENT: ${{ github.event_name }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.event.after }}
           REPO: ${{ github.repository }}
           ACTOR: ${{ github.actor }}
+          UPSTREAM_REPO: kukuqi666/TVBoxOS-Mobile
+          UPSTREAM_REF: refs/heads/main
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          chmod +x scripts/u2_qualify.sh
-          bash scripts/u2_qualify.sh
+          if [[ "$INTENT" == "noop-smoke" ]]; then
+            NOOP=true
+            export NOOP
+          fi
+          trusted_root="$RUNNER_TEMP/u2-trusted-control"
+          mkdir -p "$trusted_root/scripts"
           if [[ "$MODE" == "auto-upstream" ]]; then
-            # Non-U1 push debt watcher: open one deduplicated local-release-debt Issue.
+            [[ -n "$PUSH_BEFORE" && -n "$PUSH_AFTER" ]] || {
+              echo "::error::auto-upstream qualification requires push before/after SHAs"; exit 1;
+            }
+            git show "$PUSH_BEFORE:scripts/u2_release.py" > "$trusted_root/scripts/u2_release.py"
+            git show "$PUSH_BEFORE:scripts/upstream_monitor.py" > "$trusted_root/scripts/upstream_monitor.py"
+            git show "$PUSH_BEFORE:scripts/u2_qualify.sh" > "$trusted_root/scripts/u2_qualify.sh"
+          else
+            git show "$SOURCE_SHA:scripts/u2_release.py" > "$trusted_root/scripts/u2_release.py"
+            git show "$SOURCE_SHA:scripts/upstream_monitor.py" > "$trusted_root/scripts/upstream_monitor.py"
+            git show "$SOURCE_SHA:scripts/u2_qualify.sh" > "$trusted_root/scripts/u2_qualify.sh"
+          fi
+          chmod +x "$trusted_root/scripts/u2_release.py" "$trusted_root/scripts/upstream_monitor.py" "$trusted_root/scripts/u2_qualify.sh"
+          # u2_qualify.sh stays fork-owned; require the source merge to retain
+          # the pre-merge copy, then execute it against the checked-out repo with
+          # the pre-merge trusted u2_release helper.
+          if [[ "$MODE" == "auto-upstream" ]]; then
+            git diff --quiet "$PUSH_BEFORE" "$PUSH_AFTER" -- scripts/u2_qualify.sh || {
+              echo "::error::U1 source merge changed the trusted qualification wrapper"; exit 1;
+            }
+          fi
+          U2_REPO_ROOT="$PWD" \
+            U2_RELEASE_HELPER="$trusted_root/scripts/u2_release.py" \
+            bash "$trusted_root/scripts/u2_qualify.sh"
+          echo "intent=$INTENT" >> "$GITHUB_OUTPUT"
+          if [[ "$INTENT" == "noop-smoke" ]]; then
+            echo "::notice::trusted noop-smoke completed baseline/debt calculation; no write-capable path is entered"
+            exit 0
+          fi
+          if [[ "$MODE" == "auto-upstream" ]]; then
+            # Record the reason for the separate read/write debt watcher job.
             watch_debt() {
               local reason="$1"
-              local debt version baseline classification
-              debt=$(grep '^release_debt=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
-              version=$(grep '^expected_version_name=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
-              baseline=$(grep '^baseline_tag=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
-              classification=$(grep '^debt_classification=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
-              if [[ "$classification" == "docs-only" ]]; then
+              if [[ "$INTENT" == "noop-smoke" || "$NOOP" == "true" ]]; then
                 return 0
               fi
-              local title="local-release-debt: ${baseline} -> patched (${classification})"
-              local existing
-              existing=$(gh issue list --repo "$REPO" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
-              if [[ -n "$existing" ]]; then
-                echo "::notice::local-release-debt issue already open: #${existing}"
-                return 0
-              fi
-              gh issue create --repo "$REPO" \
-                --title "$title" \
-                --body "Non-U1 push to patched carries unabsorbed release debt.
-
-                - Mode: auto-upstream (rejected: ${reason})
-                - Source: $SOURCE_SHA
-                - Baseline: $baseline
-                - Debt fingerprint: $debt
-                - Classification: $classification
-                - Planned version: ${version:-none}
-
-                U2 cannot build an RC from this push because it is not a valid U1 merge.
-                Open until the debt is absorbed by a qualified U1 merge or manual-local release."
-              echo "::notice::local-release-debt issue opened for ${SOURCE_SHA}"
+              echo "debt_issue_reason=$reason" >> "$GITHUB_OUTPUT"
             }
             # Strict U1 qualification: only a real U1 candidate merge qualifies.
             parents=$(git rev-list --parents -n 1 "$PUSH_AFTER" | awk '{for(i=2;i<=NF;i++) printf "%s%s", sep, $i; sep=" "}')
@@ -157,8 +232,8 @@ jobs:
             fi
             pr_json=$(echo "$pr" | jq -c '{number,state,merged_at:.merged_at,base:(.base // {}),merged_by:(.merged_by.login // ""),author:(.user.login // ""),head_repository:(.head.repo.full_name // ""),head:(.head.ref // ""),head_sha:(.head.sha // ""),merge_commit_sha:.merge_commit_sha}')
             # For provenance, read the marker embedded in the PR body.
-            marker=$(echo "$pr" | jq -r '.body // ""' | grep -o '<!-- tvbox-upstream-candidate-v2 .* -->' | head -1)
-            parsed=$(python3 scripts/u2_release.py parse-provenance-marker --marker "$marker" 2>/dev/null || echo "")
+            marker=$(echo "$pr" | jq -r '.body // ""' | grep -o '<!-- tvbox-upstream-candidate-v2 .* -->' | head -1 || true)
+            parsed=$(python3 "$trusted_root/scripts/u2_release.py" parse-provenance-marker --marker "$marker" 2>/dev/null || echo "")
             if [[ -z "$parsed" ]]; then
               echo "::error::auto-upstream PR missing valid v2 provenance marker"
               watch_debt "missing-provenance-marker"
@@ -169,15 +244,94 @@ jobs:
             upstream_sha=$(jq -r '.upstream' <<<"$parsed")
             candidate=$(jq -r '.candidate' <<<"$parsed")
             candidate_tree=$(jq -r '.tree' <<<"$parsed")
-            upstream_version=$(jq -r '.upstreamVersion' <<<"$parsed")
-            upstream_code=$(jq -r '.upstreamCode' <<<"$parsed")
+            marker_fork_main=$(jq -r '.forkMain' <<<"$parsed")
             upstream_is_ancestor=false
             if git merge-base --is-ancestor "$upstream_sha" "$candidate" 2>/dev/null; then
               upstream_is_ancestor=true
             fi
-            replay_tree="$candidate_tree"
-            actual_tree=$(git rev-parse "${PUSH_AFTER}^{tree}")
-            result=$(python3 scripts/u2_release.py qualify-u1 \
+            actual_source_tree=$(git rev-parse "${PUSH_AFTER}^{tree}")
+            actual_candidate_tree=$(git rev-parse "${candidate}^{tree}")
+            source_parents=$(git rev-list --parents -n 1 "$PUSH_AFTER" | jq -R 'rtrimstr("\n") | split(" ") | .[1:]')
+            candidate_parents=$(git rev-list --parents -n 1 "$candidate" | jq -R 'rtrimstr("\n") | split(" ") | .[1:]')
+            git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+              +refs/heads/main:refs/remotes/upstream/main
+            live_upstream=$(git rev-parse refs/remotes/upstream/main)
+            [[ "$live_upstream" == "$upstream_sha" ]] || {
+              echo "::error::provenance upstream SHA moved during strict replay";
+              watch_debt "upstream-sha-moved";
+              sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
+              echo "qualified=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            }
+            upstream_version_file="$RUNNER_TEMP/upstream-app-build.gradle"
+            git show "$upstream_sha:app/build.gradle" > "$upstream_version_file"
+            upstream_version_json=$(python3 "$trusted_root/scripts/u2_release.py" parse-app-version --file "$upstream_version_file")
+            upstream_version=$(jq -r '.versionName' <<<"$upstream_version_json")
+            upstream_code=$(jq -r '.versionCode' <<<"$upstream_version_json")
+            existing_fork_main=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
+            if [[ -n "$existing_fork_main" && "$existing_fork_main" != "$marker_fork_main" ]]; then
+              echo "::error::fork main baseline differs from the trusted candidate marker";
+              watch_debt "fork-main-baseline-mismatch"
+              sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
+              echo "qualified=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+            fork_main=$(git rev-parse refs/remotes/origin/main)
+            fork_main_is_ancestor=false
+            if git merge-base --is-ancestor "$fork_main" "$upstream_sha" 2>/dev/null; then
+              fork_main_is_ancestor=true
+            fi
+            replay_worktree=$(mktemp -d "$RUNNER_TEMP/u2-replay.XXXXXX")
+            rm -rf "$replay_worktree"
+            git worktree add --detach "$replay_worktree" "$PUSH_BEFORE" >/dev/null
+            replay_log="$RUNNER_TEMP/u2-replay.log"
+            replay_result_file="$RUNNER_TEMP/u2-replay-result.json"
+            set +e
+            PYTHONPATH="$trusted_root" python3 "$trusted_root/scripts/upstream_monitor.py" prepare-candidate \
+              --repo "$replay_worktree" \
+              --upstream-ref "$upstream_sha" \
+              --base-ref "$PUSH_BEFORE" > "$replay_result_file" 2> "$replay_log"
+            replay_exit=$?
+            set -e
+            git worktree remove --force "$replay_worktree"
+            if [[ "$replay_exit" -ne 0 ]] || ! jq -e . "$replay_result_file" >/dev/null 2>&1; then
+              echo "::error::trusted replay rebuild failed"
+              cat "$replay_log"
+              watch_debt "replay-rebuild-failed"
+              sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
+              echo "qualified=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            replay_status=$(jq -r '.status' "$replay_result_file")
+            replay_candidate_needed=$(jq -r '.candidate_needed' "$replay_result_file")
+            rebuilt_candidate=$(jq -r '.candidate_sha // empty' "$replay_result_file")
+            [[ -n "$rebuilt_candidate" ]] || {
+              echo "::error::trusted replay did not produce a candidate commit"; exit 1;
+            }
+            rebuilt_tree=$(git rev-parse "${rebuilt_candidate}^{tree}")
+            replay_file="$RUNNER_TEMP/u2-replay-evidence.json"
+            jq -n \
+              --arg status "$replay_status" \
+              --arg before "$PUSH_BEFORE" \
+              --arg source_after "$PUSH_AFTER" \
+              --arg candidate "$candidate" \
+              --arg upstream "$upstream_sha" \
+              --arg upstream_repository "$UPSTREAM_REPO" \
+              --arg upstream_ref "$UPSTREAM_REF" \
+              --arg fork_main "$fork_main" \
+              --arg marker_fork_main "$marker_fork_main" \
+              --arg marker_tree "$candidate_tree" \
+              --arg candidate_tree "$actual_candidate_tree" \
+              --arg rebuilt_tree "$rebuilt_tree" \
+              --arg source_tree "$actual_source_tree" \
+              --argjson source_parents "$source_parents" \
+              --argjson candidate_parents "$candidate_parents" \
+              --argjson candidate_needed "$replay_candidate_needed" \
+              --argjson fork_main_is_ancestor "$fork_main_is_ancestor" \
+              '{status:$status,candidate_needed:$candidate_needed,before:$before,source_after:$source_after,source_parents:$source_parents,candidate:$candidate,candidate_parents:$candidate_parents,upstream:$upstream,upstream_repository:$upstream_repository,upstream_ref:$upstream_ref,fork_main:$fork_main,marker_fork_main:$marker_fork_main,fork_main_is_ancestor:$fork_main_is_ancestor,marker_tree:$marker_tree,candidate_tree:$candidate_tree,rebuilt_tree:$rebuilt_tree,source_tree:$source_tree}' \
+              > "$replay_file"
+            result=$(python3 "$trusted_root/scripts/u2_release.py" qualify-u1 \
               --before "$PUSH_BEFORE" \
               --after "$PUSH_AFTER" \
               --parents $parents \
@@ -188,9 +342,9 @@ jobs:
               --marker "$marker" \
               --candidate-tree "$candidate_tree" \
               --upstream-ancestor "$upstream_is_ancestor" \
-              --replay-status clean \
-              --replay-tree "$replay_tree" \
-              --replay-actual-tree "$actual_tree")
+              --upstream-version "$upstream_version" \
+              --upstream-code "$upstream_code" \
+              --replay-file "$replay_file")
             if [[ "$(jq -r '.qualified' <<<"$result")" != "true" ]]; then
               reason=$(jq -r '.reason' <<<"$result")
               echo "::error::auto-upstream qualification failed: $reason"
@@ -209,10 +363,62 @@ jobs:
           [[ -n "$qualified" ]] || { echo "::error::qualify output missing qualified"; exit 1; }
           # u2_qualify.sh emits the rc-pipeline-compatible mode.
 
+  debt_watcher:
+    name: Record local release debt
+    needs: [gate, qualify]
+    if: always() && needs.gate.outputs.enabled == 'true' && needs.gate.outputs.mode == 'auto-upstream' && needs.gate.outputs.intent != 'noop-smoke' && needs.gate.outputs.noop != 'true' && needs.qualify.outputs.qualified == 'false' && needs.qualify.outputs.debt_issue_reason != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out source SHA
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.qualify.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Open identity-bound release-debt issue
+        env:
+          REASON: ${{ needs.qualify.outputs.debt_issue_reason }}
+          SOURCE_SHA: ${{ needs.qualify.outputs.source_sha }}
+          BASELINE_TAG: ${{ needs.qualify.outputs.baseline_tag }}
+          RELEASE_DEBT: ${{ needs.qualify.outputs.release_debt }}
+          CLASSIFICATION: ${{ needs.qualify.outputs.debt_classification }}
+          EXPECTED_VERSION: ${{ needs.qualify.outputs.expected_version_name }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$REASON" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "::error::debt watcher reason is invalid"; exit 1; }
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::debt watcher source SHA is invalid"; exit 1; }
+          [[ "$RELEASE_DEBT" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::debt watcher fingerprint is invalid"; exit 1; }
+          [[ "$CLASSIFICATION" != "docs-only" ]] || { echo "::notice::docs-only debt does not open an issue"; exit 0; }
+          title="local-release-debt: ${BASELINE_TAG} -> patched (${CLASSIFICATION})"
+          existing=$(gh issue list --repo "$REPO" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
+          if [[ -n "$existing" ]]; then
+            echo "::notice::local-release-debt issue already open: #${existing}"
+            exit 0
+          fi
+          gh issue create --repo "$REPO" \
+            --title "$title" \
+            --body "Non-U1 push to patched carries unabsorbed release debt.
+
+          - Mode: auto-upstream (rejected: ${REASON})
+          - Source: $SOURCE_SHA
+          - Baseline: $BASELINE_TAG
+          - Debt fingerprint: $RELEASE_DEBT
+          - Classification: $CLASSIFICATION
+          - Planned version: ${EXPECTED_VERSION:-none}
+
+          U2 cannot build an RC from this push because it is not a valid U1 merge.
+          Open until the debt is absorbed by a qualified U1 merge or manual-local release."
+          echo "::notice::local-release-debt issue opened for ${SOURCE_SHA}"
+
   prep:
     name: Derive version and create prep commit
     needs: [gate, qualify]
-    if: needs.gate.outputs.enabled == 'true' && needs.qualify.outputs.qualified == 'true'
+    if: needs.gate.outputs.enabled == 'true' && needs.qualify.outputs.qualified == 'true' && needs.qualify.outputs.noop != 'true' && needs.qualify.outputs.intent != 'noop-smoke'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -223,6 +429,8 @@ jobs:
       release_sha: ${{ steps.prep.outputs.release_sha }}
       expected_version_name: ${{ steps.prep.outputs.expected_version_name }}
       expected_version_code: ${{ steps.prep.outputs.expected_version_code }}
+      intent: ${{ needs.qualify.outputs.intent }}
+      noop: ${{ needs.qualify.outputs.noop }}
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -234,6 +442,8 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.qualify.outputs.source_sha }}
           MODE: ${{ needs.qualify.outputs.mode }}
+          INTENT: ${{ needs.qualify.outputs.intent }}
+          NOOP: ${{ needs.qualify.outputs.noop }}
           UPSTREAM_SHA: ${{ needs.qualify.outputs.upstream_sha }}
           UPSTREAM_VERSION: ${{ needs.qualify.outputs.upstream_version }}
           UPSTREAM_CODE: ${{ needs.qualify.outputs.upstream_code }}
@@ -324,7 +534,7 @@ jobs:
   build_rc:
     name: Build exact signed RC
     needs: [gate, qualify, prep]
-    if: needs.gate.outputs.enabled == 'true' && needs.qualify.outputs.qualified == 'true'
+    if: needs.gate.outputs.enabled == 'true' && needs.qualify.outputs.qualified == 'true' && needs.qualify.outputs.noop != 'true' && needs.qualify.outputs.intent != 'noop-smoke'
     permissions:
       contents: read
       actions: read
@@ -350,7 +560,7 @@ jobs:
   rc_summary:
     name: Release evidence and approval marker
     needs: [gate, qualify, prep, build_rc]
-    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success'
+    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.qualify.outputs.noop != 'true' && needs.qualify.outputs.intent != 'noop-smoke'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -363,6 +573,8 @@ jobs:
       EXPECTED_MARKER: ${{ steps.summary.outputs.EXPECTED_MARKER }}
       SOURCE_SHA: ${{ steps.summary.outputs.SOURCE_SHA }}
       MODE: ${{ steps.summary.outputs.MODE }}
+      INTENT: ${{ steps.summary.outputs.INTENT }}
+      NOOP: ${{ steps.summary.outputs.NOOP }}
     steps:
       - name: Publish release evidence and exact approval marker (no environment)
         id: summary
@@ -370,6 +582,8 @@ jobs:
           RELEASE_SHA: ${{ needs.prep.outputs.release_sha }}
           SOURCE_SHA: ${{ needs.qualify.outputs.source_sha }}
           MODE: ${{ needs.qualify.outputs.mode }}
+          INTENT: ${{ needs.qualify.outputs.intent }}
+          NOOP: ${{ needs.qualify.outputs.noop }}
           EXPECTED_VERSION: ${{ needs.prep.outputs.expected_version_name }}
           EXPECTED_DEBT: ${{ needs.qualify.outputs.release_debt }}
           EXPECTED_APK: ${{ needs.build_rc.outputs.signed_sha256 }}
@@ -392,6 +606,8 @@ jobs:
           echo "SIGNER_SHA=$SIGNER_SHA" >> "$GITHUB_OUTPUT"
           echo "SOURCE_SHA=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
           echo "MODE=$MODE" >> "$GITHUB_OUTPUT"
+          echo "INTENT=$INTENT" >> "$GITHUB_OUTPUT"
+          echo "NOOP=$NOOP" >> "$GITHUB_OUTPUT"
           expected_marker="TVBOX_RELEASE_APPROVE_V2 release=${RELEASE_SHA} debt=${EXPECTED_DEBT} version=${EXPECTED_VERSION} apk=${EXPECTED_APK} run=${RUN_ID} attempt=${RUN_ATTEMPT}"
           echo "EXPECTED_MARKER=$expected_marker" >> "$GITHUB_OUTPUT"
           echo "::notice::Release evidence (mode=$MODE source=$SOURCE_SHA release=$RELEASE_SHA version=$EXPECTED_VERSION apk=$EXPECTED_APK signer=$SIGNER_SHA debt=$EXPECTED_DEBT run=$RUN_ID attempt=$RUN_ATTEMPT)"
@@ -415,7 +631,7 @@ jobs:
   watch_approval:
     name: Record explicit human rejection
     needs: [gate, qualify, prep, build_rc, rc_summary, publish]
-    if: always() && needs.gate.outputs.enabled == 'true' && needs.publish.result == 'failure'
+    if: always() && needs.gate.outputs.enabled == 'true' && needs.publish.result == 'failure' && needs.qualify.outputs.noop != 'true' && needs.qualify.outputs.intent != 'noop-smoke'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -425,7 +641,7 @@ jobs:
       - name: Check out patched
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: refs/heads/patched
+          ref: ${{ needs.rc_summary.outputs.RELEASE_SHA }}
           fetch-depth: 0
           persist-credentials: false
       - name: Scan for rejected reviews and open identity-bound human-blocked issue
@@ -434,6 +650,8 @@ jobs:
           REPO: ${{ github.repository }}
           SOURCE_SHA: ${{ needs.rc_summary.outputs.SOURCE_SHA }}
           MODE: ${{ needs.rc_summary.outputs.MODE }}
+          INTENT: ${{ needs.rc_summary.outputs.INTENT }}
+          NOOP: ${{ needs.rc_summary.outputs.NOOP }}
           EXPECTED_VERSION: ${{ needs.rc_summary.outputs.EXPECTED_VERSION }}
           EXPECTED_DEBT: ${{ needs.rc_summary.outputs.EXPECTED_DEBT }}
           GH_TOKEN: ${{ github.token }}
@@ -464,7 +682,7 @@ jobs:
   publish:
     name: Exact immutable publish
     needs: [gate, qualify, prep, build_rc, rc_summary]
-    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.rc_summary.result == 'success'
+    if: needs.gate.outputs.enabled == 'true' && needs.build_rc.result == 'success' && needs.rc_summary.result == 'success' && needs.qualify.outputs.noop != 'true' && needs.qualify.outputs.intent != 'noop-smoke'
     runs-on: ubuntu-24.04
     environment: release-production
     concurrency:
@@ -476,22 +694,35 @@ jobs:
       contents: read
       actions: read
       issues: write
+    outputs:
+      intent: ${{ steps.identity.outputs.INTENT }}
+      noop: ${{ steps.identity.outputs.NOOP }}
     steps:
       - name: Check out patched
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: refs/heads/patched
+          ref: ${{ needs.rc_summary.outputs.RELEASE_SHA }}
           fetch-depth: 0
           persist-credentials: false
       - name: Load release identity
         id: identity
+        env:
+          INTENT: ${{ needs.rc_summary.outputs.INTENT }}
+          NOOP: ${{ needs.rc_summary.outputs.NOOP }}
         run: |
+          set -euo pipefail
+          [[ "$INTENT" == "release" || "$INTENT" == "recover" ]] || {
+            echo "::error::publish received an invalid or no-op intent"; exit 1;
+          }
+          [[ "$NOOP" != "true" ]] || { echo "::error::publish received noop=true"; exit 1; }
           echo "RELEASE_SHA=${{ needs.rc_summary.outputs.RELEASE_SHA }}" >> "$GITHUB_OUTPUT"
           echo "EXPECTED_VERSION=${{ needs.rc_summary.outputs.EXPECTED_VERSION }}" >> "$GITHUB_OUTPUT"
           echo "EXPECTED_DEBT=${{ needs.rc_summary.outputs.EXPECTED_DEBT }}" >> "$GITHUB_OUTPUT"
           echo "EXPECTED_APK=${{ needs.rc_summary.outputs.EXPECTED_APK }}" >> "$GITHUB_OUTPUT"
           echo "SIGNER_SHA=${{ needs.rc_summary.outputs.SIGNER_SHA }}" >> "$GITHUB_OUTPUT"
           echo "EXPECTED_MARKER=${{ needs.rc_summary.outputs.EXPECTED_MARKER }}" >> "$GITHUB_OUTPUT"
+          echo "INTENT=$INTENT" >> "$GITHUB_OUTPUT"
+          echo "NOOP=$NOOP" >> "$GITHUB_OUTPUT"
 
       - name: Verify exact approval marker from current-run review history
         env:
@@ -593,39 +824,289 @@ jobs:
           # any mutation; a public mutable Release must never be created.
           imm=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/immutable-releases" --jq '.enabled' 2>/dev/null || echo "")
           [[ "$imm" == "true" ]] || { echo "::error::repository immutable releases are not enabled"; exit 1; }
-          echo "::notice::release identity revalidated (release=$RELEASE_SHA version=$EXPECTED_VERSION apk=$EXPECTED_APK signer=$SIGNER_SHA debt=$EXPECTED_DEBT recomputed=$recomputed_debt)"
-          echo "::notice::default branch patched + release-production environment confirmed (immutable releases enforced per-Release post-publish)"
+           echo "::notice::release identity revalidated (release=$RELEASE_SHA version=$EXPECTED_VERSION apk=$EXPECTED_APK signer=$SIGNER_SHA debt=$EXPECTED_DEBT recomputed=$recomputed_debt)"
+           echo "::notice::default branch patched + release-production environment confirmed (immutable releases enforced per-Release post-publish)"
+
+      - name: Preflight verified release metadata
+        id: preflight
+        env:
+          RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
+          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          EXPECTED_VERSION_CODE: ${{ needs.prep.outputs.expected_version_code }}
+          EXPECTED_DEBT: ${{ steps.identity.outputs.EXPECTED_DEBT }}
+          EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
+          SIGNER_SHA: ${{ steps.identity.outputs.SIGNER_SHA }}
+          SOURCE_SHA: ${{ needs.rc_summary.outputs.SOURCE_SHA }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          tag="v${EXPECTED_VERSION}"
+          candidate_update="$RUNNER_TEMP/u2-preflight-candidate-update.json"
+          python3 scripts/u2_publish.py build-update-json \
+            --version "$EXPECTED_VERSION" \
+            --apk-url "https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/${tag}/TVBox-Mobile-v${EXPECTED_VERSION}.apk" \
+            --output "$candidate_update" >/dev/null
+          update_digest=$(sha256sum "$candidate_update" | awk '{print $1}')
+          entry_file="$RUNNER_TEMP/u2-preflight-entry.json"
+          python3 - "$tag" "$RELEASE_SHA" "$EXPECTED_VERSION" "$EXPECTED_VERSION_CODE" \
+            "$EXPECTED_APK" "$update_digest" "$SIGNER_SHA" "$SOURCE_SHA" \
+            "$EXPECTED_DEBT" "$RUN_ID" "$RUN_ATTEMPT" > "$entry_file" <<'PY'
+          import json
+          import sys
+
+          from scripts.u2_publish import verified_release_entry
+
+          entry = verified_release_entry(
+              tag=sys.argv[1],
+              target=sys.argv[2],
+              version_name=sys.argv[3],
+              version_code=sys.argv[4],
+              asset_sha256=sys.argv[5],
+              update_sha256=sys.argv[6],
+              signer_sha256=sys.argv[7],
+              source_sha=sys.argv[8],
+              debt=sys.argv[9],
+              run_id=sys.argv[10],
+              run_attempt=sys.argv[11],
+          )
+          print(json.dumps(entry, sort_keys=True))
+          PY
+
+          # Read both blobs without changing the repository. The branch SHA
+          # guards the two API reads against a moving patched ref.
+          remote_head_before=$(git ls-remote origin refs/heads/patched | awk 'NF {print $1}')
+          [[ "$remote_head_before" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::cannot read patched SHA before metadata preflight"; exit 1; }
+          current_update="$RUNNER_TEMP/u2-preflight-current-update.json"
+          current_update_b64=$(GH_TOKEN="$TOKEN" gh api \
+            "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
+            --jq '.content' 2>/dev/null) || { echo "::error::current update.json preflight read failed"; exit 1; }
+          [[ -n "$current_update_b64" ]] || { echo "::error::current update.json preflight content is empty"; exit 1; }
+          printf '%s' "$current_update_b64" | base64 -d > "$current_update" || { echo "::error::current update.json preflight decode failed"; exit 1; }
+          current_ledger="$RUNNER_TEMP/u2-preflight-current-ledger.json"
+          current_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
+            "repos/slashinchi/TVBoxOS-Mobile/contents/gradle/verified-releases.json?ref=patched" \
+            --jq '.content' 2>/dev/null) || { echo "::error::current verified-release ledger preflight read failed"; exit 1; }
+          [[ -n "$current_ledger_b64" ]] || { echo "::error::current verified-release ledger preflight content is empty"; exit 1; }
+          printf '%s' "$current_ledger_b64" | base64 -d > "$current_ledger" || { echo "::error::current verified-release ledger preflight decode failed"; exit 1; }
+          remote_head_after=$(git ls-remote origin refs/heads/patched | awk 'NF {print $1}')
+          [[ "$remote_head_after" == "$remote_head_before" ]] || { echo "::error::patched moved during read-only metadata preflight"; exit 1; }
+          baseline_json=$(python3 scripts/u2_release.py canonical-release-baseline --file "$current_ledger") || {
+            echo "::error::metadata baseline is malformed during preflight"; exit 1;
+          }
+          current_metadata=$(python3 scripts/u2_publish.py parse-update-metadata --metadata-file "$current_update") || {
+            echo "::error::update.json is malformed during preflight"; exit 1;
+          }
+          baseline_tag=$(jq -er '.tag' <<<"$baseline_json") || { echo "::error::preflight baseline tag missing"; exit 1; }
+          baseline_target=$(jq -er '.target' <<<"$baseline_json") || { echo "::error::preflight baseline target missing"; exit 1; }
+          baseline_version=$(jq -er '.versionName' <<<"$baseline_json") || { echo "::error::preflight baseline version missing"; exit 1; }
+          baseline_code=$(jq -er '.versionCode' <<<"$baseline_json") || { echo "::error::preflight baseline versionCode missing"; exit 1; }
+          current_version=$(jq -er '.version' <<<"$current_metadata") || { echo "::error::preflight current version missing"; exit 1; }
+          current_update_digest=$(sha256sum "$current_update" | awk '{print $1}')
+          current_ledger_digest=$(sha256sum "$current_ledger" | awk '{print $1}')
+          echo "remote_head_before=$remote_head_before" >> "$GITHUB_OUTPUT"
+          echo "baseline_tag=$baseline_tag" >> "$GITHUB_OUTPUT"
+          echo "baseline_target=$baseline_target" >> "$GITHUB_OUTPUT"
+          echo "baseline_version=$baseline_version" >> "$GITHUB_OUTPUT"
+          echo "baseline_code=$baseline_code" >> "$GITHUB_OUTPUT"
+          echo "current_version=$current_version" >> "$GITHUB_OUTPUT"
+          echo "current_update_digest=$current_update_digest" >> "$GITHUB_OUTPUT"
+          echo "current_ledger_digest=$current_ledger_digest" >> "$GITHUB_OUTPUT"
+
+          preflight_ledger="$RUNNER_TEMP/u2-preflight-reconciled-ledger.json"
+          preflight=$(python3 scripts/u2_publish.py reconcile-verified-release-metadata \
+            --current-update "$current_update" \
+            --current-ledger "$current_ledger" \
+            --candidate-update "$candidate_update" \
+            --entry "$entry_file" \
+            --output "$preflight_ledger") || { echo "::error::strict two-file metadata preflight failed; no Release or tag mutation allowed"; exit 1; }
+          action=$(jq -er '.action' <<<"$preflight") || { echo "::error::metadata preflight returned no action"; exit 1; }
+          [[ "$action" == "append" || "$action" == "exact-reuse" ]] || { echo "::error::unexpected metadata preflight action: $action"; exit 1; }
+          echo "::notice::read-only verified release metadata preflight passed (action=$action, patched=$remote_head_before); formal Release/tag mutations may proceed"
 
       - name: Promote patched to exact release SHA (CAS)
         env:
           RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
           EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          PREFLIGHT_REMOTE_SHA: ${{ steps.preflight.outputs.remote_head_before }}
+          PREFLIGHT_BASELINE_TAG: ${{ steps.preflight.outputs.baseline_tag }}
+          PREFLIGHT_BASELINE_TARGET: ${{ steps.preflight.outputs.baseline_target }}
+          PREFLIGHT_BASELINE_VERSION: ${{ steps.preflight.outputs.baseline_version }}
+          PREFLIGHT_BASELINE_CODE: ${{ steps.preflight.outputs.baseline_code }}
+          PREFLIGHT_CURRENT_VERSION: ${{ steps.preflight.outputs.current_version }}
+          PREFLIGHT_UPDATE_DIGEST: ${{ steps.preflight.outputs.current_update_digest }}
+          PREFLIGHT_LEDGER_DIGEST: ${{ steps.preflight.outputs.current_ledger_digest }}
+          INTENT: ${{ needs.rc_summary.outputs.INTENT }}
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
         run: |
           set -euo pipefail
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          preflight_sha="${PREFLIGHT_REMOTE_SHA:-}"
+          [[ "$preflight_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::preflight patched SHA is empty or invalid; refusing to continue"; exit 1;
+          }
+          live_remote_sha=$(git ls-remote origin refs/heads/patched | awk 'NF {print $1}') || {
+            echo "::error::cannot read live patched SHA during promote preflight; refusing to continue"; exit 1;
+          }
+          [[ "$live_remote_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::live patched SHA is empty or invalid; refusing to continue"; exit 1;
+          }
+          [[ "$live_remote_sha" == "$preflight_sha" ]] || {
+            echo "::error::patched moved since metadata preflight; refusing to continue"; exit 1;
+          }
+           live_update_b64=$(GH_TOKEN="$TOKEN" gh api \
+             "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
+             --jq '.content' 2>/dev/null) || {
+             echo "::error::final live current update.json read failed; refusing to continue"; exit 1;
+           }
+           live_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
+             "repos/slashinchi/TVBoxOS-Mobile/contents/gradle/verified-releases.json?ref=patched" \
+             --jq '.content' 2>/dev/null) || {
+             echo "::error::final live current verified-releases.json read failed; refusing to continue"; exit 1;
+           }
+           live_update="$RUNNER_TEMP/u2-promote-live-update.json"
+           live_ledger="$RUNNER_TEMP/u2-promote-live-verified-releases.json"
+           [[ -n "$live_update_b64" && -n "$live_ledger_b64" ]] || {
+             echo "::error::final live metadata content is empty; refusing to continue"; exit 1;
+           }
+           printf '%s' "$live_update_b64" | base64 -d > "$live_update" || {
+             echo "::error::final live update.json decode failed; refusing to continue"; exit 1;
+           }
+           printf '%s' "$live_ledger_b64" | base64 -d > "$live_ledger" || {
+             echo "::error::final live verified-releases.json decode failed; refusing to continue"; exit 1;
+           }
+           live_baseline=$(python3 scripts/u2_release.py canonical-release-baseline --file "$live_ledger") || {
+             echo "::error::final live baseline is malformed; refusing to continue"; exit 1;
+           }
+           live_metadata=$(python3 scripts/u2_publish.py parse-update-metadata --metadata-file "$live_update") || {
+             echo "::error::final live update.json is malformed; refusing to continue"; exit 1;
+           }
+           [[ "$(jq -er '.tag' <<<"$live_baseline")" == "$PREFLIGHT_BASELINE_TAG" \
+             && "$(jq -er '.target' <<<"$live_baseline")" == "$PREFLIGHT_BASELINE_TARGET" \
+             && "$(jq -er '.versionName' <<<"$live_baseline")" == "$PREFLIGHT_BASELINE_VERSION" \
+             && "$(jq -er '.versionCode' <<<"$live_baseline")" == "$PREFLIGHT_BASELINE_CODE" ]] || {
+             echo "::error::live baseline identity changed since metadata preflight; refusing to continue"; exit 1;
+           }
+           live_version=$(jq -er '.version' <<<"$live_metadata") || {
+             echo "::error::final live version is unreadable; refusing to continue"; exit 1;
+           }
+           [[ "$live_version" == "$PREFLIGHT_CURRENT_VERSION" ]] || {
+             echo "::error::live current version changed since metadata preflight; refusing to continue"; exit 1;
+           }
+           live_update_digest=$(sha256sum "$live_update" | awk '{print $1}')
+           live_ledger_digest=$(sha256sum "$live_ledger" | awk '{print $1}')
+           [[ "$live_update_digest" == "$PREFLIGHT_UPDATE_DIGEST" \
+             && "$live_ledger_digest" == "$PREFLIGHT_LEDGER_DIGEST" ]] || {
+             echo "::error::live metadata digest changed since metadata preflight; refusing to continue"; exit 1;
+           }
+           newer=$(python3 scripts/u2_publish.py monotonic-compare \
+             --current-version "$live_version" \
+             --candidate-version "$EXPECTED_VERSION" | jq -r '.newer')
+           [[ "$newer" == "true" ]] || {
+             echo "::error::live version collision or candidate regression; refusing to continue"; exit 1;
+           }
+           if [[ "$live_version" == "$EXPECTED_VERSION" ]]; then
+             python3 - "$RUNNER_TEMP/u2-preflight-candidate-update.json" "$live_update" <<'PY'
+          import sys
+
+          from scripts.u2_publish import parse_update_metadata
+
+          candidate = parse_update_metadata(open(sys.argv[1], "rb").read())
+          current = parse_update_metadata(open(sys.argv[2], "rb").read())
+          if candidate != current:
+              raise SystemExit("live same-version update.json has a conflicting identity")
+          PY
+           fi
+          echo "::notice::final live baseline/version collision revalidation passed before CAS promote"
+          git fetch --no-tags origin "+refs/heads/patched:refs/heads/patched"
           current=$(git rev-parse refs/heads/patched)
+          [[ "$current" == "$preflight_sha" ]] || {
+            echo "::error::local patched ref does not match metadata preflight SHA; refusing to continue"; exit 1;
+          }
           tag="v${EXPECTED_VERSION}"
           if [[ "$current" == "$RELEASE_SHA" ]]; then
             echo "::notice::patched already at release SHA; no promote needed"
-          elif git merge-base --is-ancestor "$RELEASE_SHA" "$current"; then
+          elif [[ "$INTENT" == "recover" ]] && git merge-base --is-ancestor "$RELEASE_SHA" "$current"; then
             # Recovery: patched advanced past release SHA is only valid when the
             # formal TAG OBJECT already exists (metadata commit or resumed
             # publish). A draft is NOT a tag: drafts have no git tag ref, so a
             # draft must never satisfy this recovery — otherwise a stale RC
             # could be published after patched moved forward.
-            if tag_ref=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
-              : # success: stdout holds the tag object SHA
-            else
-              tag_ref=""
+            tag_api_base="repos/slashinchi/TVBoxOS-Mobile/git/ref/"
+            tag_api="${tag_api_base}tags/${tag}"
+            tag_read="$RUNNER_TEMP/u2-promote-tag-read.txt"
+            set +e
+            GH_TOKEN="$TOKEN" gh api --include "$tag_api" > "$tag_read" 2>&1
+            tag_read_status=$?
+            set -e
+            tag_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$tag_read")
+            tag_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+              --status "$tag_read_status" \
+              --http-status "$tag_http_status") || {
+              echo "::error::promotion tag read classification failed closed"; exit 1;
+            }
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result") || {
+              echo "::error::promotion tag read classification returned no action"; exit 1;
+            }
+            if [[ "$tag_read_action" == "missing" ]]; then
+              echo "::error::formal tag ref is missing during recovery; refusing to continue"; exit 1
+            elif [[ "$tag_read_action" != "present" ]]; then
+              echo "::error::promotion tag read failed (status=$tag_read_status http=$tag_http_status); only explicit HTTP 404 may report missing"; exit 1
             fi
-            if [[ -n "$tag_ref" && "$tag_ref" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::notice::recovery: patched advanced past release SHA but tag object $tag exists ($tag_ref); continuing"
+            resolve_tag_target() {
+              local remote="$1"
+              local tag="$2"
+              local object_type="$3"
+              local output sha ref extra direct="" peeled=""
+              output=$(git ls-remote --exit-code "$remote" \
+                "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+              [[ -n "$output" ]] || return 1
+              while IFS=$'\t' read -r sha ref extra; do
+                [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                case "$ref" in
+                  "refs/tags/${tag}^{}")
+                    [[ -z "$peeled" ]] || return 1
+                    peeled="$sha"
+                    ;;
+                  "refs/tags/${tag}")
+                    [[ -z "$direct" ]] || return 1
+                    direct="$sha"
+                    ;;
+                  *) return 1 ;;
+                esac
+              done <<<"$output"
+              case "$object_type" in
+                tag)
+                  [[ -n "$direct" && -n "$peeled" ]] || return 1
+                  printf '%s\n' "$peeled"
+                  ;;
+                commit)
+                  [[ -n "$direct" && -z "$peeled" ]] || return 1
+                  printf '%s\n' "$direct"
+                  ;;
+                *) return 1 ;;
+              esac
+            }
+            tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+              echo "::error::promotion tag object type read failed; refusing to continue"; exit 1;
+            }
+            if tag_target_sha=$(resolve_tag_target \
+              "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$tag" "$tag_object_type"); then
+              [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                echo "::error::tag target commit does not equal release SHA; refusing recovery"; exit 1;
+              }
+              echo "::notice::recovery: tag target commit equals release SHA ($tag_target_sha); continuing"
             else
-              echo "::error::patched advanced past the release SHA and formal tag $tag does not exist; pending RC is stale"
+              echo "::error::formal tag target commit is not readable or exact; pending RC is stale"
               exit 1
             fi
           else
+            if git merge-base --is-ancestor "$RELEASE_SHA" "$current"; then
+              echo "::error::release intent cannot enter recovery-forward after patched advanced; use intent=recover"
+              exit 1
+            fi
             git fetch --no-tags origin "+refs/heads/patched:refs/remotes/origin/patched"
             remote=$(git rev-parse refs/remotes/origin/patched)
             [[ "$remote" == "$current" ]] || { echo "::error::patched moved during promote; CAS failed"; exit 1; }
@@ -745,20 +1226,119 @@ jobs:
             --apk-url "$apk_url" \
             --output "$update_file"
           update_digest=$(sha256sum "$update_file" | awk '{print $1}')
-          existing=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile \
-            --json tagName,targetCommitish,isDraft,assets \
-            --jq '.' 2>/dev/null || echo "")
+
+          release_read="$RUNNER_TEMP/u2-release-read.txt"
+          set +e
+          GH_TOKEN="$TOKEN" gh api --include \
+            "repos/slashinchi/TVBoxOS-Mobile/releases/tags/${tag}" > "$release_read" 2>&1
+          release_read_status=$?
+          set -e
+          release_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$release_read")
+          release_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+            --status "$release_read_status" \
+            --http-status "$release_http_status") || {
+            echo "::error::Release read classification failed closed"; exit 1;
+          }
+          release_read_action=$(jq -er '.action' <<<"$release_read_result") || {
+            echo "::error::Release read classification returned no action"; exit 1;
+          }
+          case "$release_read_action" in
+            present)
+              existing=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile \
+                --json tagName,targetCommitish,isDraft,assets \
+                --jq '.') || {
+                echo "::error::Release existed during preflight but the identity read failed; refusing to create or fallback"; exit 1;
+              }
+              [[ -n "$existing" ]] || { echo "::error::present Release read returned empty identity"; exit 1; }
+              ;;
+            missing)
+              existing=""
+              ;;
+            *)
+              echo "::error::Release read failed (status=$release_read_status http=$release_http_status); only explicit HTTP 404 may create a Release"
+              exit 1
+              ;;
+          esac
           if [[ -n "$existing" ]]; then
             # Resolve the authoritative tag-object commit SHA. Drafts have no
             # tag ref yet, so fall back to targetCommitish when it is a full SHA
             # (gh release create --draft --target stores the SHA); a branch-name
             # targetCommitish with a resolvable tag ref must still match the ref.
-            if tag_target_sha=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
-              : # success: stdout holds the tag object SHA
-            else
-              tag_target_sha=""
-            fi
-            if [[ -z "$tag_target_sha" ]]; then
+            tag_read="$RUNNER_TEMP/u2-tag-read.txt"
+            set +e
+            tag_api_base="repos/slashinchi/TVBoxOS-Mobile/git/ref/"
+            tag_api="${tag_api_base}tags/${tag}"
+            GH_TOKEN="$TOKEN" gh api --include \
+              "$tag_api" > "$tag_read" 2>&1
+            tag_read_status=$?
+            set -e
+            tag_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$tag_read")
+            tag_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+              --status "$tag_read_status" \
+              --http-status "$tag_http_status") || {
+              echo "::error::tag read classification failed closed"; exit 1;
+            }
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result") || {
+              echo "::error::tag read classification returned no action"; exit 1;
+            }
+            tag_target_sha=""
+            case "$tag_read_action" in
+              present)
+                tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+                  echo "::error::tag object type read failed; refusing to fallback"; exit 1;
+                }
+                resolve_tag_target() {
+                  local remote="$1"
+                  local tag="$2"
+                  local object_type="$3"
+                  local output sha ref extra direct="" peeled=""
+                  output=$(git ls-remote --exit-code "$remote" \
+                    "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+                  [[ -n "$output" ]] || return 1
+                  while IFS=$'\t' read -r sha ref extra; do
+                    [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                    case "$ref" in
+                      "refs/tags/${tag}^{}")
+                        [[ -z "$peeled" ]] || return 1
+                        peeled="$sha"
+                        ;;
+                      "refs/tags/${tag}")
+                        [[ -z "$direct" ]] || return 1
+                        direct="$sha"
+                        ;;
+                      *) return 1 ;;
+                    esac
+                  done <<<"$output"
+                  case "$object_type" in
+                    tag)
+                      [[ -n "$direct" && -n "$peeled" ]] || return 1
+                      printf '%s\n' "$peeled"
+                      ;;
+                    commit)
+                      [[ -n "$direct" && -z "$peeled" ]] || return 1
+                      printf '%s\n' "$direct"
+                      ;;
+                    *) return 1 ;;
+                  esac
+                }
+                tag_target_sha=$(resolve_tag_target \
+                  "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$tag" "$tag_object_type") || {
+                  echo "::error::tag target commit resolution failed; refusing to fallback"; exit 1;
+                }
+                [[ "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                  echo "::error::tag target commit does not equal release SHA; refusing to mutate"; exit 1;
+                }
+                ;;
+              missing)
+                : # Drafts have no tag ref; an explicit 404 permits fallback.
+                ;;
+              *)
+                echo "::error::tag read failed (status=$tag_read_status http=$tag_http_status); only explicit HTTP 404 may fallback"
+                exit 1
+                ;;
+            esac
+            is_draft=$(echo "$existing" | jq -r '.isDraft')
+            if [[ -z "$tag_target_sha" && "$is_draft" == "true" ]]; then
               commitish=$(echo "$existing" | jq -r '.targetCommitish // ""')
               if [[ "$commitish" =~ ^[0-9a-f]{40}$ ]]; then
                 tag_target_sha="$commitish"
@@ -767,7 +1347,6 @@ jobs:
             if [[ -n "$tag_target_sha" ]]; then
               existing=$(echo "$existing" | jq --arg sha "$tag_target_sha" '.tagTargetSha = $sha')
             fi
-            is_draft=$(echo "$existing" | jq -r '.isDraft')
             if [[ "$is_draft" == "true" ]]; then
               decision=$(python3 scripts/u2_publish.py reconcile-draft \
                 --draft "$existing" \
@@ -811,6 +1390,68 @@ jobs:
               esac
             fi
           else
+            tag_read="$RUNNER_TEMP/u2-create-tag-read.txt"
+            set +e
+            GH_TOKEN="$TOKEN" gh api --include \
+              "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" > "$tag_read" 2>&1
+            tag_read_status=$?
+            set -e
+            tag_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$tag_read")
+            tag_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+              --status "$tag_read_status" --http-status "$tag_http_status") || {
+              echo "::error::pre-create tag identity classification failed; fail closed"; exit 1;
+            }
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
+            if [[ "$tag_read_action" == "present" ]]; then
+              tag_api="repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}"
+              tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+                echo "::error::pre-create tag object type read failed; fail closed"; exit 1;
+              }
+              resolve_tag_target() {
+                local remote="$1"
+                local tag="$2"
+                local object_type="$3"
+                local output sha ref extra direct="" peeled=""
+                output=$(git ls-remote --exit-code "$remote" \
+                  "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+                [[ -n "$output" ]] || return 1
+                while IFS=$'\t' read -r sha ref extra; do
+                  [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                  case "$ref" in
+                    "refs/tags/${tag}^{}")
+                      [[ -z "$peeled" ]] || return 1
+                      peeled="$sha"
+                      ;;
+                    "refs/tags/${tag}")
+                      [[ -z "$direct" ]] || return 1
+                      direct="$sha"
+                      ;;
+                    *) return 1 ;;
+                  esac
+                done <<<"$output"
+                case "$object_type" in
+                  tag)
+                    [[ -n "$direct" && -n "$peeled" ]] || return 1
+                    printf '%s\n' "$peeled"
+                    ;;
+                  commit)
+                    [[ -n "$direct" && -z "$peeled" ]] || return 1
+                    printf '%s\n' "$direct"
+                    ;;
+                  *) return 1 ;;
+                esac
+              }
+              tag_target_sha=$(resolve_tag_target \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$tag" "$tag_object_type") || {
+                echo "::error::pre-create tag target commit resolution failed; fail closed"; exit 1;
+              }
+              [[ "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                echo "::error::pre-create tag target commit does not equal release SHA; fail closed"; exit 1;
+              }
+              echo "::notice::pre-create tag target commit equals release SHA ($tag_target_sha)"
+            elif [[ "$tag_read_action" != "missing" ]]; then
+              echo "::error::pre-create tag identity is unreadable; fail closed"; exit 1
+            fi
             run_url="https://github.com/slashinchi/TVBoxOS-Mobile/actions/runs/${{ github.run_id }}"
             notes=$(printf '%s\n' \
               "## Build / Release Evidence" \
@@ -838,28 +1479,161 @@ jobs:
           echo "decision=$decision" >> "$GITHUB_OUTPUT"
           echo "update_digest=$update_digest" >> "$GITHUB_OUTPUT"
 
-      - name: Attach missing assets only (no clobber)
+      - name: Freeze Release identity after first draft/asset operation
+        id: freeze
         env:
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+          RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
+          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
+          UPDATE_DIGEST: ${{ steps.release.outputs.update_digest }}
         run: |
           set -euo pipefail
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
-          tag="${{ steps.release.outputs.tag }}"
+           tag="${{ steps.release.outputs.tag }}"
+           state=$(GH_TOKEN="$TOKEN" gh release view "$tag" \
+             --repo slashinchi/TVBoxOS-Mobile \
+             --json tagName,targetCommitish,isDraft,assets \
+             --jq '.') || { echo "::error::first Release identity read failed; fail closed"; exit 1; }
+           tag_name=$(jq -er '.tagName' <<<"$state") || { echo "::error::Release tag identity is unreadable; fail closed"; exit 1; }
+           target_commitish=$(jq -er '.targetCommitish // ""' <<<"$state") || { echo "::error::Release target identity is unreadable; fail closed"; exit 1; }
+           is_draft=$(jq -er '.isDraft' <<<"$state") || { echo "::error::Release draft identity is unreadable; fail closed"; exit 1; }
+           [[ "$tag_name" == "$tag" && "$tag" == "v${EXPECTED_VERSION}" ]] || {
+             echo "::error::first Release tag/version identity changed; fail closed"; exit 1;
+           }
+           tag_read="$RUNNER_TEMP/u2-freeze-tag-read.txt"
+           set +e
+           GH_TOKEN="$TOKEN" gh api --include \
+             "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" > "$tag_read" 2>&1
+           tag_read_status=$?
+           set -e
+           tag_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$tag_read")
+           tag_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+             --status "$tag_read_status" --http-status "$tag_http_status") || {
+             echo "::error::first Release tag identity classification failed; fail closed"; exit 1;
+           }
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
+            if [[ "$tag_read_action" == "present" ]]; then
+              tag_api="repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}"
+              tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+                echo "::error::first Release tag object type read failed; fail closed"; exit 1;
+              }
+              resolve_tag_target() {
+                local remote="$1"
+                local tag="$2"
+                local object_type="$3"
+                local output sha ref extra direct="" peeled=""
+                output=$(git ls-remote --exit-code "$remote" \
+                  "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+                [[ -n "$output" ]] || return 1
+                while IFS=$'\t' read -r sha ref extra; do
+                  [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                  case "$ref" in
+                    "refs/tags/${tag}^{}")
+                      [[ -z "$peeled" ]] || return 1
+                      peeled="$sha"
+                      ;;
+                    "refs/tags/${tag}")
+                      [[ -z "$direct" ]] || return 1
+                      direct="$sha"
+                      ;;
+                    *) return 1 ;;
+                  esac
+                done <<<"$output"
+                case "$object_type" in
+                  tag)
+                    [[ -n "$direct" && -n "$peeled" ]] || return 1
+                    printf '%s\n' "$peeled"
+                    ;;
+                  commit)
+                    [[ -n "$direct" && -z "$peeled" ]] || return 1
+                    printf '%s\n' "$direct"
+                    ;;
+                  *) return 1 ;;
+                esac
+              }
+              tag_target_sha=$(resolve_tag_target \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$tag" "$tag_object_type") || {
+                echo "::error::first Release tag target commit resolution failed; fail closed"; exit 1;
+              }
+              [[ "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                echo "::error::first Release tag target commit changed; fail closed"; exit 1;
+              }
+            elif [[ "$tag_read_action" != "missing" ]]; then
+              echo "::error::first Release tag read failed; fail closed"; exit 1
+            fi
+           if [[ "$is_draft" == "true" ]]; then
+             [[ "$target_commitish" == "$RELEASE_SHA" ]] || {
+               echo "::error::first draft exact target identity changed; fail closed"; exit 1;
+             }
+              [[ -z "$tag_target_sha" || "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+               echo "::error::first draft tag target changed; fail closed"; exit 1;
+             }
+           else
+              [[ "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+               echo "::error::first published Release tag target changed; fail closed"; exit 1;
+             }
+           fi
+           expected_apk_name="TVBox-Mobile-v${EXPECTED_VERSION}.apk"
+           asset_count=$(jq '.assets | length' <<<"$state")
+           [[ "$asset_count" -le 2 ]] || { echo "::error::first Release has an unexpected asset; fail closed"; exit 1; }
+           while IFS=$'\t' read -r name digest; do
+             case "$name" in
+               "$expected_apk_name") expected_digest="$EXPECTED_APK" ;;
+               update.json) expected_digest="$UPDATE_DIGEST" ;;
+               *) echo "::error::first Release asset name is unexpected; fail closed"; exit 1 ;;
+             esac
+             digest="${digest#sha256:}"
+             [[ "$digest" =~ ^[0-9a-f]{64}$ && "$digest" == "$expected_digest" ]] || {
+               echo "::error::first Release asset digest changed; fail closed"; exit 1;
+             }
+           done < <(jq -r '.assets[] | [.name, (.digest // "")] | @tsv' <<<"$state")
+           echo "frozen_tag=$tag" >> "$GITHUB_OUTPUT"
+           echo "frozen_target_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+           echo "frozen_version=$EXPECTED_VERSION" >> "$GITHUB_OUTPUT"
+           echo "frozen_apk_name=$expected_apk_name" >> "$GITHUB_OUTPUT"
+           echo "frozen_apk_digest=$EXPECTED_APK" >> "$GITHUB_OUTPUT"
+           echo "frozen_update_digest=$UPDATE_DIGEST" >> "$GITHUB_OUTPUT"
+           echo "::notice::Release identity frozen after first draft/asset operation (tag=$tag target=$RELEASE_SHA version=$EXPECTED_VERSION)"
+
+      - name: Attach missing assets only (no clobber)
+        env:
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+          FROZEN_TAG: ${{ steps.freeze.outputs.frozen_tag }}
+          FROZEN_TARGET_SHA: ${{ steps.freeze.outputs.frozen_target_sha }}
+          FROZEN_VERSION: ${{ steps.freeze.outputs.frozen_version }}
+          FROZEN_APK_NAME: ${{ steps.freeze.outputs.frozen_apk_name }}
+          FROZEN_APK_DIGEST: ${{ steps.freeze.outputs.frozen_apk_digest }}
+          FROZEN_UPDATE_DIGEST: ${{ steps.freeze.outputs.frozen_update_digest }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          tag="$FROZEN_TAG"
           decision="${{ steps.release.outputs.decision }}"
+          [[ "$tag" == "v${FROZEN_VERSION}" ]] || { echo "::error::frozen tag/version mismatch; fail closed"; exit 1; }
           [[ "$decision" == "repair-missing" || "$decision" == "created" ]] || {
             echo "::notice::no asset attach needed (decision=$decision)"
             exit 0
+          }
+          identity=$(GH_TOKEN="$TOKEN" gh release view "$tag" \
+            --repo slashinchi/TVBoxOS-Mobile \
+            --json tagName,targetCommitish,isDraft \
+            --jq '.') || { echo "::error::pre-upload Release identity read failed; fail closed"; exit 1; }
+          [[ "$(jq -er '.tagName' <<<"$identity")" == "$FROZEN_TAG" \
+            && "$(jq -er '.targetCommitish' <<<"$identity")" == "$FROZEN_TARGET_SHA" \
+            && "$(jq -er '.isDraft' <<<"$identity")" == "true" ]] || {
+            echo "::error::pre-upload draft target/tag identity changed; fail closed"; exit 1;
           }
           state=$(GH_TOKEN="$TOKEN" gh release view "$tag" --repo slashinchi/TVBoxOS-Mobile --json assets --jq '[.assets[].name]')
           names=$(jq -r '.[]' <<<"$state" | sort)
           has_apk=false
           has_update=false
           while IFS= read -r name; do
-            [[ "$name" == "${{ steps.assets.outputs.asset_name }}" ]] && has_apk=true
+            [[ "$name" == "$FROZEN_APK_NAME" ]] && has_apk=true
             [[ "$name" == "update.json" ]] && has_update=true
           done <<<"$names"
           files=()
-          [[ "$has_apk" == "true" ]] || files+=("$RUNNER_TEMP/assets/${{ steps.assets.outputs.asset_name }}")
+          [[ "$has_apk" == "true" ]] || files+=("$RUNNER_TEMP/assets/$FROZEN_APK_NAME")
           [[ "$has_update" == "true" ]] || files+=("$RUNNER_TEMP/update.json")
           if [[ "${#files[@]}" -gt 0 ]]; then
             GH_TOKEN="$TOKEN" gh release upload "$tag" \
@@ -870,12 +1644,133 @@ jobs:
             echo "::notice::no missing assets for $tag"
           fi
 
+      - name: Revalidate frozen Release identity after asset operation
+        env:
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+          FROZEN_TARGET_SHA: ${{ steps.freeze.outputs.frozen_target_sha }}
+          FROZEN_TAG: ${{ steps.freeze.outputs.frozen_tag }}
+          FROZEN_VERSION: ${{ steps.freeze.outputs.frozen_version }}
+          FROZEN_APK_NAME: ${{ steps.freeze.outputs.frozen_apk_name }}
+          FROZEN_APK_DIGEST: ${{ steps.freeze.outputs.frozen_apk_digest }}
+          FROZEN_UPDATE_DIGEST: ${{ steps.freeze.outputs.frozen_update_digest }}
+          DECISION: ${{ steps.release.outputs.decision }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          [[ "$FROZEN_TAG" == "v${FROZEN_VERSION}" ]] || { echo "::error::frozen tag/version mismatch; fail closed"; exit 1; }
+           state=$(GH_TOKEN="$TOKEN" gh release view "$FROZEN_TAG" \
+             --repo slashinchi/TVBoxOS-Mobile \
+             --json tagName,targetCommitish,isDraft,assets \
+             --jq '.') || { echo "::error::post-asset Release identity read failed; fail closed"; exit 1; }
+           [[ "$(jq -er '.tagName' <<<"$state")" == "$FROZEN_TAG" ]] || {
+             echo "::error::post-asset Release tag changed; fail closed"; exit 1;
+           }
+           target_commitish=$(jq -er '.targetCommitish // ""' <<<"$state")
+           is_draft=$(jq -er '.isDraft' <<<"$state")
+           tag_read="$RUNNER_TEMP/u2-frozen-tag-read.txt"
+           set +e
+           GH_TOKEN="$TOKEN" gh api --include \
+             "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${FROZEN_TAG}" > "$tag_read" 2>&1
+           tag_read_status=$?
+           set -e
+           tag_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$tag_read")
+           tag_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+             --status "$tag_read_status" --http-status "$tag_http_status") || {
+             echo "::error::post-asset tag identity classification failed; fail closed"; exit 1;
+           }
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
+            if [[ "$tag_read_action" == "present" ]]; then
+              tag_api="repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${FROZEN_TAG}"
+              tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+                echo "::error::post-asset tag object type read failed; fail closed"; exit 1;
+              }
+              resolve_tag_target() {
+                local remote="$1"
+                local tag="$2"
+                local object_type="$3"
+                local output sha ref extra direct="" peeled=""
+                output=$(git ls-remote --exit-code "$remote" \
+                  "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+                [[ -n "$output" ]] || return 1
+                while IFS=$'\t' read -r sha ref extra; do
+                  [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                  case "$ref" in
+                    "refs/tags/${tag}^{}")
+                      [[ -z "$peeled" ]] || return 1
+                      peeled="$sha"
+                      ;;
+                    "refs/tags/${tag}")
+                      [[ -z "$direct" ]] || return 1
+                      direct="$sha"
+                      ;;
+                    *) return 1 ;;
+                  esac
+                done <<<"$output"
+                case "$object_type" in
+                  tag)
+                    [[ -n "$direct" && -n "$peeled" ]] || return 1
+                    printf '%s\n' "$peeled"
+                    ;;
+                  commit)
+                    [[ -n "$direct" && -z "$peeled" ]] || return 1
+                    printf '%s\n' "$direct"
+                    ;;
+                  *) return 1 ;;
+                esac
+              }
+              tag_target_sha=$(resolve_tag_target \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$FROZEN_TAG" "$tag_object_type") || {
+                echo "::error::post-asset tag target commit resolution failed; fail closed"; exit 1;
+              }
+              [[ "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
+                echo "::error::post-asset tag target commit changed; fail closed"; exit 1;
+              }
+            elif [[ "$tag_read_action" != "missing" ]]; then
+              echo "::error::post-asset tag read failed; fail closed"; exit 1
+            fi
+           if [[ "$is_draft" == "true" ]]; then
+             [[ "$target_commitish" == "$FROZEN_TARGET_SHA" ]] || {
+               echo "::error::post-asset draft target changed; fail closed"; exit 1;
+             }
+              [[ -z "$tag_target_sha" || "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
+               echo "::error::post-asset draft tag target changed; fail closed"; exit 1;
+             }
+           else
+              [[ "$DECISION" == "published" && "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
+               echo "::error::post-asset published target changed; fail closed"; exit 1;
+             }
+           fi
+           asset_count=$(jq '.assets | length' <<<"$state")
+           [[ "$asset_count" -eq 2 ]] || { echo "::error::exactly 2 assets required after asset operation; fail closed"; exit 1; }
+           expected_names=$(printf '%s\n' "$FROZEN_APK_NAME" update.json | sort)
+           actual_names=$(jq -r '.assets[].name' <<<"$state" | sort)
+           [[ "$actual_names" == "$expected_names" ]] || {
+             echo "::error::post-asset Release asset names changed; fail closed"; exit 1;
+           }
+           while IFS=$'\t' read -r name digest; do
+             case "$name" in
+               "$FROZEN_APK_NAME") expected_digest="$FROZEN_APK_DIGEST" ;;
+               update.json) expected_digest="$FROZEN_UPDATE_DIGEST" ;;
+               *) echo "::error::post-asset Release asset name is unexpected; fail closed"; exit 1 ;;
+             esac
+             digest="${digest#sha256:}"
+             [[ "$digest" =~ ^[0-9a-f]{64}$ && "$digest" == "$expected_digest" ]] || {
+               echo "::error::post-asset Release asset digest changed; fail closed"; exit 1;
+             }
+           done < <(jq -r '.assets[] | [.name, (.digest // "")] | @tsv' <<<"$state")
+           echo "::notice::frozen Release identity revalidated after asset operation (tag=$FROZEN_TAG target=$FROZEN_TARGET_SHA version=$FROZEN_VERSION)"
+
       - name: Verify both assets before publish (API digest + download bytes)
         env:
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+          FROZEN_TAG: ${{ steps.freeze.outputs.frozen_tag }}
+          FROZEN_VERSION: ${{ steps.freeze.outputs.frozen_version }}
+          FROZEN_APK_NAME: ${{ steps.freeze.outputs.frozen_apk_name }}
+          FROZEN_APK_DIGEST: ${{ steps.freeze.outputs.frozen_apk_digest }}
+          FROZEN_UPDATE_DIGEST: ${{ steps.freeze.outputs.frozen_update_digest }}
         run: |
           set -euo pipefail
-          tag="${{ steps.release.outputs.tag }}"
+          tag="$FROZEN_TAG"
           mkdir -p "$RUNNER_TEMP/pre-publish-verify"
           GH_TOKEN="$TOKEN" gh release download "$tag" \
             --repo slashinchi/TVBoxOS-Mobile \
@@ -887,9 +1782,9 @@ jobs:
             --jq '.')
           result=$(python3 scripts/u2_publish.py verify-release-assets \
             --release "$state" \
-            --version "${{ steps.identity.outputs.EXPECTED_VERSION }}" \
-            --apk-digest "${{ steps.identity.outputs.EXPECTED_APK }}" \
-            --update-digest "${{ steps.release.outputs.update_digest }}" \
+            --version "$FROZEN_VERSION" \
+            --apk-digest "$FROZEN_APK_DIGEST" \
+            --update-digest "$FROZEN_UPDATE_DIGEST" \
             --download-dir "$RUNNER_TEMP/pre-publish-verify")
           verified=$(jq -r '.verified' <<<"$result")
           [[ "$verified" == "true" ]] || {
@@ -900,11 +1795,122 @@ jobs:
       - name: Publish verified draft
         env:
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+          FROZEN_TAG: ${{ steps.freeze.outputs.frozen_tag }}
+          FROZEN_TARGET_SHA: ${{ steps.freeze.outputs.frozen_target_sha }}
+          FROZEN_VERSION: ${{ steps.freeze.outputs.frozen_version }}
+          FROZEN_APK_NAME: ${{ steps.freeze.outputs.frozen_apk_name }}
+          FROZEN_APK_DIGEST: ${{ steps.freeze.outputs.frozen_apk_digest }}
+          FROZEN_UPDATE_DIGEST: ${{ steps.freeze.outputs.frozen_update_digest }}
         run: |
           set -euo pipefail
-          tag="${{ steps.release.outputs.tag }}"
+          tag="$FROZEN_TAG"
           decision="${{ steps.release.outputs.decision }}"
-          if [[ "$decision" == "published" || "$decision" == "verify-published" ]]; then
+          [[ "$tag" == "v${FROZEN_VERSION}" ]] || { echo "::error::frozen tag/version mismatch; fail closed"; exit 1; }
+           state=$(GH_TOKEN="$TOKEN" gh release view "$tag" \
+             --repo slashinchi/TVBoxOS-Mobile \
+             --json tagName,targetCommitish,isDraft,assets \
+             --jq '.') || { echo "::error::pre-publish Release identity read failed; fail closed"; exit 1; }
+           [[ "$(jq -er '.tagName' <<<"$state")" == "$tag" ]] || {
+             echo "::error::pre-publish Release tag changed; fail closed"; exit 1;
+           }
+            target_commitish=$(jq -er '.targetCommitish // ""' <<<"$state")
+            is_draft=$(jq -er '.isDraft' <<<"$state")
+            tag_read="$RUNNER_TEMP/u2-pre-publish-tag-read.txt"
+            set +e
+            GH_TOKEN="$TOKEN" gh api --include \
+              "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" > "$tag_read" 2>&1
+            tag_read_status=$?
+            set -e
+            tag_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$tag_read")
+            tag_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+              --status "$tag_read_status" --http-status "$tag_http_status") || {
+              echo "::error::pre-publish tag identity classification failed; fail closed"; exit 1;
+            }
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
+            tag_target_sha=""
+            if [[ "$tag_read_action" == "present" ]]; then
+              tag_api="repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}"
+              tag_object_type=$(GH_TOKEN="$TOKEN" gh api "$tag_api" --jq '.object.type') || {
+                echo "::error::pre-publish tag object type read failed; fail closed"; exit 1;
+              }
+              resolve_tag_target() {
+                local remote="$1"
+                local tag="$2"
+                local object_type="$3"
+                local output sha ref extra direct="" peeled=""
+                output=$(git ls-remote --exit-code "$remote" \
+                  "refs/tags/${tag}^{}" "refs/tags/${tag}") || return 1
+                [[ -n "$output" ]] || return 1
+                while IFS=$'\t' read -r sha ref extra; do
+                  [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$ref" && -z "$extra" ]] || return 1
+                  case "$ref" in
+                    "refs/tags/${tag}^{}")
+                      [[ -z "$peeled" ]] || return 1
+                      peeled="$sha"
+                      ;;
+                    "refs/tags/${tag}")
+                      [[ -z "$direct" ]] || return 1
+                      direct="$sha"
+                      ;;
+                    *) return 1 ;;
+                  esac
+                done <<<"$output"
+                case "$object_type" in
+                  tag)
+                    [[ -n "$direct" && -n "$peeled" ]] || return 1
+                    printf '%s\n' "$peeled"
+                    ;;
+                  commit)
+                    [[ -n "$direct" && -z "$peeled" ]] || return 1
+                    printf '%s\n' "$direct"
+                    ;;
+                  *) return 1 ;;
+                esac
+              }
+              tag_target_sha=$(resolve_tag_target \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" "$tag" "$tag_object_type") || {
+                echo "::error::pre-publish tag target commit resolution failed; fail closed"; exit 1;
+              }
+              [[ "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
+                echo "::error::pre-publish tag target commit changed; fail closed"; exit 1;
+              }
+            elif [[ "$tag_read_action" == "missing" && "$is_draft" == "true" ]]; then
+              : # Draft Releases have no formal tag ref yet.
+            else
+              echo "::error::pre-publish tag identity is missing or unreadable; fail closed"; exit 1
+            fi
+           if [[ "$is_draft" == "true" ]]; then
+             [[ "$target_commitish" == "$FROZEN_TARGET_SHA" ]] || {
+               echo "::error::pre-publish draft target changed; fail closed"; exit 1;
+             }
+              [[ -z "$tag_target_sha" || "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
+               echo "::error::pre-publish draft tag target changed; fail closed"; exit 1;
+             }
+           else
+             [[ "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
+               echo "::error::pre-publish published target changed; fail closed"; exit 1;
+             }
+           fi
+           [[ "$(jq '.assets | length' <<<"$state")" -eq 2 ]] || {
+             echo "::error::pre-publish Release must contain exactly 2 assets; fail closed"; exit 1;
+           }
+           expected_names=$(printf '%s\n' "$FROZEN_APK_NAME" update.json | sort)
+           actual_names=$(jq -r '.assets[].name' <<<"$state" | sort)
+           [[ "$actual_names" == "$expected_names" ]] || {
+             echo "::error::pre-publish Release asset names changed; fail closed"; exit 1;
+           }
+           while IFS=$'\t' read -r name digest; do
+             case "$name" in
+               "$FROZEN_APK_NAME") expected_digest="$FROZEN_APK_DIGEST" ;;
+               update.json) expected_digest="$FROZEN_UPDATE_DIGEST" ;;
+               *) echo "::error::pre-publish Release asset name is unexpected; fail closed"; exit 1 ;;
+             esac
+             digest="${digest#sha256:}"
+             [[ "$digest" =~ ^[0-9a-f]{64}$ && "$digest" == "$expected_digest" ]] || {
+               echo "::error::pre-publish Release asset digest changed; fail closed"; exit 1;
+             }
+           done < <(jq -r '.assets[] | [.name, (.digest // "")] | @tsv' <<<"$state")
+           if [[ "$decision" == "published" || "$decision" == "verify-published" ]]; then
             echo "::notice::Release $tag already published; skipping publish"
             exit 0
           fi
@@ -916,11 +1922,16 @@ jobs:
       - name: Verify immutable Release and assets
         env:
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+          FROZEN_TAG: ${{ steps.freeze.outputs.frozen_tag }}
+          FROZEN_TARGET_SHA: ${{ steps.freeze.outputs.frozen_target_sha }}
+          FROZEN_VERSION: ${{ steps.freeze.outputs.frozen_version }}
+          FROZEN_APK_NAME: ${{ steps.freeze.outputs.frozen_apk_name }}
+          FROZEN_APK_DIGEST: ${{ steps.freeze.outputs.frozen_apk_digest }}
         run: |
           set -euo pipefail
-          tag="${{ steps.release.outputs.tag }}"
-          expected_apk="${{ steps.identity.outputs.EXPECTED_APK }}"
-          expected_target="${{ steps.identity.outputs.RELEASE_SHA }}"
+          tag="$FROZEN_TAG"
+          expected_apk="$FROZEN_APK_DIGEST"
+          expected_target="$FROZEN_TARGET_SHA"
           # 1) GitHub's own immutable-release verification commands.
           GH_TOKEN="$TOKEN" gh release verify "$tag" --repo slashinchi/TVBoxOS-Mobile
           # 2) Re-download the APK directly from GitHub and verify the exact bytes,
@@ -928,12 +1939,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/direct-download"
           GH_TOKEN="$TOKEN" gh release download "$tag" \
             --repo slashinchi/TVBoxOS-Mobile \
-            --pattern "${{ steps.assets.outputs.asset_name }}" \
+            --pattern "$FROZEN_APK_NAME" \
             --dir "$RUNNER_TEMP/direct-download" --clobber
           GH_TOKEN="$TOKEN" gh release verify-asset "$tag" \
-            "$RUNNER_TEMP/direct-download/${{ steps.assets.outputs.asset_name }}" \
+            "$RUNNER_TEMP/direct-download/$FROZEN_APK_NAME" \
             --repo slashinchi/TVBoxOS-Mobile
-          remote=$(sha256sum "$RUNNER_TEMP/direct-download/${{ steps.assets.outputs.asset_name }}" | awk '{print $1}')
+          remote=$(sha256sum "$RUNNER_TEMP/direct-download/$FROZEN_APK_NAME" | awk '{print $1}')
           [[ "$remote" == "$expected_apk" ]] || {
             echo "::error::downloaded Release APK digest mismatch: $remote != $expected_apk"; exit 1;
           }
@@ -957,7 +1968,7 @@ jobs:
             echo "::notice::release target_commitish is a ref name ($commitish); tag object SHA is the identity authority"
           fi
           names=$(jq -r '.assets | sort | join(",")' <<<"$state")
-          expected_names="${{ steps.assets.outputs.asset_name }},update.json"
+          expected_names="$FROZEN_APK_NAME,update.json"
           [[ "$names" == "$expected_names" ]] || { echo "::error::release asset set mismatch: $names"; exit 1; }
           echo "::notice::immutable verification passed for $tag (immutable=true, exact tag/target/assets/digest, tag SHA $tag_sha)"
 
@@ -965,11 +1976,14 @@ jobs:
         env:
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
+          FROZEN_TAG: ${{ steps.freeze.outputs.frozen_tag }}
+          FROZEN_VERSION: ${{ steps.freeze.outputs.frozen_version }}
+          FROZEN_APK_DIGEST: ${{ steps.freeze.outputs.frozen_apk_digest }}
         run: |
           set -euo pipefail
-          tag="${{ steps.release.outputs.tag }}"
-          expected="${{ steps.identity.outputs.EXPECTED_APK }}"
-          apk_url="https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/${tag}/TVBox-Mobile-v${{ steps.identity.outputs.EXPECTED_VERSION }}.apk"
+          tag="$FROZEN_TAG"
+          expected="$FROZEN_APK_DIGEST"
+          apk_url="https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/${tag}/TVBox-Mobile-v${FROZEN_VERSION}.apk"
           proxy_file="$RUNNER_TEMP/proxy.apk"
           delivery_ok=false
           for attempt in 1 2 3; do
@@ -992,7 +2006,7 @@ jobs:
             incident_key=$(python3 scripts/u2_publish.py incident-key \
               --mode "${{ needs.rc_summary.outputs.MODE }}" \
               --source-sha "${{ needs.rc_summary.outputs.SOURCE_SHA }}" \
-              --version "${{ steps.identity.outputs.EXPECTED_VERSION }}" \
+            --version "$FROZEN_VERSION" \
               --debt "${{ steps.identity.outputs.EXPECTED_DEBT }}" | jq -r '.key')
             title="release-delivery: ${incident_key}"
             existing=$(gh issue list --repo slashinchi/TVBoxOS-Mobile --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
@@ -1009,110 +2023,309 @@ jobs:
           echo "delivery_ok=true" >> "$GITHUB_OUTPUT"
           echo "::notice::delivery proxy verified for $tag"
 
-      - name: Reconcile root update.json monotonically with remote readback
+      - name: Reconcile verified release metadata with bounded normal CAS
         env:
-          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          RELEASE_SHA: ${{ steps.freeze.outputs.frozen_target_sha }}
+          EXPECTED_VERSION: ${{ steps.freeze.outputs.frozen_version }}
+          EXPECTED_VERSION_CODE: ${{ needs.prep.outputs.expected_version_code }}
           EXPECTED_DEBT: ${{ steps.identity.outputs.EXPECTED_DEBT }}
+          EXPECTED_APK: ${{ steps.freeze.outputs.frozen_apk_digest }}
+          FROZEN_TAG: ${{ steps.freeze.outputs.frozen_tag }}
+          FROZEN_UPDATE_DIGEST: ${{ steps.freeze.outputs.frozen_update_digest }}
+          SIGNER_SHA: ${{ steps.identity.outputs.SIGNER_SHA }}
+          SOURCE_SHA: ${{ needs.rc_summary.outputs.SOURCE_SHA }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Reconcile root update.json together with the verified-release ledger.
           [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
-          cand_version="$EXPECTED_VERSION"
-          # Read the CURRENT root update.json from the remote patched branch,
-          # never from local HEAD (which may be ahead of or behind remote).
-          if remote_b64=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
-            --jq '.content' 2>/dev/null); then
-            : # success: stdout holds base64 content
-          else
-            remote_b64=""
-          fi
-          [[ -n "$remote_b64" ]] || {
-            echo "::error::cannot read current patched/update.json from remote; refusing to guess (a transient API failure must never be treated as an empty baseline)"
-            exit 1
-          }
-          remote_content=$(printf '%s' "$remote_b64" | base64 -d 2>/dev/null || echo "")
-          [[ -n "$remote_content" ]] || {
-            echo "::error::remote update.json base64 decode failed or is empty; refusing to proceed on an unknown baseline"
-            exit 1
-          }
-          current_version=$(jq -r '.version // ""' <<<"$remote_content" 2>/dev/null || echo "")
-          [[ -n "$current_version" ]] || {
-            echo "::error::remote update.json has no readable version; refusing to proceed on an unknown baseline"
-            exit 1
-          }
-          newer=$(python3 scripts/u2_publish.py monotonic-compare \
-            --current-version "$current_version" \
-            --candidate-version "$cand_version" | jq -r '.newer')
-          [[ "$newer" == "true" ]] || { echo "::error::candidate version is older than current update.json"; exit 1; }
-          apk_url="https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/v${cand_version}/TVBox-Mobile-v${cand_version}.apk"
+          tag="$FROZEN_TAG"
+          [[ "$tag" == "v${EXPECTED_VERSION}" ]] || { echo "::error::frozen tag/version mismatch; fail closed"; exit 1; }
+           apk_url="https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/${tag}/TVBox-Mobile-v${EXPECTED_VERSION}.apk"
+          candidate_update="$RUNNER_TEMP/u2-candidate-update.json"
           python3 scripts/u2_publish.py build-update-json \
-            --version "$cand_version" \
+            --version "$EXPECTED_VERSION" \
             --apk-url "$apk_url" \
-            --output update.json
-          if cmp -s update.json <(printf '%s' "$remote_content"); then
-            echo "::notice::remote update.json already identical to v${cand_version}; no commit needed"
-            exit 0
-          fi
+            --output "$candidate_update"
+          update_digest=$(sha256sum "$candidate_update" | awk '{print $1}')
+          [[ "$update_digest" == "$FROZEN_UPDATE_DIGEST" ]] || {
+            echo "::error::candidate update.json digest changed after delivery verification"; exit 1;
+          }
+          entry_file="$RUNNER_TEMP/u2-verified-release-entry.json"
+          python3 - "$tag" "$RELEASE_SHA" "$EXPECTED_VERSION" "$EXPECTED_VERSION_CODE" \
+            "$EXPECTED_APK" "$update_digest" "$SIGNER_SHA" "$SOURCE_SHA" \
+            "$EXPECTED_DEBT" "$RUN_ID" "$RUN_ATTEMPT" > "$entry_file" <<'PY'
+          import json
+          import sys
+
+          from scripts.u2_publish import verified_release_entry
+
+          entry = verified_release_entry(
+              tag=sys.argv[1],
+              target=sys.argv[2],
+              version_name=sys.argv[3],
+              version_code=sys.argv[4],
+              asset_sha256=sys.argv[5],
+              update_sha256=sys.argv[6],
+              signer_sha256=sys.argv[7],
+              source_sha=sys.argv[8],
+              debt=sys.argv[9],
+              run_id=sys.argv[10],
+              run_attempt=sys.argv[11],
+          )
+          print(json.dumps(entry, sort_keys=True))
+          PY
           git config user.name "TVBox U2 Publish"
           git config user.email "u2-publish@users.noreply.github.com"
-          # Metadata is forward-only: if patched moved while this run was
-          # publishing (TOCTOU), rebuild the single update.json commit on the
-          # NEW remote HEAD so we never fast-forward-overwrite concurrent
-          # pushes, and never leave a published Release without metadata.
-          cp update.json "$RUNNER_TEMP/update-json-to-commit.json"
-          git fetch --no-tags origin "+refs/heads/patched:refs/remotes/origin/patched"
-          remote_head=$(git rev-parse refs/remotes/origin/patched)
-          if [[ "$(git rev-parse HEAD)" != "$remote_head" ]]; then
-            echo "::notice::patched moved during publish ($(git rev-parse --short HEAD) -> $(git rev-parse --short "$remote_head")); rebuilding update.json commit on remote HEAD"
-            # Re-validate monotonicity against the NEW remote baseline before
-            # committing: a concurrent push may have written an even newer
-            # update.json, and we must never regress it.
-            if new_remote_b64=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" --jq '.content' 2>/dev/null); then
-              new_remote_content=$(printf '%s' "$new_remote_b64" | base64 -d 2>/dev/null || echo "")
-              if [[ -n "$new_remote_content" ]]; then
-                new_current_version=$(jq -r '.version // ""' <<<"$new_remote_content" 2>/dev/null || echo "")
-                if [[ -n "$new_current_version" ]]; then
-                  still_newer=$(python3 scripts/u2_publish.py monotonic-compare \
-                    --current-version "$new_current_version" \
-                    --candidate-version "$cand_version" | jq -r '.newer')
-                  [[ "$still_newer" == "true" ]] || {
-                    echo "::error::remote update.json advanced to $new_current_version during publish; refusing to regress metadata"
-                    exit 1
-                  }
-                fi
-              fi
-            fi
+          remote_url="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          metadata_ledger="$RUNNER_TEMP/u2-reconciled-verified-releases.json"
+          metadata_cas_verified=false
+
+           verify_remote_blobs() {
+             local readback_head_before readback_head_after
+             local remote_after_update_b64 remote_after_ledger_b64
+             readback_head_before=$(git ls-remote "$remote_url" refs/heads/patched | awk 'NF {print $1}') || {
+               echo "::error::cannot read patched SHA before metadata readback"; return 1;
+             }
+             [[ "$readback_head_before" =~ ^[0-9a-f]{40}$ ]] || {
+               echo "::error::invalid patched SHA before metadata readback"; return 1;
+             }
+             remote_after_update_b64=$(GH_TOKEN="$TOKEN" gh api \
+               "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
+               --jq '.content' 2>/dev/null) || {
+               echo "::error::remote update.json readback failed"; return 1;
+             }
+             remote_after_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
+               "repos/slashinchi/TVBoxOS-Mobile/contents/gradle/verified-releases.json?ref=patched" \
+               --jq '.content' 2>/dev/null) || {
+               echo "::error::remote verified-release ledger readback failed"; return 1;
+             }
+             readback_head_after=$(git ls-remote "$remote_url" refs/heads/patched | awk 'NF {print $1}') || {
+               echo "::error::cannot read patched SHA after metadata readback"; return 1;
+             }
+             [[ "$readback_head_after" =~ ^[0-9a-f]{40}$ ]] || {
+               echo "::error::invalid patched SHA after metadata readback"; return 1;
+             }
+             if [[ "$readback_head_after" != "$readback_head_before" ]]; then
+               echo "::warning::patched moved during metadata readback; discard this round and rebuild from a fresh remote read"
+               return 2
+             fi
+             [[ -n "$remote_after_update_b64" && -n "$remote_after_ledger_b64" ]] || {
+               echo "::error::remote metadata readback returned empty content"; return 1;
+             }
+             printf '%s' "$remote_after_update_b64" | base64 -d > "$RUNNER_TEMP/u2-readback-update.json" || return 1
+             printf '%s' "$remote_after_ledger_b64" | base64 -d > "$RUNNER_TEMP/u2-readback-verified-releases.json" || return 1
+             persisted_entry_file="$RUNNER_TEMP/u2-persisted-release-entry.json"
+             python3 - "$entry_file" "$metadata_ledger" > "$persisted_entry_file" <<'PY'
+          import json
+          import sys
+
+          from scripts.u2_publish import persisted_verified_release_entry, strict_json_loads
+
+          expected = strict_json_loads(open(sys.argv[1], encoding="utf-8").read())
+          result = persisted_verified_release_entry(open(sys.argv[2], "rb").read(), expected)
+          if not result["verified"]:
+              raise SystemExit("persisted metadata ledger does not contain the exact release identity")
+          print(json.dumps(result["entry"], sort_keys=True))
+          PY
+             cmp -s "$candidate_update" "$RUNNER_TEMP/u2-readback-update.json" || {
+               echo "::error::remote update.json readback is not byte-exact"; return 1;
+             }
+             cmp -s "$metadata_ledger" "$RUNNER_TEMP/u2-readback-verified-releases.json" || {
+               echo "::error::remote verified-release ledger readback is not byte-exact"; return 1;
+             }
+             verified=$(python3 scripts/u2_publish.py verify-remote-metadata \
+               --metadata-file "$RUNNER_TEMP/u2-readback-update.json" \
+               --expected-version "$EXPECTED_VERSION" \
+               --expected-apk-url "$apk_url" | jq -r '.verified') || return 1
+             [[ "$verified" == "true" ]] || { echo "::error::remote update.json semantic readback failed"; return 1; }
+             verified=$(python3 - "$persisted_entry_file" "$RUNNER_TEMP/u2-readback-verified-releases.json" <<'PY'
+          import json
+          import sys
+
+          from scripts.u2_publish import verify_verified_releases, strict_json_loads
+
+          expected = strict_json_loads(open(sys.argv[1], encoding="utf-8").read())
+          actual = open(sys.argv[2], "rb").read()
+          print(json.dumps(verify_verified_releases(actual, expected), sort_keys=True))
+          PY
+             ) || return 1
+             [[ "$(jq -r '.verified' <<<"$verified")" == "true" ]] || {
+               echo "::error::remote verified-release ledger semantic readback failed: $verified"; return 1;
+             }
+             return 0
+           }
+
+           for attempt in 1 2 3; do
+            echo "::notice::metadata CAS attempt ${attempt}/3: fresh fetch and remote read"
+            git fetch --no-tags origin "+refs/heads/patched:refs/remotes/origin/patched"
+            remote_head=$(git rev-parse refs/remotes/origin/patched)
             git reset --hard "$remote_head"
-            cp "$RUNNER_TEMP/update-json-to-commit.json" update.json
-            git add update.json
-            if git diff --cached --quiet; then
-              echo "::notice::update.json on remote HEAD already identical to v${cand_version}; no commit needed"
-              exit 0
+
+            remote_update_b64=$(GH_TOKEN="$TOKEN" gh api \
+              "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
+              --jq '.content' 2>/dev/null) || {
+              echo "::error::cannot read current patched/update.json from remote; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            [[ -n "$remote_update_b64" ]] || {
+              echo "::error::remote update.json read failed or returned empty content; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            remote_update="$RUNNER_TEMP/u2-remote-update.json"
+            printf '%s' "$remote_update_b64" | base64 -d > "$remote_update" || {
+              echo "::error::remote update.json base64 decode failed; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            [[ -s "$remote_update" ]] || { echo "::error::remote update.json is empty; refusing to proceed on an unknown baseline"; exit 1; }
+            current_metadata=$(python3 scripts/u2_publish.py parse-update-metadata \
+              --metadata-file "$remote_update") || {
+              echo "::error::remote update.json strict parse/semantic validation failed; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            current_version=$(jq -er '.version' <<<"$current_metadata") || {
+              echo "::error::remote update.json has no readable version; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            current_url=$(jq -er '.apk_url' <<<"$current_metadata") || {
+              echo "::error::remote update.json has no readable apk_url; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            # Do not replace strict JSON parsing with jq's duplicate-folding
+            # `keys | sort` check; the Python helper rejected duplicates above.
+            python3 scripts/u2_publish.py build-update-json \
+              --version "$current_version" \
+              --apk-url "$current_url" \
+              --output "$RUNNER_TEMP/current-canonical-update.json" >/dev/null || {
+              echo "::error::remote update.json failed semantic validation; refusing to proceed on an unknown baseline"; exit 1;
+            }
+            newer=$(python3 scripts/u2_publish.py monotonic-compare \
+              --current-version "$current_version" \
+              --candidate-version "$EXPECTED_VERSION" | jq -r '.newer')
+            [[ "$newer" == "true" ]] || {
+              echo "::error::candidate version is older than current update.json"; exit 1;
+            }
+            if [[ "$current_version" == "$EXPECTED_VERSION" ]]; then
+              python3 - "$candidate_update" "$remote_update" <<'PY'
+          import sys
+
+          from scripts.u2_publish import parse_update_metadata
+
+          if parse_update_metadata(open(sys.argv[1], "rb").read()) != parse_update_metadata(open(sys.argv[2], "rb").read()):
+              raise SystemExit("same-version update.json has a different identity")
+          PY
             fi
-            git commit -m "chore: update metadata to v${cand_version}"
-          else
-            git add update.json
-            if git diff --cached --quiet; then
-              echo "::notice::update.json already identical to v${cand_version}; no commit needed"
-              exit 0
-            fi
-            git commit -m "chore: update metadata to v${cand_version}"
-          fi
-          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/patched
-          # Remote byte readback via the Contents API on patched.
-          remote_after=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
-            --jq '.content' | base64 -d)
-          expected_url="$apk_url"
-          printf '%s' "$remote_after" > "$RUNNER_TEMP/remote-update.json"
-          verified=$(python3 scripts/u2_publish.py verify-remote-metadata \
-            --metadata-file "$RUNNER_TEMP/remote-update.json" \
-            --expected-version "$cand_version" \
-            --expected-apk-url "$expected_url" | jq -r '.verified')
-          [[ "$verified" == "true" ]] || {
-            echo "::error::remote update.json readback mismatch after commit"; exit 1;
-          }
-          echo "::notice::root update.json reconciled to v${cand_version} and remote-readback byte-exact"
+
+            remote_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
+              "repos/slashinchi/TVBoxOS-Mobile/contents/gradle/verified-releases.json?ref=patched" \
+              --jq '.content' 2>/dev/null) || {
+              echo "::error::cannot read current patched/gradle/verified-releases.json from remote"; exit 1;
+            }
+            [[ -n "$remote_ledger_b64" ]] || {
+              echo "::error::remote verified-release ledger read failed or returned empty content"; exit 1;
+            }
+            remote_ledger="$RUNNER_TEMP/u2-remote-verified-releases.json"
+            printf '%s' "$remote_ledger_b64" | base64 -d > "$remote_ledger" || {
+              echo "::error::remote verified-release ledger base64 decode failed"; exit 1;
+            }
+            [[ -s "$remote_ledger" ]] || { echo "::error::remote verified-release ledger is empty"; exit 1; }
+            rm -f "$metadata_ledger"
+            # Keep reconcile-verified-releases only as a compatibility reference;
+            # the shared two-file helper below is the sole reconciliation authority.
+            reconcile=$(python3 scripts/u2_publish.py reconcile-verified-release-metadata \
+              --current-update "$remote_update" \
+              --current-ledger "$remote_ledger" \
+              --candidate-update "$candidate_update" \
+              --entry "$entry_file" \
+              --output "$metadata_ledger")
+            action=$(jq -er '.action' <<<"$reconcile") || {
+              echo "::error::verified-release ledger reconciliation returned no action"; exit 1;
+            }
+            [[ "$action" == "append" || "$action" == "exact-reuse" ]] || {
+              echo "::error::unexpected verified-release ledger action: $action"; exit 1;
+            }
+
+             cp "$candidate_update" update.json
+             cp "$metadata_ledger" gradle/verified-releases.json
+             if cmp -s update.json "$remote_update" && cmp -s gradle/verified-releases.json "$remote_ledger"; then
+               echo "::notice::both remote metadata files are already identical and contain exact verified identity; no commit needed"
+               if verify_remote_blobs; then
+                 metadata_cas_verified=true
+                 break
+               else
+                 verify_status=$?
+                 if [[ "$verify_status" -eq 2 ]]; then
+                   echo "::notice::metadata readback was unstable; continuing with a fresh fetch and remote read"
+                   continue
+                 fi
+                 echo "::error::metadata readback failed closed (status=$verify_status)"; exit 1
+               fi
+             fi
+             git add update.json gradle/verified-releases.json
+             git commit -m "chore: reconcile verified release metadata v${EXPECTED_VERSION}"
+             local_parent=$(git rev-parse HEAD^)
+             remote_head_before=$(git ls-remote "$remote_url" refs/heads/patched | awk 'NF {print $1}')
+            [[ "$remote_head_before" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::cannot read remote patched SHA before metadata push"; exit 1;
+            }
+             push_log="$RUNNER_TEMP/u2-metadata-push.log"
+             push_porcelain="$RUNNER_TEMP/u2-metadata-push-porcelain.log"
+             push_diagnostics="$RUNNER_TEMP/u2-metadata-push-diagnostics.log"
+             set +e
+             git push --porcelain "$remote_url" HEAD:refs/heads/patched > "$push_porcelain" 2> "$push_diagnostics"
+             push_status=$?
+             set -e
+             cat "$push_porcelain" "$push_diagnostics" > "$push_log"
+            remote_head_after=$(git ls-remote "$remote_url" refs/heads/patched | awk 'NF {print $1}')
+            [[ "$remote_head_after" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::cannot read remote patched SHA after metadata push"; exit 1;
+            }
+            push_is_non_fast_forward=$(awk -F '\t' '
+              $1 == "!" && $2 ~ /:refs\/heads\/patched$/ { print "true"; found=1; exit }
+              END { if (!found) print "false" }
+            ' "$push_log")
+            push_decision=$(python3 scripts/u2_publish.py classify-metadata-push \
+              --status "$push_status" \
+              --porcelain-file "$push_log" \
+              --local-parent "$local_parent" \
+              --remote-before "$remote_head_before" \
+              --remote-after "$remote_head_after" \
+              --attempt "$attempt" \
+              --max-attempts 3) || {
+              echo "::error::metadata push classification failed closed (porcelain_nff=$push_is_non_fast_forward)"; exit 1;
+            }
+            push_action=$(jq -er '.action' <<<"$push_decision") || {
+              echo "::error::metadata push classification returned no action"; exit 1;
+            }
+             case "$push_action" in
+               success)
+                 if verify_remote_blobs; then
+                   metadata_cas_verified=true
+                   echo "::notice::metadata CAS push and stable remote readback succeeded on attempt ${attempt}"
+                   break
+                 else
+                   verify_status=$?
+                   if [[ "$verify_status" -eq 2 ]]; then
+                     echo "::notice::metadata readback was unstable; discarding this round for a fresh fetch and remote read"
+                     continue
+                   fi
+                   echo "::error::metadata readback failed closed (status=$verify_status)"; exit 1
+                 fi
+                 ;;
+              retry)
+                echo "::notice::patched moved during publish; rebuilding update.json commit on remote HEAD with both metadata files after a fresh read (porcelain_nff=$push_is_non_fast_forward, remote_head_before=$remote_head_before, remote_head_after=$remote_head_after)"
+                continue
+                ;;
+              retry-exhausted)
+                echo "::error::metadata CAS retry exhaustion after 3 confirmed non-fast-forward failures"; exit 1
+                ;;
+              *)
+                echo "::error::metadata CAS push failed closed without a confirmed non-fast-forward (status=$push_status)"; exit 1
+                ;;
+            esac
+          done
+
+           [[ "$metadata_cas_verified" == "true" ]] || {
+             echo "::error::metadata CAS did not reach stable remote readback within 3 attempts"; exit 1;
+           }
+           echo "::notice::update.json and verified-releases.json are remote byte-exact readback after bounded normal CAS"
 
       - name: Clean up disposable prep ref and close satisfied incidents
         env:

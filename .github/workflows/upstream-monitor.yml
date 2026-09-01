@@ -198,7 +198,7 @@ jobs:
           set -euo pipefail
            trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
            cp scripts/upstream_monitor.py "$trusted_helper"
-           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+           git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
 
@@ -339,9 +339,7 @@ jobs:
       validation: ${{ steps.prepare.outputs.validation }}
       classification: ${{ steps.prepare.outputs.classification }}
       candidate_needed: ${{ steps.prepare.outputs.candidate_needed }}
-      candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
       validated_tree: ${{ steps.prepare.outputs.validated_tree }}
-      provenance_marker: ${{ steps.prepare.outputs.provenance_marker }}
       changed_paths_b64: ${{ steps.prepare.outputs.changed_paths_b64 }}
       preserved_paths_b64: ${{ steps.prepare.outputs.preserved_paths_b64 }}
       candidate_diff_stat_b64: ${{ steps.prepare.outputs.candidate_diff_stat_b64 }}
@@ -358,10 +356,33 @@ jobs:
         env:
           UPSTREAM_REPO: kukuqi666/TVBoxOS-Mobile
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
+          FORK_MAIN_SHA: ${{ needs.probe.outputs.fork_main_sha }}
         run: |
           set +e
            trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
            cp scripts/upstream_monitor.py "$trusted_helper"
+           existing_fork_main=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
+           if [[ -n "$existing_fork_main" && "$existing_fork_main" != "$FORK_MAIN_SHA" ]]; then
+             echo "Candidate validation fork main baseline changed during checkout."
+             echo 'validation=fail' >> "$GITHUB_OUTPUT"
+             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
+             exit 0
+           fi
+           if ! git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main; then
+             echo "Candidate validation could not fetch fork main without rewriting local evidence."
+             echo 'validation=fail' >> "$GITHUB_OUTPUT"
+             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
+             exit 0
+           fi
+           if [[ "$(git rev-parse refs/remotes/origin/main)" != "$FORK_MAIN_SHA" ]]; then
+             echo "Candidate validation fork main SHA changed during validation."
+             echo 'validation=fail' >> "$GITHUB_OUTPUT"
+             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
+             exit 0
+           fi
            git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
           if [[ "$(git rev-parse refs/remotes/upstream/main)" != "$UPSTREAM_SHA" ]]; then
@@ -369,9 +390,7 @@ jobs:
             echo 'validation=fail' >> "$GITHUB_OUTPUT"
             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
-             echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
              echo 'validated_tree=' >> "$GITHUB_OUTPUT"
-             echo 'provenance_marker=' >> "$GITHUB_OUTPUT"
              echo 'candidate_diff_stat_b64=' >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -389,39 +408,37 @@ jobs:
             echo 'validation=fail' >> "$GITHUB_OUTPUT"
             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
-             echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
              echo 'validated_tree=' >> "$GITHUB_OUTPUT"
-             echo 'provenance_marker=' >> "$GITHUB_OUTPUT"
              echo 'candidate_diff_stat_b64=' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           classification=$(jq -r '.classification' "$result_file")
           status=$(jq -r '.status' "$result_file")
            candidate_needed=$(jq -r '.candidate_needed' "$result_file")
-           candidate_sha=$(jq -r '.candidate_sha // empty' "$result_file")
            validated_tree=$(jq -r '.validated_tree // empty' "$result_file")
-           provenance_marker=
-           if [[ "$candidate_needed" == "true" ]]; then
-             upstream_version_file="$RUNNER_TEMP/upstream-app-build.gradle"
-             git show "$UPSTREAM_SHA:app/build.gradle" > "$upstream_version_file"
-             upstream_version_json=$(python3 scripts/u2_release.py parse-app-version --file "$upstream_version_file")
-             upstream_version=$(jq -r '.versionName' <<<"$upstream_version_json")
-             upstream_code=$(jq -r '.versionCode' <<<"$upstream_version_json")
-             provenance_marker=$(python3 scripts/u2_release.py provenance-marker \
-               --upstream "$UPSTREAM_SHA" \
-               --candidate "$candidate_sha" \
-               --tree "$validated_tree" \
-               --upstream-version "$upstream_version" \
-               --upstream-code "$upstream_code")
-           fi
            changed_paths_b64=$(jq -jr '.changed_paths | join("\u0000")' "$result_file" | base64 -w 0)
           preserved_paths_b64=$(jq -jr '.preserved | join("\u0000")' "$result_file" | base64 -w 0)
           candidate_diff_stat_b64=$(git diff --stat "$base_sha...HEAD" | base64 -w 0)
+          base_control_tree="$RUNNER_TEMP/base-control-tree.txt"
+          candidate_control_tree="$RUNNER_TEMP/candidate-control-tree.txt"
+          git ls-tree -r --full-tree "$base_sha" -- \
+            .github scripts gradle/verified-releases.json \
+            gradle/legacy-dependencies.lock.json AGENTS.md README.md update.json \
+            > "$base_control_tree"
+          git ls-tree -r --full-tree HEAD -- \
+            .github scripts gradle/verified-releases.json \
+            gradle/legacy-dependencies.lock.json AGENTS.md README.md update.json \
+            > "$candidate_control_tree"
+          diff -u "$base_control_tree" "$candidate_control_tree" >/dev/null || {
+            echo "Candidate changed fork-owned control inputs; refusing validation."
+            echo 'validation=fail' >> "$GITHUB_OUTPUT"
+            echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+            echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          }
           echo "classification=$classification" >> "$GITHUB_OUTPUT"
            echo "candidate_needed=$candidate_needed" >> "$GITHUB_OUTPUT"
-           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
-           echo "validated_tree=$validated_tree" >> "$GITHUB_OUTPUT"
-           echo "provenance_marker=$provenance_marker" >> "$GITHUB_OUTPUT"
+            echo "validated_tree=$validated_tree" >> "$GITHUB_OUTPUT"
           echo "changed_paths_b64=$changed_paths_b64" >> "$GITHUB_OUTPUT"
           echo "preserved_paths_b64=$preserved_paths_b64" >> "$GITHUB_OUTPUT"
           echo "candidate_diff_stat_b64=$candidate_diff_stat_b64" >> "$GITHUB_OUTPUT"
@@ -505,13 +522,17 @@ jobs:
           EXPECTED_CLASSIFICATION: ${{ needs.candidate_validation.outputs.classification }}
           EXPECTED_CANDIDATE_NEEDED: ${{ needs.candidate_validation.outputs.candidate_needed }}
           VALIDATED_TREE: ${{ needs.candidate_validation.outputs.validated_tree }}
-          EXPECTED_PROVENANCE_MARKER: ${{ needs.candidate_validation.outputs.provenance_marker }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
            trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
            cp scripts/upstream_monitor.py "$trusted_helper"
-           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+           existing_fork_main=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
+           if [[ -n "$existing_fork_main" && "$existing_fork_main" != "$FORK_MAIN_SHA" ]]; then
+             echo "::error::fork main baseline changed during candidate write"
+             exit 1
+           fi
+           git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
           git fetch --no-tags origin +refs/heads/patched:refs/remotes/origin/patched
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
@@ -554,17 +575,18 @@ jobs:
              exit 1
            fi
 
-           candidate_sha=$(jq -r '.candidate_sha' "$result_file")
+            candidate_sha=$(git rev-parse HEAD)
+            test "$candidate_sha" = "$(jq -r '.candidate_sha' "$result_file")"
            upstream_version_file="$RUNNER_TEMP/upstream-app-build.gradle"
            git show "$UPSTREAM_SHA:app/build.gradle" > "$upstream_version_file"
            upstream_version_json=$(python3 scripts/u2_release.py parse-app-version --file "$upstream_version_file")
-           provenance_marker=$(python3 scripts/u2_release.py provenance-marker \
-             --upstream "$UPSTREAM_SHA" \
-             --candidate "$candidate_sha" \
-             --tree "$VALIDATED_TREE" \
-             --upstream-version "$(jq -r '.versionName' <<<"$upstream_version_json")" \
+            provenance_marker=$(python3 scripts/u2_release.py provenance-marker \
+              --upstream "$UPSTREAM_SHA" \
+              --candidate "$candidate_sha" \
+              --tree "$VALIDATED_TREE" \
+              --fork-main "$UPSTREAM_SHA" \
+              --upstream-version "$(jq -r '.versionName' <<<"$upstream_version_json")" \
              --upstream-code "$(jq -r '.versionCode' <<<"$upstream_version_json")")
-           test "$provenance_marker" = "$EXPECTED_PROVENANCE_MARKER"
 
           changed_paths=$(jq -r '.changed_paths[]?' "$result_file")
           candidate_diff_stat=$(git diff --stat "$PATCHED_SHA...HEAD")
@@ -614,6 +636,13 @@ jobs:
           actual_candidate_oid=$(git rev-parse "refs/remotes/origin/$candidate_branch")
           test "$actual_candidate_oid" = "$expected_candidate_oid"
           git merge-base --is-ancestor "$PATCHED_SHA" "$actual_candidate_oid"
+          if ! git diff --quiet "$PATCHED_SHA" "$actual_candidate_oid" -- \
+            .github/ scripts/ gradle/verified-releases.json \
+            gradle/legacy-dependencies.lock.json AGENTS.md README.md update.json; then
+            echo 'failure_reason=fork-control-input-changed' >> "$GITHUB_OUTPUT"
+            echo "Fork-owned control inputs changed after candidate push"
+            exit 1
+          fi
            expected_candidate_tree="$VALIDATED_TREE"
            actual_candidate_tree=$(git rev-parse "refs/remotes/origin/$candidate_branch^{tree}")
             if ! python3 "$trusted_helper" tree-check --actual "$actual_candidate_tree" --expected "$expected_candidate_tree"; then
@@ -659,10 +688,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
-          cp scripts/upstream_monitor.py "$trusted_helper"
-          candidate_branch=$(python3 "$trusted_helper" candidate-branch --upstream-sha "$UPSTREAM_SHA")
-          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+           trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
+           cp scripts/upstream_monitor.py "$trusted_helper"
+           candidate_branch=$(python3 "$trusted_helper" candidate-branch --upstream-sha "$UPSTREAM_SHA")
+           existing_fork_main=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
+           if [[ -n "$existing_fork_main" && "$existing_fork_main" != "$FORK_MAIN_SHA" ]]; then
+             echo "::error::fork main baseline changed during recovery"
+             exit 1
+           fi
+           git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
           git fetch --no-tags origin +refs/heads/patched:refs/remotes/origin/patched
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
@@ -691,11 +725,12 @@ jobs:
            upstream_version_file="$RUNNER_TEMP/upstream-app-build.gradle"
            git show "$UPSTREAM_SHA:app/build.gradle" > "$upstream_version_file"
            upstream_version_json=$(python3 scripts/u2_release.py parse-app-version --file "$upstream_version_file")
-           provenance_marker=$(python3 scripts/u2_release.py provenance-marker \
-             --upstream "$UPSTREAM_SHA" \
-             --candidate "$CANDIDATE_BRANCH_OID" \
-             --tree "$expected_tree" \
-             --upstream-version "$(jq -r '.versionName' <<<"$upstream_version_json")" \
+            provenance_marker=$(python3 scripts/u2_release.py provenance-marker \
+              --upstream "$UPSTREAM_SHA" \
+              --candidate "$CANDIDATE_BRANCH_OID" \
+              --tree "$expected_tree" \
+              --fork-main "$UPSTREAM_SHA" \
+              --upstream-version "$(jq -r '.versionName' <<<"$upstream_version_json")" \
              --upstream-code "$(jq -r '.versionCode' <<<"$upstream_version_json")")
            if ! python3 "$trusted_helper" tree-check --actual "$actual_tree" --expected "$expected_tree"; then
              echo 'failure_reason=validated-tree-mismatch' >> "$GITHUB_OUTPUT"
@@ -822,7 +857,6 @@ jobs:
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
           PATCHED_SHA: ${{ needs.probe.outputs.patched_sha }}
           CLASSIFICATION: ${{ needs.candidate_validation.outputs.classification }}
-          CANDIDATE_SHA: ${{ needs.candidate_validation.outputs.candidate_sha }}
           VALIDATED_TREE: ${{ needs.candidate_validation.outputs.validated_tree }}
           CHANGED_PATHS_B64: ${{ needs.candidate_validation.outputs.changed_paths_b64 }}
           PRESERVED_PATHS_B64: ${{ needs.candidate_validation.outputs.preserved_paths_b64 }}
@@ -897,8 +931,7 @@ jobs:
            - upstream full SHA：${UPSTREAM_SHA:-unknown}
            - fork main SHA：${FORK_MAIN_SHA:-unknown}
            - patched SHA：${PATCHED_SHA:-unknown}
-           - candidate SHA：${CANDIDATE_SHA:-none}
-           - validated tree：${VALIDATED_TREE:-none}
+            - validated tree：${VALIDATED_TREE:-none}
            - risk classification：${CLASSIFICATION:-unknown/high-risk}
            - candidate build/validation：$candidate_build_status / ${VALIDATION:-unknown}
            - changed files：$changed_paths

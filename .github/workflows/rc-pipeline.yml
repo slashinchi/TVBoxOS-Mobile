@@ -55,6 +55,11 @@ on:
         required: false
         default: ''
         type: string
+      canary_namespace:
+        description: Optional exact run-owned prefix for the authorized U2c canary only.
+        required: false
+        default: ''
+        type: string
     outputs:
       unsigned_artifact_id:
         description: Actions artifact ID for the exact unsigned APK bundle.
@@ -68,12 +73,18 @@ on:
       repro_artifact_id:
         description: Actions artifact ID for the independent reproducibility bundle.
         value: ${{ jobs.build_repro.outputs.artifact_id }}
+      repro_artifact_name:
+        description: Actions artifact name for the independent reproducibility bundle.
+        value: ${{ jobs.build_repro.outputs.artifact_name }}
       repro_artifact_digest:
         description: Actions transport digest for the independent reproducibility bundle.
         value: ${{ jobs.build_repro.outputs.artifact_digest }}
       reproducibility_report_artifact_id:
         description: Actions artifact ID for the reproducibility comparison report.
         value: ${{ jobs.compare_reproducibility.outputs.report_artifact_id }}
+      reproducibility_report_artifact_name:
+        description: Actions artifact name for the reproducibility comparison report.
+        value: ${{ jobs.compare_reproducibility.outputs.report_artifact_name }}
       reproducibility_report_artifact_digest:
         description: Actions transport digest for the reproducibility comparison report.
         value: ${{ jobs.compare_reproducibility.outputs.report_artifact_digest }}
@@ -89,6 +100,18 @@ on:
       signed_artifact_digest:
         description: Actions transport digest for the signed bundle.
         value: ${{ jobs.sign_exact.outputs.artifact_digest }}
+      sign_input_artifact_name:
+        description: Actions artifact name for the sanitized sign input.
+        value: ${{ jobs.prepare_sign_input.outputs.artifact_name }}
+      sign_input_artifact_id:
+        description: Actions artifact ID for the sanitized sign input.
+        value: ${{ jobs.prepare_sign_input.outputs.artifact_id }}
+      attest_input_artifact_id:
+        description: Actions artifact ID for the verifier-produced attest input.
+        value: ${{ jobs.verify_signed.outputs.attest_input_artifact_id }}
+      attest_input_artifact_name:
+        description: Actions artifact name for the verifier-produced attest input.
+        value: ${{ jobs.verify_signed.outputs.attest_input_artifact_name }}
       unsigned_sha256:
         description: Raw SHA-256 of the exact AGP-produced unsigned APK.
         value: ${{ jobs.build_unsigned.outputs.unsigned_sha256 }}
@@ -110,8 +133,50 @@ permissions:
   actions: read
 
 jobs:
+  validate_canary_namespace:
+    name: Validate optional canary artifact namespace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: none
+    outputs:
+      canary_namespace: ${{ steps.validate.outputs.canary_namespace }}
+    steps:
+      - id: validate
+        name: Fail closed on an invalid canary namespace
+        env:
+          CANARY_NAMESPACE: ${{ inputs.canary_namespace }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CANARY_NAMESPACE" ]]; then
+            echo "canary_namespace=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$RUN_ID" =~ ^[0-9]+$ && "$RUN_ATTEMPT" =~ ^[0-9]+$ ]] || {
+            echo "::error::GitHub run identity is not numeric"
+            exit 1
+          }
+          [[ "$CANARY_NAMESPACE" =~ ^u2-canary-[0-9]+-attempt-[0-9]+$ ]] || {
+            echo "::error::canary namespace must match u2-canary-<run>-attempt-<attempt>"
+            exit 1
+          }
+          expected_namespace="u2-canary-${RUN_ID}-attempt-${RUN_ATTEMPT}"
+          [[ "$CANARY_NAMESPACE" == "$expected_namespace" ]] || {
+            echo "::error::namespace does not match the current run and attempt"
+            exit 1
+          }
+          [[ "$CALLER_WORKFLOW_REF" == "slashinchi/TVBoxOS-Mobile/.github/workflows/u2-canary-harness.yml@refs/heads/patched" ]] || {
+            echo "::error::namespaced pipeline calls are allowed only from the patched canary harness"
+            exit 1
+          }
+          echo "canary_namespace=$CANARY_NAMESPACE" >> "$GITHUB_OUTPUT"
+
   build_unsigned:
     name: Build exact unsigned APK
+    needs: validate_canary_namespace
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -172,7 +237,7 @@ jobs:
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: tvbox-u2-build-evidence-${{ inputs.release_sha }}-${{ github.run_attempt }}
+          name: ${{ inputs.canary_namespace != '' && format('{0}-tvbox-u2-build-evidence-{1}-{2}', inputs.canary_namespace, inputs.release_sha, github.run_attempt) || format('tvbox-u2-build-evidence-{0}-{1}', inputs.release_sha, github.run_attempt) }}
           path: build/evidence
           if-no-files-found: error
           compression-level: 0
@@ -181,13 +246,21 @@ jobs:
 
       - id: outputs
         name: Publish unsigned artifact outputs
+        env:
+          CANARY_NAMESPACE: ${{ inputs.canary_namespace }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          artifact_name="tvbox-u2-build-evidence-${{ inputs.release_sha }}-${{ github.run_attempt }}"
+          artifact_name="tvbox-u2-build-evidence-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          if [[ -n "$CANARY_NAMESPACE" ]]; then
+            artifact_name="${CANARY_NAMESPACE}-${artifact_name}"
+          fi
           echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 
   build_repro:
     name: Build independent reproducibility APK
+    needs: validate_canary_namespace
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -248,7 +321,7 @@ jobs:
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: tvbox-u2-repro-build-evidence-${{ inputs.release_sha }}-${{ github.run_attempt }}
+          name: ${{ inputs.canary_namespace != '' && format('{0}-tvbox-u2-repro-build-evidence-{1}-{2}', inputs.canary_namespace, inputs.release_sha, github.run_attempt) || format('tvbox-u2-repro-build-evidence-{0}-{1}', inputs.release_sha, github.run_attempt) }}
           path: build/evidence
           if-no-files-found: error
           compression-level: 0
@@ -257,9 +330,16 @@ jobs:
 
       - id: outputs
         name: Publish reproducibility artifact outputs
+        env:
+          CANARY_NAMESPACE: ${{ inputs.canary_namespace }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          artifact_name="tvbox-u2-repro-build-evidence-${{ inputs.release_sha }}-${{ github.run_attempt }}"
+          artifact_name="tvbox-u2-repro-build-evidence-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          if [[ -n "$CANARY_NAMESPACE" ]]; then
+            artifact_name="${CANARY_NAMESPACE}-${artifact_name}"
+          fi
           echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 
   compare_reproducibility:
@@ -375,12 +455,27 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: tvbox-u2-repro-comparison-${{ inputs.release_sha }}-${{ github.run_attempt }}
+          name: ${{ inputs.canary_namespace != '' && format('{0}-tvbox-u2-repro-comparison-{1}-{2}', inputs.canary_namespace, inputs.release_sha, github.run_attempt) || format('tvbox-u2-repro-comparison-{0}-{1}', inputs.release_sha, github.run_attempt) }}
           path: ${{ runner.temp }}/repro-comparison/reproducibility-report.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 90
           overwrite: false
+
+      - id: outputs
+        name: Publish comparison artifact outputs
+        if: always()
+        env:
+          CANARY_NAMESPACE: ${{ inputs.canary_namespace }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          artifact_name="tvbox-u2-repro-comparison-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          if [[ -n "$CANARY_NAMESPACE" ]]; then
+            artifact_name="${CANARY_NAMESPACE}-${artifact_name}"
+          fi
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 
   prepare_sign_input:
     name: Prepare sanitized sign input without secrets
@@ -468,7 +563,7 @@ jobs:
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: tvbox-u2-sign-input-${{ inputs.release_sha }}-${{ github.run_attempt }}
+          name: ${{ inputs.canary_namespace != '' && format('{0}-tvbox-u2-sign-input-{1}-{2}', inputs.canary_namespace, inputs.release_sha, github.run_attempt) || format('tvbox-u2-sign-input-{0}-{1}', inputs.release_sha, github.run_attempt) }}
           path: ${{ runner.temp }}/sign-input
           if-no-files-found: error
           compression-level: 0
@@ -477,9 +572,16 @@ jobs:
 
       - id: outputs
         name: Publish sign input artifact outputs
+        env:
+          CANARY_NAMESPACE: ${{ inputs.canary_namespace }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          artifact_name="tvbox-u2-sign-input-${{ inputs.release_sha }}-${{ github.run_attempt }}"
+          artifact_name="tvbox-u2-sign-input-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          if [[ -n "$CANARY_NAMESPACE" ]]; then
+            artifact_name="${CANARY_NAMESPACE}-${artifact_name}"
+          fi
           echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 
   sign_exact:
@@ -497,6 +599,9 @@ jobs:
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
     env:
       EXPECTED_SIGNER_SHA256: ${{ vars.TVBOX_SIGNER_SHA256 }}
+      CANARY_NAMESPACE: ${{ inputs.canary_namespace }}
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
       EXPECTED_PRIMARY_ARTIFACT_ID: ${{ needs.prepare_sign_input.outputs.primary_artifact_id }}
       EXPECTED_PRIMARY_ARTIFACT_DIGEST: ${{ needs.prepare_sign_input.outputs.primary_artifact_digest }}
       EXPECTED_REPRO_ARTIFACT_ID: ${{ needs.prepare_sign_input.outputs.repro_artifact_id }}
@@ -598,7 +703,11 @@ jobs:
             --arg run_id "$GITHUB_RUN_ID" \
             --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
             '{schema:$schema, unsigned_sha256:$unsigned_sha256, signed_sha256:$signed_sha256, signer_sha256:$signer_sha256, signer_java_version:$signer_java_version, signer_job:$signer_job, run_id:$run_id, run_attempt:$run_attempt}' > "$RUNNER_TEMP/signed-output/signer-result.json"
-          echo "artifact_name=tvbox-u2-signed-output-${{ inputs.release_sha }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+           artifact_name="tvbox-u2-signed-output-${RELEASE_SHA}-${RUN_ATTEMPT}"
+           if [[ -n "$CANARY_NAMESPACE" ]]; then
+             artifact_name="${CANARY_NAMESPACE}-${artifact_name}"
+           fi
+           echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 
       - name: Remove all signing material before upload
         if: always()
@@ -611,7 +720,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: tvbox-u2-signed-output-${{ inputs.release_sha }}-${{ github.run_attempt }}
+          name: ${{ inputs.canary_namespace != '' && format('{0}-tvbox-u2-signed-output-{1}-{2}', inputs.canary_namespace, inputs.release_sha, github.run_attempt) || format('tvbox-u2-signed-output-{0}-{1}', inputs.release_sha, github.run_attempt) }}
           path: ${{ runner.temp }}/signed-output
           if-no-files-found: error
           compression-level: 0
@@ -620,7 +729,17 @@ jobs:
 
       - id: outputs
         if: success()
-        run: echo "artifact_name=tvbox-u2-signed-output-${{ inputs.release_sha }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+        env:
+          CANARY_NAMESPACE: ${{ inputs.canary_namespace }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          artifact_name="tvbox-u2-signed-output-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          if [[ -n "$CANARY_NAMESPACE" ]]; then
+            artifact_name="${CANARY_NAMESPACE}-${artifact_name}"
+          fi
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 
   verify_signed:
     name: Independently verify signed APK without OIDC
@@ -644,8 +763,12 @@ jobs:
       signed_artifact_id: ${{ steps.verify.outputs.signed_artifact_id }}
       signed_artifact_digest: ${{ steps.verify.outputs.signed_artifact_digest }}
       attest_input_artifact_id: ${{ steps.upload_attest_input.outputs.artifact-id }}
+      attest_input_artifact_name: ${{ steps.outputs.outputs.artifact_name }}
     env:
       EXPECTED_SIGNER_SHA256: ${{ vars.TVBOX_SIGNER_SHA256 }}
+      CANARY_NAMESPACE: ${{ inputs.canary_namespace }}
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
       BUILD_EVIDENCE_ARTIFACT_ID: ${{ needs.build_unsigned.outputs.artifact_id }}
       SIGNED_OUTPUT_ARTIFACT_ID: ${{ needs.sign_exact.outputs.artifact_id }}
       COMPARISON_REPORT_ARTIFACT_ID: ${{ needs.compare_reproducibility.outputs.report_artifact_id }}
@@ -809,9 +932,27 @@ jobs:
              "$RUNNER_TEMP/apk-equivalence.json" >/dev/null
            signer_java_version=$(jq -r '.signer_java_version' "$signer_result")
            [[ "$signer_java_version" == *"17.0.20"* ]] || { echo "::error::signer JDK identity mismatch"; exit 1; }
-           verifier_image_os="${ImageOS:-unknown}"
-           verifier_image_version="${ImageVersion:-unknown}"
-            mkdir -p "$RUNNER_TEMP/attest-input"
+            verifier_image_os="${ImageOS:-unknown}"
+            verifier_image_version="${ImageVersion:-unknown}"
+            normalize_artifact_digest() {
+              local digest="$1"
+              if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                printf '%s\n' "$digest"
+                return 0
+              fi
+              if [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+                printf 'sha256:%s\n' "$digest"
+                return 0
+              fi
+              echo "::error::signed artifact digest is not a normalized SHA-256 value" >&2
+              return 1
+            }
+            signed_artifact_digest_normalized=$(normalize_artifact_digest "$EXPECTED_SIGNED_OUTPUT_ARTIFACT_DIGEST")
+            signed_artifact_name="tvbox-u2-signed-output-${RELEASE_SHA}-${GITHUB_RUN_ATTEMPT}"
+            if [[ -n "$CANARY_NAMESPACE" ]]; then
+              signed_artifact_name="${CANARY_NAMESPACE}-${signed_artifact_name}"
+            fi
+             mkdir -p "$RUNNER_TEMP/attest-input"
            cp -- "$signed" "$RUNNER_TEMP/attest-input/signed.apk"
            jq -n \
              --argjson builder "$(cat "$builder_identity")" \
@@ -830,13 +971,18 @@ jobs:
               --arg reproducibility_report_artifact_id "$COMPARISON_REPORT_ARTIFACT_ID" \
               --arg reproducibility_report_artifact_digest "$EXPECTED_COMPARISON_REPORT_ARTIFACT_DIGEST" \
               --arg signed_artifact_id "$SIGNED_OUTPUT_ARTIFACT_ID" \
-              --arg signed_artifact_digest "$EXPECTED_SIGNED_OUTPUT_ARTIFACT_DIGEST" \
-              --arg primary_artifact_id "$EXPECTED_PRIMARY_ARTIFACT_ID" \
-              --arg repro_artifact_id "$EXPECTED_REPRO_ARTIFACT_ID" \
-              --arg reproducibility_status "$(jq -r '.status' "$comparison")" \
-              --argjson runner_image_drift "$(jq -r '.runner_image_drift' "$comparison")" \
-              '$builder + {schema:"tvbox-release-identity-v2", unsigned_sha256:$unsigned, signed_sha256:$signed, signer_sha256:$signer, signer_java_version:$signer_java, verifier_image_os:$verifier_image_os, verifier_image_version:$verifier_image_version, verifier_workflow_source_sha:$workflow_source, run_id:$run, run_attempt:$attempt, primary_artifact_id:$primary_artifact_id, primary_artifact_digest:$primary_artifact_digest, repro_artifact_id:$repro_artifact_id, repro_artifact_digest:$repro_artifact_digest, reproducibility_report_artifact_id:$reproducibility_report_artifact_id, reproducibility_report_artifact_digest:$reproducibility_report_artifact_digest, reproducibility_report_sha256:$comparison_report_sha256, signed_artifact_id:$signed_artifact_id, signed_artifact_digest:$signed_artifact_digest, reproducibility_status:$reproducibility_status, runner_image_drift:$runner_image_drift}' \
-              > "$RUNNER_TEMP/attest-input/release-identity-predicate.json"
+               --arg signed_artifact_digest "$EXPECTED_SIGNED_OUTPUT_ARTIFACT_DIGEST" \
+               --arg primary_artifact_id "$EXPECTED_PRIMARY_ARTIFACT_ID" \
+               --arg repro_artifact_id "$EXPECTED_REPRO_ARTIFACT_ID" \
+               --arg canary_namespace "$CANARY_NAMESPACE" \
+               --arg canary_release_sha "$RELEASE_SHA" \
+               --arg canary_source_sha "$SOURCE_SHA" \
+               --arg canary_signed_artifact_name "$signed_artifact_name" \
+               --arg canary_signed_artifact_digest "$signed_artifact_digest_normalized" \
+               --arg reproducibility_status "$(jq -r '.status' "$comparison")" \
+               --argjson runner_image_drift "$(jq -r '.runner_image_drift' "$comparison")" \
+               '$builder + {schema:"tvbox-release-identity-v2", unsigned_sha256:$unsigned, signed_sha256:$signed, signer_sha256:$signer, signer_java_version:$signer_java, verifier_image_os:$verifier_image_os, verifier_image_version:$verifier_image_version, verifier_workflow_source_sha:$workflow_source, run_id:$run, run_attempt:$attempt, primary_artifact_id:$primary_artifact_id, primary_artifact_digest:$primary_artifact_digest, repro_artifact_id:$repro_artifact_id, repro_artifact_digest:$repro_artifact_digest, reproducibility_report_artifact_id:$reproducibility_report_artifact_id, reproducibility_report_artifact_digest:$reproducibility_report_artifact_digest, reproducibility_report_sha256:$comparison_report_sha256, signed_artifact_id:$signed_artifact_id, signed_artifact_digest:$signed_artifact_digest, reproducibility_status:$reproducibility_status, runner_image_drift:$runner_image_drift} + (if $canary_namespace == "" then {} else {canary_namespace:$canary_namespace, canary_release_sha:$canary_release_sha, canary_source_sha:$canary_source_sha, canary_signed_artifact_name:$canary_signed_artifact_name, canary_signed_artifact_digest:$canary_signed_artifact_digest, canary_run_id:$run, canary_run_attempt:$attempt} end)' \
+               > "$RUNNER_TEMP/attest-input/release-identity-predicate.json"
            test "$(find "$RUNNER_TEMP/attest-input" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 2 || {
              echo "::error::attest input must contain exactly 2 files"; exit 1;
            }
@@ -857,11 +1003,25 @@ jobs:
         id: upload_attest_input
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: tvbox-u2-attest-input-${{ inputs.release_sha }}-${{ github.run_attempt }}
+          name: ${{ inputs.canary_namespace != '' && format('{0}-tvbox-u2-attest-input-{1}-{2}', inputs.canary_namespace, inputs.release_sha, github.run_attempt) || format('tvbox-u2-attest-input-{0}-{1}', inputs.release_sha, github.run_attempt) }}
           path: ${{ runner.temp }}/attest-input
           if-no-files-found: error
           retention-days: 90
           overwrite: false
+
+      - id: outputs
+        name: Publish attest input artifact outputs
+        env:
+          CANARY_NAMESPACE: ${{ inputs.canary_namespace }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          artifact_name="tvbox-u2-attest-input-${RELEASE_SHA}-${RUN_ATTEMPT}"
+          if [[ -n "$CANARY_NAMESPACE" ]]; then
+            artifact_name="${CANARY_NAMESPACE}-${artifact_name}"
+          fi
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
 
   attest_signed:
     name: Attest verified signed APK with minimal OIDC
