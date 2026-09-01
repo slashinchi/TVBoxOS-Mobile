@@ -353,6 +353,7 @@ def canonical_release_baseline(releases, update_version=None, delivery_hold=Fals
             raise ValueError("verified release tag/version mismatch")
         if (
             isinstance(release["versionCode"], bool)
+            or not isinstance(release["versionCode"], int)
             or int(release["versionCode"]) <= 0
             or not HEX64_RE.fullmatch(release["assetSha256"])
             or not HEX64_RE.fullmatch(release["signerSha256"])
@@ -360,7 +361,7 @@ def canonical_release_baseline(releases, update_version=None, delivery_hold=Fals
             raise ValueError("verified release version or digest is invalid")
         if release.get("verified") is not True or release.get("tag_ancestor") is not True:
             raise ValueError("verified release flags must be true")
-        release_version_code = int(release["versionCode"])
+        release_version_code = release["versionCode"]
         if previous_version is not None and (
             release_version <= previous_version
             or release_version_code <= previous_version_code

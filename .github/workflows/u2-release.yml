@@ -698,8 +698,85 @@ jobs:
           # any mutation; a public mutable Release must never be created.
           imm=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/immutable-releases" --jq '.enabled' 2>/dev/null || echo "")
           [[ "$imm" == "true" ]] || { echo "::error::repository immutable releases are not enabled"; exit 1; }
-          echo "::notice::release identity revalidated (release=$RELEASE_SHA version=$EXPECTED_VERSION apk=$EXPECTED_APK signer=$SIGNER_SHA debt=$EXPECTED_DEBT recomputed=$recomputed_debt)"
-          echo "::notice::default branch patched + release-production environment confirmed (immutable releases enforced per-Release post-publish)"
+           echo "::notice::release identity revalidated (release=$RELEASE_SHA version=$EXPECTED_VERSION apk=$EXPECTED_APK signer=$SIGNER_SHA debt=$EXPECTED_DEBT recomputed=$recomputed_debt)"
+           echo "::notice::default branch patched + release-production environment confirmed (immutable releases enforced per-Release post-publish)"
+
+      - name: Preflight verified release metadata
+        env:
+          RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
+          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
+          EXPECTED_VERSION_CODE: ${{ needs.prep.outputs.expected_version_code }}
+          EXPECTED_DEBT: ${{ steps.identity.outputs.EXPECTED_DEBT }}
+          EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
+          SIGNER_SHA: ${{ steps.identity.outputs.SIGNER_SHA }}
+          SOURCE_SHA: ${{ needs.rc_summary.outputs.SOURCE_SHA }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
+          tag="v${EXPECTED_VERSION}"
+          candidate_update="$RUNNER_TEMP/u2-preflight-candidate-update.json"
+          python3 scripts/u2_publish.py build-update-json \
+            --version "$EXPECTED_VERSION" \
+            --apk-url "https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/${tag}/TVBox-Mobile-v${EXPECTED_VERSION}.apk" \
+            --output "$candidate_update" >/dev/null
+          update_digest=$(sha256sum "$candidate_update" | awk '{print $1}')
+          entry_file="$RUNNER_TEMP/u2-preflight-entry.json"
+          python3 - "$tag" "$RELEASE_SHA" "$EXPECTED_VERSION" "$EXPECTED_VERSION_CODE" \
+            "$EXPECTED_APK" "$update_digest" "$SIGNER_SHA" "$SOURCE_SHA" \
+            "$EXPECTED_DEBT" "$RUN_ID" "$RUN_ATTEMPT" > "$entry_file" <<'PY'
+          import json
+          import sys
+
+          from scripts.u2_publish import verified_release_entry
+
+          entry = verified_release_entry(
+              tag=sys.argv[1],
+              target=sys.argv[2],
+              version_name=sys.argv[3],
+              version_code=sys.argv[4],
+              asset_sha256=sys.argv[5],
+              update_sha256=sys.argv[6],
+              signer_sha256=sys.argv[7],
+              source_sha=sys.argv[8],
+              debt=sys.argv[9],
+              run_id=sys.argv[10],
+              run_attempt=sys.argv[11],
+          )
+          print(json.dumps(entry, sort_keys=True))
+          PY
+
+          # Read both blobs without changing the repository. The branch SHA
+          # guards the two API reads against a moving patched ref.
+          remote_head_before=$(git ls-remote origin refs/heads/patched | awk 'NF {print $1}')
+          [[ "$remote_head_before" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::cannot read patched SHA before metadata preflight"; exit 1; }
+          current_update="$RUNNER_TEMP/u2-preflight-current-update.json"
+          current_update_b64=$(GH_TOKEN="$TOKEN" gh api \
+            "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
+            --jq '.content' 2>/dev/null) || { echo "::error::current update.json preflight read failed"; exit 1; }
+          [[ -n "$current_update_b64" ]] || { echo "::error::current update.json preflight content is empty"; exit 1; }
+          printf '%s' "$current_update_b64" | base64 -d > "$current_update" || { echo "::error::current update.json preflight decode failed"; exit 1; }
+          current_ledger="$RUNNER_TEMP/u2-preflight-current-ledger.json"
+          current_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
+            "repos/slashinchi/TVBoxOS-Mobile/contents/gradle/verified-releases.json?ref=patched" \
+            --jq '.content' 2>/dev/null) || { echo "::error::current verified-release ledger preflight read failed"; exit 1; }
+          [[ -n "$current_ledger_b64" ]] || { echo "::error::current verified-release ledger preflight content is empty"; exit 1; }
+          printf '%s' "$current_ledger_b64" | base64 -d > "$current_ledger" || { echo "::error::current verified-release ledger preflight decode failed"; exit 1; }
+          remote_head_after=$(git ls-remote origin refs/heads/patched | awk 'NF {print $1}')
+          [[ "$remote_head_after" == "$remote_head_before" ]] || { echo "::error::patched moved during read-only metadata preflight"; exit 1; }
+
+          preflight_ledger="$RUNNER_TEMP/u2-preflight-reconciled-ledger.json"
+          preflight=$(python3 scripts/u2_publish.py reconcile-verified-release-metadata \
+            --current-update "$current_update" \
+            --current-ledger "$current_ledger" \
+            --candidate-update "$candidate_update" \
+            --entry "$entry_file" \
+            --output "$preflight_ledger") || { echo "::error::strict two-file metadata preflight failed; no Release or tag mutation allowed"; exit 1; }
+          action=$(jq -er '.action' <<<"$preflight") || { echo "::error::metadata preflight returned no action"; exit 1; }
+          [[ "$action" == "append" || "$action" == "exact-reuse" ]] || { echo "::error::unexpected metadata preflight action: $action"; exit 1; }
+          echo "::notice::read-only verified release metadata preflight passed (action=$action, patched=$remote_head_before); formal Release/tag mutations may proceed"
 
       - name: Promote patched to exact release SHA (CAS)
         env:
@@ -849,83 +926,6 @@ jobs:
           [[ "$package_name" == "com.github.tvbox.osc" ]] || { echo "::error::publish APK package mismatch: $package_name"; exit 1; }
           [[ "$apk_name" == "$EXPECTED_VERSION" ]] || { echo "::error::publish APK versionName mismatch: $apk_name != $EXPECTED_VERSION"; exit 1; }
           echo "::notice::APK identity independently verified (signer=$signer_sha package=$package_name versionName=$apk_name)"
-
-      - name: Preflight verified release metadata
-        env:
-          RELEASE_SHA: ${{ steps.identity.outputs.RELEASE_SHA }}
-          EXPECTED_VERSION: ${{ steps.identity.outputs.EXPECTED_VERSION }}
-          EXPECTED_VERSION_CODE: ${{ needs.prep.outputs.expected_version_code }}
-          EXPECTED_DEBT: ${{ steps.identity.outputs.EXPECTED_DEBT }}
-          EXPECTED_APK: ${{ steps.identity.outputs.EXPECTED_APK }}
-          SIGNER_SHA: ${{ steps.identity.outputs.SIGNER_SHA }}
-          SOURCE_SHA: ${{ needs.rc_summary.outputs.SOURCE_SHA }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          [[ -n "$TOKEN" ]] || { echo "::error::release token missing"; exit 1; }
-          tag="v${EXPECTED_VERSION}"
-          candidate_update="$RUNNER_TEMP/u2-preflight-candidate-update.json"
-          python3 scripts/u2_publish.py build-update-json \
-            --version "$EXPECTED_VERSION" \
-            --apk-url "https://gh.xxooo.cf/https://github.com/slashinchi/TVBoxOS-Mobile/releases/download/${tag}/TVBox-Mobile-v${EXPECTED_VERSION}.apk" \
-            --output "$candidate_update" >/dev/null
-          update_digest=$(sha256sum "$candidate_update" | awk '{print $1}')
-          entry_file="$RUNNER_TEMP/u2-preflight-entry.json"
-          python3 - "$tag" "$RELEASE_SHA" "$EXPECTED_VERSION" "$EXPECTED_VERSION_CODE" \
-            "$EXPECTED_APK" "$update_digest" "$SIGNER_SHA" "$SOURCE_SHA" \
-            "$EXPECTED_DEBT" "$RUN_ID" "$RUN_ATTEMPT" > "$entry_file" <<'PY'
-          import json
-          import sys
-
-          from scripts.u2_publish import verified_release_entry
-
-          entry = verified_release_entry(
-              tag=sys.argv[1],
-              target=sys.argv[2],
-              version_name=sys.argv[3],
-              version_code=sys.argv[4],
-              asset_sha256=sys.argv[5],
-              update_sha256=sys.argv[6],
-              signer_sha256=sys.argv[7],
-              source_sha=sys.argv[8],
-              debt=sys.argv[9],
-              run_id=sys.argv[10],
-              run_attempt=sys.argv[11],
-          )
-          print(json.dumps(entry, sort_keys=True))
-          PY
-
-          # Read both blobs without changing the repository. The branch SHA
-          # guards the two API reads against a moving patched ref.
-          remote_head_before=$(git ls-remote origin refs/heads/patched | awk 'NF {print $1}')
-          [[ "$remote_head_before" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::cannot read patched SHA before metadata preflight"; exit 1; }
-          current_update="$RUNNER_TEMP/u2-preflight-current-update.json"
-          current_update_b64=$(GH_TOKEN="$TOKEN" gh api \
-            "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
-            --jq '.content' 2>/dev/null) || { echo "::error::current update.json preflight read failed"; exit 1; }
-          [[ -n "$current_update_b64" ]] || { echo "::error::current update.json preflight content is empty"; exit 1; }
-          printf '%s' "$current_update_b64" | base64 -d > "$current_update" || { echo "::error::current update.json preflight decode failed"; exit 1; }
-          current_ledger="$RUNNER_TEMP/u2-preflight-current-ledger.json"
-          current_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
-            "repos/slashinchi/TVBoxOS-Mobile/contents/gradle/verified-releases.json?ref=patched" \
-            --jq '.content' 2>/dev/null) || { echo "::error::current verified-release ledger preflight read failed"; exit 1; }
-          [[ -n "$current_ledger_b64" ]] || { echo "::error::current verified-release ledger preflight content is empty"; exit 1; }
-          printf '%s' "$current_ledger_b64" | base64 -d > "$current_ledger" || { echo "::error::current verified-release ledger preflight decode failed"; exit 1; }
-          remote_head_after=$(git ls-remote origin refs/heads/patched | awk 'NF {print $1}')
-          [[ "$remote_head_after" == "$remote_head_before" ]] || { echo "::error::patched moved during read-only metadata preflight"; exit 1; }
-
-          preflight_ledger="$RUNNER_TEMP/u2-preflight-reconciled-ledger.json"
-          preflight=$(python3 scripts/u2_publish.py reconcile-verified-release-metadata \
-            --current-update "$current_update" \
-            --current-ledger "$current_ledger" \
-            --candidate-update "$candidate_update" \
-            --entry "$entry_file" \
-            --output "$preflight_ledger") || { echo "::error::strict two-file metadata preflight failed; no Release or tag mutation allowed"; exit 1; }
-          action=$(jq -er '.action' <<<"$preflight") || { echo "::error::metadata preflight returned no action"; exit 1; }
-          [[ "$action" == "append" || "$action" == "exact-reuse" ]] || { echo "::error::unexpected metadata preflight action: $action"; exit 1; }
-          echo "::notice::read-only verified release metadata preflight passed (action=$action, patched=$remote_head_before); formal Release/tag mutations may proceed"
 
       - name: Create or reconcile draft Release with exact identity
         id: release

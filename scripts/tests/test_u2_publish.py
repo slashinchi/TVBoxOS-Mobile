@@ -556,6 +556,25 @@ class U2PublishContractTests(unittest.TestCase):
                 entry,
             )
 
+        current_update_digest = hashlib.sha256(current_update).hexdigest()
+        complete_current_ledger = dict(
+            _verified_entry(),
+            tag="v2.1.26.1",
+            versionName="2.1.26.1",
+            versionCode=23601,
+            target="3" * 40,
+            sourceSha="4" * 40,
+            updateSha256=current_update_digest,
+        )
+        drifted_current_update = current_update.replace(b"current.apk", b"drifted.apk")
+        with self.assertRaises(ValueError):
+            u2_publish_module.reconcile_verified_release_metadata(
+                drifted_current_update,
+                json.dumps([complete_current_ledger]).encode(),
+                candidate_update,
+                entry,
+            )
+
         duplicate_ledger = b'[{"tag":"v2.1.26.1","tag":"v2.1.26.1"}]'
         with self.assertRaises(ValueError):
             u2_publish_module.reconcile_verified_release_metadata(
@@ -611,6 +630,7 @@ class U2PublishContractTests(unittest.TestCase):
             )["action"],
             "fail",
         )
+
         self.assertEqual(
             u2_publish_module.classify_metadata_push(
                 1, rejected, sha_a, sha_a, sha_b, 3, 3
@@ -623,6 +643,13 @@ class U2PublishContractTests(unittest.TestCase):
                 1, actual_git_rejected, sha_a, sha_a, sha_b, 1, 3
             )["action"],
             "retry",
+        )
+        fast_forward = " \tHEAD:refs/heads/patched\t" + sha_a + ".." + sha_b
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                0, fast_forward, sha_a, sha_a, sha_b, 1, 3
+            )["action"],
+            "success",
         )
         fetch_first = "!\tHEAD:refs/heads/patched\t[rejected] (fetch first)"
         self.assertEqual(
@@ -646,6 +673,30 @@ class U2PublishContractTests(unittest.TestCase):
         self.assertEqual(
             u2_publish_module.classify_metadata_push(
                 1,
+                rejected + "\nremote: server hook failure",
+                sha_a,
+                sha_a,
+                sha_b,
+                1,
+                3,
+            )["action"],
+            "fail",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                1,
+                rejected + "\n!\tHEAD:refs/heads/main\t[rejected] (fetch first)",
+                sha_a,
+                sha_a,
+                sha_b,
+                1,
+                3,
+            )["action"],
+            "fail",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                1,
                 "!\tHEAD:refs/heads/main\t[rejected] (fetch first)",
                 sha_a,
                 sha_a,
@@ -657,10 +708,123 @@ class U2PublishContractTests(unittest.TestCase):
         )
         self.assertEqual(
             u2_publish_module.classify_metadata_push(
+                1,
+                rejected,
+                sha_a,
+                sha_a,
+                sha_a,
+                1,
+                3,
+            )["action"],
+            "fail",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                1,
+                rejected + "\nunknown: output line",
+                sha_a,
+                sha_a,
+                sha_b,
+                1,
+                3,
+            )["action"],
+            "fail",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                1,
+                rejected + "\nhint: unexpected diagnostic",
+                sha_a,
+                sha_a,
+                sha_b,
+                1,
+                3,
+            )["action"],
+            "fail",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
+                0,
+                accepted + "\n!\tHEAD:refs/heads/patched\t[remote rejected] (hook declined)",
+                sha_a,
+                sha_a,
+                sha_a,
+                1,
+                3,
+            )["action"],
+            "fail",
+        )
+        self.assertEqual(
+            u2_publish_module.classify_metadata_push(
                 1, "fatal: authentication failed", sha_a, sha_a, sha_a, 1, 3
             )["action"],
             "fail",
         )
+
+    def test_metadata_push_classifier_accepts_real_git_nff_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            first = root / "first"
+            second = root / "second"
+
+            def run(*args):
+                return subprocess.run(args, check=True, text=True, capture_output=True)
+
+            run("git", "init", "--bare", str(remote))
+            run("git", "init", "-b", "patched", str(first))
+            run("git", "-C", str(first), "config", "user.name", "first")
+            run("git", "-C", str(first), "config", "user.email", "first@example.invalid")
+            (first / "file").write_text("base\n")
+            run("git", "-C", str(first), "add", "file")
+            run("git", "-C", str(first), "commit", "-m", "base")
+            run("git", "-C", str(first), "remote", "add", "origin", str(remote))
+            run("git", "-C", str(first), "push", "origin", "HEAD:refs/heads/patched")
+            run("git", "clone", "-b", "patched", str(remote), str(second))
+            run("git", "-C", str(second), "config", "user.name", "second")
+            run("git", "-C", str(second), "config", "user.email", "second@example.invalid")
+
+            (first / "file").write_text("base\nfirst\n")
+            run("git", "-C", str(first), "add", "file")
+            run("git", "-C", str(first), "commit", "-m", "first")
+            run("git", "-C", str(first), "push", "origin", "HEAD:refs/heads/patched")
+            (second / "file").write_text("base\nsecond\n")
+            run("git", "-C", str(second), "add", "file")
+            run("git", "-C", str(second), "commit", "-m", "second")
+            local_parent = subprocess.check_output(
+                ["git", "-C", str(second), "rev-parse", "HEAD^"], text=True
+            ).strip()
+            remote_before = subprocess.check_output(
+                ["git", "-C", str(first), "rev-parse", "HEAD"], text=True
+            ).strip()
+            failed_push = subprocess.run(
+                ["git", "-C", str(second), "push", "--porcelain", str(remote), "HEAD:refs/heads/patched"],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(failed_push.returncode, 0)
+
+            (first / "file").write_text("base\nfirst\nfirst-again\n")
+            run("git", "-C", str(first), "add", "file")
+            run("git", "-C", str(first), "commit", "-m", "first-again")
+            run("git", "-C", str(first), "push", "origin", "HEAD:refs/heads/patched")
+            remote_after = subprocess.check_output(
+                ["git", "-C", str(first), "rev-parse", "HEAD"], text=True
+            ).strip()
+            result = u2_publish_module.classify_metadata_push(
+                failed_push.returncode,
+                failed_push.stdout + failed_push.stderr,
+                local_parent,
+                remote_before,
+                remote_after,
+                1,
+                3,
+            )
+            self.assertEqual(
+                result["action"],
+                "retry",
+                f"{result}; {failed_push.stdout + failed_push.stderr!r}; status={failed_push.returncode}; before={remote_before}; after={remote_after}; parent={local_parent}",
+            )
 
     def test_release_read_classifier_allows_only_explicit_404_fallback(self):
         self.assertEqual(

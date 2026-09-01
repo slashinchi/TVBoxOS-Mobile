@@ -396,6 +396,10 @@ class U2ReleaseContractTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             canonical_release_baseline([newer, release])
+        for version_code in (23601.0, "23601", True):
+            with self.subTest(version_code=version_code):
+                with self.assertRaises(ValueError):
+                    canonical_release_baseline([dict(release, versionCode=version_code)])
 
     def test_delivery_hold_is_identity_bound_not_boolean(self):
         release = {
@@ -1406,12 +1410,14 @@ class U2ReleaseContractTests(unittest.TestCase):
         steps = tree["jobs"]["publish"]["steps"]
         names = [step.get("name", "") for step in steps]
         preflight_index = names.index("Preflight verified release metadata")
+        promote_index = names.index("Promote patched to exact release SHA (CAS)")
         mutation_indexes = [
             names.index("Create or reconcile draft Release with exact identity"),
             names.index("Attach missing assets only (no clobber)"),
             names.index("Publish verified draft"),
         ]
-        self.assertLess(preflight_index, min(mutation_indexes))
+        self.assertLess(preflight_index, promote_index)
+        self.assertLess(promote_index, min(mutation_indexes))
         preflight = str(steps[preflight_index])
         for token in (
             "update.json",

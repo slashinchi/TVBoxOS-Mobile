@@ -14,6 +14,18 @@ HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 INCIDENT_REASON_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 RUN_ID_RE = re.compile(r"^[1-9][0-9]*$")
+NFF_HINTS = {
+    "hint: Updates were rejected because the remote contains work that you do not",
+    "hint: have locally. This is usually caused by another repository pushing",
+    "hint: have locally. This is usually caused by another repository pushing to",
+    "hint: the same ref. You may want to first integrate the remote changes",
+    "hint: the same ref. If you want to integrate the remote changes use",
+    "hint: the same ref. If you want to integrate the remote changes, use",
+    "hint: (e.g., 'git pull ...') before pushing again.",
+    "hint: 'git pull ...') before pushing again.",
+    "hint: 'git pull' before pushing again.",
+    "hint: See the 'Note about fast-forwards' in 'git push --help' for details.",
+}
 
 
 def _reject_duplicate_object_keys(pairs):
@@ -290,6 +302,13 @@ def reconcile_verified_release_metadata(
     ledger = strict_json_loads(current_ledger_bytes)
     _validate_ledger(ledger)
     _validate_verified_release_entry(entry)
+    if not isinstance(current_update_bytes, (bytes, bytearray)) or not isinstance(
+        candidate_update_bytes, (bytes, bytearray)
+    ):
+        raise ValueError("metadata update blobs must be bytes")
+    if ledger and "updateSha256" in ledger[-1]:
+        if hashlib.sha256(current_update_bytes).hexdigest() != ledger[-1]["updateSha256"]:
+            raise ValueError("current update metadata digest does not match latest verified release")
     if candidate["version"] != entry["versionName"]:
         raise ValueError("candidate update version does not match verified release entry")
     if hashlib.sha256(candidate_update_bytes).hexdigest() != entry["updateSha256"]:
@@ -333,31 +352,80 @@ def classify_metadata_push(
     if attempt > max_attempts:
         raise ValueError("metadata CAS attempt exceeds maximum")
 
-    nff_rejected = False
-    for line in (porcelain_status or "").splitlines():
-        fields = line.split("\t", 2)
-        if (
-            len(fields) > 2
-            and fields[0] == "!"
-            and fields[1].split(":", 1)[-1] == "refs/heads/patched"
-            and fields[2].strip() in {
-                "[rejected] (non-fast-forward)",
-                "[rejected] (fetch first)",
-            }
-        ):
-            nff_rejected = True
-            break
-    if push_status == 0 and not nff_rejected:
-        return {"action": "success", "reason": "push-ok"}
+    rows = []
+    diagnostics = []
+    header_seen = False
+    done_seen = False
+    for raw_line in (porcelain_status or "").splitlines():
+        line = raw_line.rstrip("\r")
+        if not line:
+            continue
+        if line.startswith("To ") and len(line) > 3:
+            if header_seen:
+                return {"action": "fail", "reason": "duplicate-push-header"}
+            header_seen = True
+            continue
+        if line == "Done":
+            if done_seen:
+                return {"action": "fail", "reason": "duplicate-push-footer"}
+            done_seen = True
+            continue
+        if line.startswith("error: failed to push some refs to ") or line.startswith("hint: "):
+            diagnostics.append(line)
+            continue
+        fields = line.split("\t")
+        if len(fields) != 3 or len(fields[0]) != 1 or ":" not in fields[1]:
+            return {"action": "fail", "reason": "unrecognized-push-output"}
+        source, destination = fields[1].split(":", 1)
+        if not source or not destination:
+            return {"action": "fail", "reason": "malformed-push-ref-status"}
+        rows.append((fields[0], destination, fields[2].strip()))
 
-    confirmed_nff = push_status != 0 and nff_rejected and (
-        remote_head_before != local_parent or remote_head_after != remote_head_before
+    if len(rows) != 1:
+        return {"action": "fail", "reason": "push-ref-status-not-unique"}
+    flag, destination, summary = rows[0]
+    if destination != "refs/heads/patched":
+        return {"action": "fail", "reason": "push-ref-status-target-mismatch"}
+
+    nff_rejected = flag == "!" and summary in {
+        "[rejected] (non-fast-forward)",
+        "[rejected] (fetch first)",
+    }
+    diagnostics_explainable = all(
+        line.startswith("error: failed to push some refs to ") or line in NFF_HINTS
+        for line in diagnostics
     )
-    if confirmed_nff:
+    confirmed_nff = (
+        push_status != 0
+        and nff_rejected
+        and remote_head_after != remote_head_before
+    )
+    if confirmed_nff and not diagnostics:
+        # A porcelain NFF row is sufficient; Git may omit stderr diagnostics.
         return {
             "action": "retry" if attempt < max_attempts else "retry-exhausted",
             "reason": "fresh-remote-head-changed",
         }
+    if confirmed_nff and diagnostics_explainable:
+        return {
+            "action": "retry" if attempt < max_attempts else "retry-exhausted",
+            "reason": "fresh-remote-head-changed",
+        }
+    if (
+        push_status == 0
+        and flag in {" ", "=", "*"}
+        and not diagnostics
+        and (
+            (flag == "=" and summary == "[up to date]")
+            or (flag == " " and re.fullmatch(r"[0-9a-f]{40}\.\.[0-9a-f]{40}", summary))
+            or (flag == "*" and summary == "[new branch]")
+        )
+    ):
+        return {"action": "success", "reason": "push-ok"}
+    if nff_rejected and not diagnostics_explainable:
+        return {"action": "fail", "reason": "unexplainable-push-diagnostic"}
+    if nff_rejected and remote_head_after == remote_head_before:
+        return {"action": "fail", "reason": "remote-head-unchanged"}
     return {"action": "fail", "reason": "push-failure-not-confirmed-nff"}
 
 
