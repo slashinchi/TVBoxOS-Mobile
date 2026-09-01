@@ -1475,6 +1475,24 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("persisted_verified_release_entry", metadata_text)
         self.assertIn("metadata_ledger", metadata_text)
 
+    def test_metadata_postpublish_readback_requires_stable_branch_snapshot_and_fresh_retry(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        metadata_step = next(
+            step for step in tree["jobs"]["publish"]["steps"]
+            if step.get("name") == "Reconcile verified release metadata with bounded normal CAS"
+        )
+        metadata_text = str(metadata_step)
+        for token in (
+            "readback_head_before",
+            "readback_head_after",
+            "patched moved during metadata readback",
+            "fresh fetch and remote read",
+            "continue",
+        ):
+            self.assertIn(token, metadata_text, token)
+        self.assertIn("if verify_remote_blobs", metadata_text)
+
     def test_release_and_tag_reads_allow_only_explicit_404_fallback(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
         tree = self._yaml_tree(workflow)

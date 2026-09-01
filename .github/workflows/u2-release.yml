@@ -1326,8 +1326,86 @@ jobs:
           PY
           git config user.name "TVBox U2 Publish"
           git config user.email "u2-publish@users.noreply.github.com"
+          remote_url="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           metadata_ledger="$RUNNER_TEMP/u2-reconciled-verified-releases.json"
-          for attempt in 1 2 3; do
+          metadata_cas_verified=false
+
+           verify_remote_blobs() {
+             local readback_head_before readback_head_after
+             local remote_after_update_b64 remote_after_ledger_b64
+             readback_head_before=$(git ls-remote "$remote_url" refs/heads/patched | awk 'NF {print $1}') || {
+               echo "::error::cannot read patched SHA before metadata readback"; return 1;
+             }
+             [[ "$readback_head_before" =~ ^[0-9a-f]{40}$ ]] || {
+               echo "::error::invalid patched SHA before metadata readback"; return 1;
+             }
+             remote_after_update_b64=$(GH_TOKEN="$TOKEN" gh api \
+               "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
+               --jq '.content' 2>/dev/null) || {
+               echo "::error::remote update.json readback failed"; return 1;
+             }
+             remote_after_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
+               "repos/slashinchi/TVBoxOS-Mobile/contents/gradle/verified-releases.json?ref=patched" \
+               --jq '.content' 2>/dev/null) || {
+               echo "::error::remote verified-release ledger readback failed"; return 1;
+             }
+             readback_head_after=$(git ls-remote "$remote_url" refs/heads/patched | awk 'NF {print $1}') || {
+               echo "::error::cannot read patched SHA after metadata readback"; return 1;
+             }
+             [[ "$readback_head_after" =~ ^[0-9a-f]{40}$ ]] || {
+               echo "::error::invalid patched SHA after metadata readback"; return 1;
+             }
+             if [[ "$readback_head_after" != "$readback_head_before" ]]; then
+               echo "::warning::patched moved during metadata readback; discard this round and rebuild from a fresh remote read"
+               return 2
+             fi
+             [[ -n "$remote_after_update_b64" && -n "$remote_after_ledger_b64" ]] || {
+               echo "::error::remote metadata readback returned empty content"; return 1;
+             }
+             printf '%s' "$remote_after_update_b64" | base64 -d > "$RUNNER_TEMP/u2-readback-update.json" || return 1
+             printf '%s' "$remote_after_ledger_b64" | base64 -d > "$RUNNER_TEMP/u2-readback-verified-releases.json" || return 1
+             persisted_entry_file="$RUNNER_TEMP/u2-persisted-release-entry.json"
+             python3 - "$entry_file" "$metadata_ledger" > "$persisted_entry_file" <<'PY'
+          import json
+          import sys
+
+          from scripts.u2_publish import persisted_verified_release_entry, strict_json_loads
+
+          expected = strict_json_loads(open(sys.argv[1], encoding="utf-8").read())
+          result = persisted_verified_release_entry(open(sys.argv[2], "rb").read(), expected)
+          if not result["verified"]:
+              raise SystemExit("persisted metadata ledger does not contain the exact release identity")
+          print(json.dumps(result["entry"], sort_keys=True))
+          PY
+             cmp -s "$candidate_update" "$RUNNER_TEMP/u2-readback-update.json" || {
+               echo "::error::remote update.json readback is not byte-exact"; return 1;
+             }
+             cmp -s "$metadata_ledger" "$RUNNER_TEMP/u2-readback-verified-releases.json" || {
+               echo "::error::remote verified-release ledger readback is not byte-exact"; return 1;
+             }
+             verified=$(python3 scripts/u2_publish.py verify-remote-metadata \
+               --metadata-file "$RUNNER_TEMP/u2-readback-update.json" \
+               --expected-version "$EXPECTED_VERSION" \
+               --expected-apk-url "$apk_url" | jq -r '.verified') || return 1
+             [[ "$verified" == "true" ]] || { echo "::error::remote update.json semantic readback failed"; return 1; }
+             verified=$(python3 - "$persisted_entry_file" "$RUNNER_TEMP/u2-readback-verified-releases.json" <<'PY'
+          import json
+          import sys
+
+          from scripts.u2_publish import verify_verified_releases, strict_json_loads
+
+          expected = strict_json_loads(open(sys.argv[1], encoding="utf-8").read())
+          actual = open(sys.argv[2], "rb").read()
+          print(json.dumps(verify_verified_releases(actual, expected), sort_keys=True))
+          PY
+             ) || return 1
+             [[ "$(jq -r '.verified' <<<"$verified")" == "true" ]] || {
+               echo "::error::remote verified-release ledger semantic readback failed: $verified"; return 1;
+             }
+             return 0
+           }
+
+           for attempt in 1 2 3; do
             echo "::notice::metadata CAS attempt ${attempt}/3: fresh fetch and remote read"
             git fetch --no-tags origin "+refs/heads/patched:refs/remotes/origin/patched"
             remote_head=$(git rev-parse refs/remotes/origin/patched)
@@ -1410,25 +1488,37 @@ jobs:
               echo "::error::unexpected verified-release ledger action: $action"; exit 1;
             }
 
-            cp "$candidate_update" update.json
-            cp "$metadata_ledger" gradle/verified-releases.json
-            if cmp -s update.json "$remote_update" && cmp -s gradle/verified-releases.json "$remote_ledger"; then
-              echo "::notice::both remote metadata files are already identical and contain exact verified identity; no commit needed"
-              break
-            fi
-            git add update.json gradle/verified-releases.json
-            git commit -m "chore: reconcile verified release metadata v${EXPECTED_VERSION}"
-            local_parent=$(git rev-parse HEAD^)
-            remote_url="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-            remote_head_before=$(git ls-remote "$remote_url" refs/heads/patched | awk 'NF {print $1}')
+             cp "$candidate_update" update.json
+             cp "$metadata_ledger" gradle/verified-releases.json
+             if cmp -s update.json "$remote_update" && cmp -s gradle/verified-releases.json "$remote_ledger"; then
+               echo "::notice::both remote metadata files are already identical and contain exact verified identity; no commit needed"
+               if verify_remote_blobs; then
+                 metadata_cas_verified=true
+                 break
+               else
+                 verify_status=$?
+                 if [[ "$verify_status" -eq 2 ]]; then
+                   echo "::notice::metadata readback was unstable; continuing with a fresh fetch and remote read"
+                   continue
+                 fi
+                 echo "::error::metadata readback failed closed (status=$verify_status)"; exit 1
+               fi
+             fi
+             git add update.json gradle/verified-releases.json
+             git commit -m "chore: reconcile verified release metadata v${EXPECTED_VERSION}"
+             local_parent=$(git rev-parse HEAD^)
+             remote_head_before=$(git ls-remote "$remote_url" refs/heads/patched | awk 'NF {print $1}')
             [[ "$remote_head_before" =~ ^[0-9a-f]{40}$ ]] || {
               echo "::error::cannot read remote patched SHA before metadata push"; exit 1;
             }
-            push_log="$RUNNER_TEMP/u2-metadata-push.log"
-            set +e
-            git push --porcelain "$remote_url" HEAD:refs/heads/patched > "$push_log" 2>&1
-            push_status=$?
-            set -e
+             push_log="$RUNNER_TEMP/u2-metadata-push.log"
+             push_porcelain="$RUNNER_TEMP/u2-metadata-push-porcelain.log"
+             push_diagnostics="$RUNNER_TEMP/u2-metadata-push-diagnostics.log"
+             set +e
+             git push --porcelain "$remote_url" HEAD:refs/heads/patched > "$push_porcelain" 2> "$push_diagnostics"
+             push_status=$?
+             set -e
+             cat "$push_porcelain" "$push_diagnostics" > "$push_log"
             remote_head_after=$(git ls-remote "$remote_url" refs/heads/patched | awk 'NF {print $1}')
             [[ "$remote_head_after" =~ ^[0-9a-f]{40}$ ]] || {
               echo "::error::cannot read remote patched SHA after metadata push"; exit 1;
@@ -1450,11 +1540,21 @@ jobs:
             push_action=$(jq -er '.action' <<<"$push_decision") || {
               echo "::error::metadata push classification returned no action"; exit 1;
             }
-            case "$push_action" in
-              success)
-                echo "::notice::metadata CAS push succeeded on attempt ${attempt}"
-                break
-                ;;
+             case "$push_action" in
+               success)
+                 if verify_remote_blobs; then
+                   metadata_cas_verified=true
+                   echo "::notice::metadata CAS push and stable remote readback succeeded on attempt ${attempt}"
+                   break
+                 else
+                   verify_status=$?
+                   if [[ "$verify_status" -eq 2 ]]; then
+                     echo "::notice::metadata readback was unstable; discarding this round for a fresh fetch and remote read"
+                     continue
+                   fi
+                   echo "::error::metadata readback failed closed (status=$verify_status)"; exit 1
+                 fi
+                 ;;
               retry)
                 echo "::notice::patched moved during publish; rebuilding update.json commit on remote HEAD with both metadata files after a fresh read (porcelain_nff=$push_is_non_fast_forward, remote_head_before=$remote_head_before, remote_head_after=$remote_head_after)"
                 continue
@@ -1468,65 +1568,10 @@ jobs:
             esac
           done
 
-          persisted_entry_file="$RUNNER_TEMP/u2-persisted-release-entry.json"
-          python3 - "$entry_file" "$metadata_ledger" > "$persisted_entry_file" <<'PY'
-          import json
-          import sys
-
-          from scripts.u2_publish import persisted_verified_release_entry, strict_json_loads
-
-          expected = strict_json_loads(open(sys.argv[1], encoding="utf-8").read())
-          result = persisted_verified_release_entry(open(sys.argv[2], "rb").read(), expected)
-          if not result["verified"]:
-              raise SystemExit("persisted metadata ledger does not contain the exact release identity")
-          print(json.dumps(result["entry"], sort_keys=True))
-          PY
-
-          verify_remote_blobs() {
-            local remote_after_update_b64 remote_after_ledger_b64
-            remote_after_update_b64=$(GH_TOKEN="$TOKEN" gh api \
-              "repos/slashinchi/TVBoxOS-Mobile/contents/update.json?ref=patched" \
-              --jq '.content' 2>/dev/null) || {
-              echo "::error::remote update.json readback failed"; return 1;
-            }
-            remote_after_ledger_b64=$(GH_TOKEN="$TOKEN" gh api \
-              "repos/slashinchi/TVBoxOS-Mobile/contents/gradle/verified-releases.json?ref=patched" \
-              --jq '.content' 2>/dev/null) || {
-              echo "::error::remote verified-release ledger readback failed"; return 1;
-            }
-            printf '%s' "$remote_after_update_b64" | base64 -d > "$RUNNER_TEMP/u2-readback-update.json" || return 1
-            printf '%s' "$remote_after_ledger_b64" | base64 -d > "$RUNNER_TEMP/u2-readback-verified-releases.json" || return 1
-            cmp -s "$candidate_update" "$RUNNER_TEMP/u2-readback-update.json" || {
-              echo "::error::remote update.json readback is not byte-exact"; return 1;
-            }
-            cmp -s "$metadata_ledger" "$RUNNER_TEMP/u2-readback-verified-releases.json" || {
-              echo "::error::remote verified-release ledger readback is not byte-exact"; return 1;
-            }
-            verified=$(python3 scripts/u2_publish.py verify-remote-metadata \
-              --metadata-file "$RUNNER_TEMP/u2-readback-update.json" \
-              --expected-version "$EXPECTED_VERSION" \
-              --expected-apk-url "$apk_url" | jq -r '.verified')
-            [[ "$verified" == "true" ]] || { echo "::error::remote update.json semantic readback failed"; return 1; }
-            verified=$(python3 - "$persisted_entry_file" "$RUNNER_TEMP/u2-readback-verified-releases.json" <<'PY'
-          import json
-          import sys
-
-          from scripts.u2_publish import verify_verified_releases
-
-          from scripts.u2_publish import strict_json_loads
-
-          expected = strict_json_loads(open(sys.argv[1], encoding="utf-8").read())
-          actual = open(sys.argv[2], "rb").read()
-          print(json.dumps(verify_verified_releases(actual, expected), sort_keys=True))
-          PY
-            )
-            [[ "$(jq -r '.verified' <<<"$verified")" == "true" ]] || {
-              echo "::error::remote verified-release ledger semantic readback failed: $verified"; return 1;
-            }
-            return 0
-          }
-          verify_remote_blobs
-          echo "::notice::update.json and verified-releases.json are remote byte-exact readback after bounded normal CAS"
+           [[ "$metadata_cas_verified" == "true" ]] || {
+             echo "::error::metadata CAS did not reach stable remote readback within 3 attempts"; exit 1;
+           }
+           echo "::notice::update.json and verified-releases.json are remote byte-exact readback after bounded normal CAS"
 
       - name: Clean up disposable prep ref and close satisfied incidents
         env:

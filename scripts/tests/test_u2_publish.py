@@ -610,8 +610,8 @@ class U2PublishContractTests(unittest.TestCase):
     def test_metadata_cas_harness_retries_only_on_fresh_porcelain_nff(self):
         sha_a = "a" * 40
         sha_b = "b" * 40
-        rejected = "!\trefs/heads/patched:refs/heads/patched\t[rejected] (non-fast-forward)"
-        accepted = "=\trefs/heads/patched:refs/heads/patched\t[up to date]"
+        rejected = "To origin\n!\trefs/heads/patched:refs/heads/patched\t[rejected] (non-fast-forward)\nDone"
+        accepted = "To origin\n=\trefs/heads/patched:refs/heads/patched\t[up to date]\nDone"
         self.assertEqual(
             u2_publish_module.classify_metadata_push(
                 0, accepted, sha_a, sha_a, sha_a, 1, 3
@@ -637,21 +637,21 @@ class U2PublishContractTests(unittest.TestCase):
             )["action"],
             "retry-exhausted",
         )
-        actual_git_rejected = "!\tHEAD:refs/heads/patched\t[rejected] (non-fast-forward)"
+        actual_git_rejected = "To origin\n!\tHEAD:refs/heads/patched\t[rejected] (non-fast-forward)\nDone"
         self.assertEqual(
             u2_publish_module.classify_metadata_push(
                 1, actual_git_rejected, sha_a, sha_a, sha_b, 1, 3
             )["action"],
             "retry",
         )
-        fast_forward = " \tHEAD:refs/heads/patched\t" + sha_a + ".." + sha_b
+        fast_forward = "To origin\n \tHEAD:refs/heads/patched\t" + sha_a + ".." + sha_b + "\nDone"
         self.assertEqual(
             u2_publish_module.classify_metadata_push(
                 0, fast_forward, sha_a, sha_a, sha_b, 1, 3
             )["action"],
             "success",
         )
-        fetch_first = "!\tHEAD:refs/heads/patched\t[rejected] (fetch first)"
+        fetch_first = "To origin\n!\tHEAD:refs/heads/patched\t[rejected] (fetch first)\nDone"
         self.assertEqual(
             u2_publish_module.classify_metadata_push(
                 1, fetch_first, sha_a, sha_a, sha_b, 1, 3
@@ -825,6 +825,95 @@ class U2PublishContractTests(unittest.TestCase):
                 "retry",
                 f"{result}; {failed_push.stdout + failed_push.stderr!r}; status={failed_push.returncode}; before={remote_before}; after={remote_after}; parent={local_parent}",
             )
+
+    def test_metadata_push_classifier_requires_strict_porcelain_order_and_diagnostics(self):
+        sha_a = "a" * 40
+        sha_b = "b" * 40
+        accepted = "=\tHEAD:refs/heads/patched\t[up to date]"
+        rejected = "!\tHEAD:refs/heads/patched\t[rejected] (non-fast-forward)"
+        valid_success = "To origin\n" + accepted + "\nDone"
+        valid_rejection = "To origin\n" + rejected + "\nDone"
+
+        malformed = (
+            "Done\n" + valid_success,
+            "To origin\nDone\n" + accepted,
+            accepted + "\nTo origin\nDone",
+            valid_success.removesuffix("\nDone"),
+            valid_rejection + "\nerror: failed to push some refs to 'origin' with extra text",
+            valid_rejection + "\nerror: failed to push some refs to 'other'",
+            valid_rejection + "\nhint: an unrecognized diagnostic",
+            valid_rejection + "\nremote: server hook failure",
+            valid_rejection + "\nfatal: authentication failed",
+            "To origin\n" + rejected + "\n" + accepted + "\nDone",
+            "To origin\n!\tHEAD:refs/heads/main\t[rejected] (non-fast-forward)\nDone",
+        )
+        for porcelain in malformed:
+            with self.subTest(porcelain=porcelain):
+                self.assertEqual(
+                    u2_publish_module.classify_metadata_push(
+                        1 if rejected in porcelain else 0,
+                        porcelain,
+                        sha_a,
+                        sha_a,
+                        sha_b,
+                        1,
+                        3,
+                    )["action"],
+                    "fail",
+                )
+
+    def test_production_legacy_ledger_can_append_complete_entry_and_bind_latest_update_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            current_update = tmp_path / "current-update.json"
+            current_ledger = tmp_path / "current-ledger.json"
+            candidate_update = tmp_path / "candidate-update.json"
+            entry_file = tmp_path / "entry.json"
+            output = tmp_path / "output.json"
+
+            current_update.write_bytes((ROOT / "update.json").read_bytes())
+            current_ledger.write_bytes((ROOT / "gradle/verified-releases.json").read_bytes())
+            candidate_url = "https://example.invalid/releases/v2.1.27.1/TVBox-Mobile-v2.1.27.1.apk"
+            candidate_bytes = (json.dumps(
+                build_update_json("2.1.27.1", candidate_url), sort_keys=True
+            ) + "\n").encode()
+            candidate_update.write_bytes(candidate_bytes)
+            entry = u2_publish_module.verified_release_entry(
+                tag="v2.1.27.1",
+                target="1" * 40,
+                version_name="2.1.27.1",
+                version_code=23701,
+                asset_sha256="2" * 64,
+                update_sha256=hashlib.sha256(candidate_bytes).hexdigest(),
+                signer_sha256="3" * 64,
+                source_sha="4" * 40,
+                debt="5" * 64,
+                run_id="123457",
+                run_attempt="1",
+            )
+            entry_file.write_text(json.dumps(entry, sort_keys=True) + "\n")
+
+            command = [
+                "python3", "scripts/u2_publish.py",
+                "reconcile-verified-release-metadata",
+                "--current-update", str(current_update),
+                "--current-ledger", str(current_ledger),
+                "--candidate-update", str(candidate_update),
+                "--entry", str(entry_file),
+                "--output", str(output),
+            ]
+            first = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(json.loads(first.stdout)["action"], "append")
+            appended = json.loads(output.read_text())
+            self.assertEqual(appended[0], json.loads(current_ledger.read_text())[0])
+            self.assertEqual(appended[-1], entry)
+
+            current_update.write_bytes(candidate_bytes + b"\n")
+            current_ledger.write_text(json.dumps(appended, sort_keys=True) + "\n")
+            drifted = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+            self.assertNotEqual(drifted.returncode, 0)
+            self.assertIn("current update metadata digest", drifted.stderr)
 
     def test_release_read_classifier_allows_only_explicit_404_fallback(self):
         self.assertEqual(

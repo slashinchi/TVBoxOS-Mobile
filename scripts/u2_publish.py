@@ -352,49 +352,79 @@ def classify_metadata_push(
     if attempt > max_attempts:
         raise ValueError("metadata CAS attempt exceeds maximum")
 
-    rows = []
+    if not isinstance(porcelain_status, str):
+        return {"action": "fail", "reason": "push-output-not-text"}
+
+    lines = [raw_line.rstrip("\r") for raw_line in porcelain_status.splitlines()]
+    if not lines or any(not line for line in lines):
+        return {"action": "fail", "reason": "blank-or-empty-push-output"}
+
+    header_remote = None
+    status_row = None
+    footer_seen = False
     diagnostics = []
-    header_seen = False
-    done_seen = False
-    for raw_line in (porcelain_status or "").splitlines():
-        line = raw_line.rstrip("\r")
-        if not line:
+    for line in lines:
+        if header_remote is None:
+            if not line.startswith("To ") or len(line) <= 3 or "\t" in line:
+                return {"action": "fail", "reason": "push-header-order"}
+            header_remote = line[3:]
             continue
-        if line.startswith("To ") and len(line) > 3:
-            if header_seen:
-                return {"action": "fail", "reason": "duplicate-push-header"}
-            header_seen = True
+        if status_row is None:
+            if line == "Done" or line.startswith("To "):
+                return {"action": "fail", "reason": "push-status-order"}
+            fields = line.split("\t")
+            if len(fields) != 3 or len(fields[0]) != 1 or ":" not in fields[1]:
+                return {"action": "fail", "reason": "unrecognized-push-output"}
+            flag, refspec, summary = fields
+            if flag not in {" ", "=", "*", "!"}:
+                return {"action": "fail", "reason": "unknown-push-status"}
+            source, destination = refspec.split(":", 1)
+            if not source or not destination:
+                return {"action": "fail", "reason": "malformed-push-ref-status"}
+            if destination != "refs/heads/patched":
+                return {"action": "fail", "reason": "push-ref-status-target-mismatch"}
+            allowed_summary = {
+                "=": {"[up to date]"},
+                "*": {"[new branch]"},
+                "!": {
+                    "[rejected] (non-fast-forward)",
+                    "[rejected] (fetch first)",
+                },
+            }
+            if flag == " " and not re.fullmatch(r"[0-9a-f]{40}\.\.[0-9a-f]{40}", summary):
+                return {"action": "fail", "reason": "unknown-push-summary"}
+            if flag != " " and summary not in allowed_summary[flag]:
+                return {"action": "fail", "reason": "unknown-push-summary"}
+            status_row = (flag, destination, summary)
             continue
-        if line == "Done":
-            if done_seen:
-                return {"action": "fail", "reason": "duplicate-push-footer"}
-            done_seen = True
+        if not footer_seen:
+            if line != "Done":
+                return {"action": "fail", "reason": "push-footer-order"}
+            footer_seen = True
             continue
-        if line.startswith("error: failed to push some refs to ") or line.startswith("hint: "):
+
+        if line.startswith("error: failed to push some refs to "):
+            expected_error = f"error: failed to push some refs to '{header_remote}'"
+            if line != expected_error or any(item.startswith("error: ") for item in diagnostics):
+                return {"action": "fail", "reason": "unrecognized-push-diagnostic"}
             diagnostics.append(line)
             continue
-        fields = line.split("\t")
-        if len(fields) != 3 or len(fields[0]) != 1 or ":" not in fields[1]:
-            return {"action": "fail", "reason": "unrecognized-push-output"}
-        source, destination = fields[1].split(":", 1)
-        if not source or not destination:
-            return {"action": "fail", "reason": "malformed-push-ref-status"}
-        rows.append((fields[0], destination, fields[2].strip()))
+        if line in NFF_HINTS:
+            if line in diagnostics:
+                return {"action": "fail", "reason": "duplicate-push-diagnostic"}
+            diagnostics.append(line)
+            continue
+        return {"action": "fail", "reason": "unrecognized-push-diagnostic"}
 
-    if len(rows) != 1:
-        return {"action": "fail", "reason": "push-ref-status-not-unique"}
-    flag, destination, summary = rows[0]
-    if destination != "refs/heads/patched":
-        return {"action": "fail", "reason": "push-ref-status-target-mismatch"}
-
+    if status_row is None or not footer_seen:
+        return {"action": "fail", "reason": "push-ref-status-or-footer-missing"}
+    flag, destination, summary = status_row
     nff_rejected = flag == "!" and summary in {
         "[rejected] (non-fast-forward)",
         "[rejected] (fetch first)",
     }
-    diagnostics_explainable = all(
-        line.startswith("error: failed to push some refs to ") or line in NFF_HINTS
-        for line in diagnostics
-    )
+    if diagnostics and not nff_rejected:
+        return {"action": "fail", "reason": "diagnostic-without-nff"}
     confirmed_nff = (
         push_status != 0
         and nff_rejected
@@ -406,7 +436,7 @@ def classify_metadata_push(
             "action": "retry" if attempt < max_attempts else "retry-exhausted",
             "reason": "fresh-remote-head-changed",
         }
-    if confirmed_nff and diagnostics_explainable:
+    if confirmed_nff and diagnostics:
         return {
             "action": "retry" if attempt < max_attempts else "retry-exhausted",
             "reason": "fresh-remote-head-changed",
@@ -422,8 +452,6 @@ def classify_metadata_push(
         )
     ):
         return {"action": "success", "reason": "push-ok"}
-    if nff_rejected and not diagnostics_explainable:
-        return {"action": "fail", "reason": "unexplainable-push-diagnostic"}
     if nff_rejected and remote_head_after == remote_head_before:
         return {"action": "fail", "reason": "remote-head-unchanged"}
     return {"action": "fail", "reason": "push-failure-not-confirmed-nff"}
