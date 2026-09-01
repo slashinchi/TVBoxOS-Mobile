@@ -567,10 +567,11 @@ class U1aContractTests(unittest.TestCase):
     def test_candidate_pr_binds_versioned_provenance_marker(self):
         workflow = WORKFLOW.read_text()
         self.assertIn("provenance_marker", workflow)
-        self.assertIn("EXPECTED_PROVENANCE_MARKER", workflow)
         self.assertIn("provenance-marker", workflow)
         self.assertIn("parse-app-version", workflow)
         self.assertIn("fork-main", workflow)
+        self.assertIn('candidate_sha=$(git rev-parse HEAD)', workflow)
+        self.assertIn('test "$candidate_sha" = "$(jq -r \'.candidate_sha\' "$result_file")"', workflow)
 
     def test_candidate_jobs_continue_using_a_trusted_helper_copy(self):
         workflow = WORKFLOW.read_text()

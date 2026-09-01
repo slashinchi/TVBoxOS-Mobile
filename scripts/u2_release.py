@@ -255,6 +255,8 @@ def qualify_u1_merge(
         return {"qualified": False, "reason": "associated-pr-mismatch"}
     if parsed["upstream"] != upstream_sha or parsed["tree"] != candidate_tree:
         return {"qualified": False, "reason": "provenance-object-mismatch"}
+    if parsed["forkMain"] != upstream_sha:
+        return {"qualified": False, "reason": "provenance-fork-main-mismatch"}
     try:
         expected_upstream_version = _version_tuple(upstream_version)
         expected_upstream_code = int(upstream_code)

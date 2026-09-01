@@ -341,7 +341,6 @@ jobs:
       candidate_needed: ${{ steps.prepare.outputs.candidate_needed }}
       candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
       validated_tree: ${{ steps.prepare.outputs.validated_tree }}
-      provenance_marker: ${{ steps.prepare.outputs.provenance_marker }}
       changed_paths_b64: ${{ steps.prepare.outputs.changed_paths_b64 }}
       preserved_paths_b64: ${{ steps.prepare.outputs.preserved_paths_b64 }}
       candidate_diff_stat_b64: ${{ steps.prepare.outputs.candidate_diff_stat_b64 }}
@@ -394,7 +393,6 @@ jobs:
             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
              echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
              echo 'validated_tree=' >> "$GITHUB_OUTPUT"
-             echo 'provenance_marker=' >> "$GITHUB_OUTPUT"
              echo 'candidate_diff_stat_b64=' >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -414,7 +412,6 @@ jobs:
             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
              echo 'candidate_sha=' >> "$GITHUB_OUTPUT"
              echo 'validated_tree=' >> "$GITHUB_OUTPUT"
-             echo 'provenance_marker=' >> "$GITHUB_OUTPUT"
              echo 'candidate_diff_stat_b64=' >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -423,21 +420,6 @@ jobs:
            candidate_needed=$(jq -r '.candidate_needed' "$result_file")
            candidate_sha=$(jq -r '.candidate_sha // empty' "$result_file")
            validated_tree=$(jq -r '.validated_tree // empty' "$result_file")
-           provenance_marker=
-           if [[ "$candidate_needed" == "true" ]]; then
-             upstream_version_file="$RUNNER_TEMP/upstream-app-build.gradle"
-             git show "$UPSTREAM_SHA:app/build.gradle" > "$upstream_version_file"
-             upstream_version_json=$(python3 scripts/u2_release.py parse-app-version --file "$upstream_version_file")
-             upstream_version=$(jq -r '.versionName' <<<"$upstream_version_json")
-             upstream_code=$(jq -r '.versionCode' <<<"$upstream_version_json")
-             provenance_marker=$(python3 scripts/u2_release.py provenance-marker \
-              --upstream "$UPSTREAM_SHA" \
-              --candidate "$candidate_sha" \
-              --tree "$validated_tree" \
-              --fork-main "$UPSTREAM_SHA" \
-              --upstream-version "$upstream_version" \
-               --upstream-code "$upstream_code")
-           fi
            changed_paths_b64=$(jq -jr '.changed_paths | join("\u0000")' "$result_file" | base64 -w 0)
           preserved_paths_b64=$(jq -jr '.preserved | join("\u0000")' "$result_file" | base64 -w 0)
           candidate_diff_stat_b64=$(git diff --stat "$base_sha...HEAD" | base64 -w 0)
@@ -462,7 +444,6 @@ jobs:
            echo "candidate_needed=$candidate_needed" >> "$GITHUB_OUTPUT"
            echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
            echo "validated_tree=$validated_tree" >> "$GITHUB_OUTPUT"
-           echo "provenance_marker=$provenance_marker" >> "$GITHUB_OUTPUT"
           echo "changed_paths_b64=$changed_paths_b64" >> "$GITHUB_OUTPUT"
           echo "preserved_paths_b64=$preserved_paths_b64" >> "$GITHUB_OUTPUT"
           echo "candidate_diff_stat_b64=$candidate_diff_stat_b64" >> "$GITHUB_OUTPUT"
@@ -546,7 +527,6 @@ jobs:
           EXPECTED_CLASSIFICATION: ${{ needs.candidate_validation.outputs.classification }}
           EXPECTED_CANDIDATE_NEEDED: ${{ needs.candidate_validation.outputs.candidate_needed }}
           VALIDATED_TREE: ${{ needs.candidate_validation.outputs.validated_tree }}
-          EXPECTED_PROVENANCE_MARKER: ${{ needs.candidate_validation.outputs.provenance_marker }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -600,7 +580,8 @@ jobs:
              exit 1
            fi
 
-           candidate_sha=$(jq -r '.candidate_sha' "$result_file")
+            candidate_sha=$(git rev-parse HEAD)
+            test "$candidate_sha" = "$(jq -r '.candidate_sha' "$result_file")"
            upstream_version_file="$RUNNER_TEMP/upstream-app-build.gradle"
            git show "$UPSTREAM_SHA:app/build.gradle" > "$upstream_version_file"
            upstream_version_json=$(python3 scripts/u2_release.py parse-app-version --file "$upstream_version_file")
@@ -611,7 +592,6 @@ jobs:
               --fork-main "$UPSTREAM_SHA" \
               --upstream-version "$(jq -r '.versionName' <<<"$upstream_version_json")" \
              --upstream-code "$(jq -r '.versionCode' <<<"$upstream_version_json")")
-           test "$provenance_marker" = "$EXPECTED_PROVENANCE_MARKER"
 
           changed_paths=$(jq -r '.changed_paths[]?' "$result_file")
           candidate_diff_stat=$(git diff --stat "$PATCHED_SHA...HEAD")

@@ -115,7 +115,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         tree = "c" * 40
         before = "d" * 40
         after = "e" * 40
-        marker = build_provenance_marker(upstream, candidate, tree, "f" * 40, "2.1.27", 237)
+        marker = build_provenance_marker(upstream, candidate, tree, upstream, "2.1.27", 237)
         pr = {
             "number": 7,
             "state": "closed",
@@ -139,8 +139,8 @@ class U2ReleaseContractTests(unittest.TestCase):
             "upstream": upstream,
             "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
             "upstream_ref": "refs/heads/main",
-            "fork_main": "f" * 40,
-            "marker_fork_main": "f" * 40,
+            "fork_main": upstream,
+            "marker_fork_main": upstream,
             "fork_main_is_ancestor": True,
             "marker_tree": tree,
             "candidate_tree": tree,
@@ -165,6 +165,23 @@ class U2ReleaseContractTests(unittest.TestCase):
         )
 
         self.assertTrue(qualified["qualified"])
+        wrong_marker = build_provenance_marker(upstream, candidate, tree, "f" * 40, "2.1.27", 237)
+        wrong = qualify_u1_merge(
+            before=before,
+            after=after,
+            parents=[before, candidate],
+            push_actor="slashinchi",
+            pr=pr,
+            repository="slashinchi/TVBoxOS-Mobile",
+            upstream_sha=upstream,
+            marker=wrong_marker,
+            candidate_tree=tree,
+            upstream_is_ancestor=True,
+            upstream_version="2.1.27",
+            upstream_code=237,
+            replay=replay,
+        )
+        self.assertEqual(wrong["reason"], "provenance-fork-main-mismatch")
         pr["author"] = "human"
         self.assertEqual(
             qualify_u1_merge(
@@ -278,7 +295,7 @@ class U2ReleaseContractTests(unittest.TestCase):
     def test_strict_qualifier_rejects_legacy_replay_tuple(self):
         evidence = self._replay_evidence()
         marker = build_provenance_marker(
-            evidence["upstream"], evidence["candidate"], evidence["marker_tree"], evidence["fork_main"], "2.1.27", 237
+            evidence["upstream"], evidence["candidate"], evidence["marker_tree"], evidence["upstream"], "2.1.27", 237
         )
         pr = {
             "number": 7,
@@ -312,7 +329,7 @@ class U2ReleaseContractTests(unittest.TestCase):
     def test_u1_marker_version_must_match_fixed_upstream_object(self):
         evidence = self._replay_evidence()
         marker = build_provenance_marker(
-            evidence["upstream"], evidence["candidate"], evidence["marker_tree"], evidence["fork_main"], "99.99.99", 9999
+            evidence["upstream"], evidence["candidate"], evidence["marker_tree"], evidence["upstream"], "99.99.99", 9999
         )
         pr = {
             "number": 7,
@@ -1435,7 +1452,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         tree = "c" * 40
         before = "d" * 40
         after = "e" * 40
-        marker = build_provenance_marker(upstream, candidate, tree, "f" * 40, "2.1.27", 237)
+        marker = build_provenance_marker(upstream, candidate, tree, upstream, "2.1.27", 237)
         pr = json.dumps({
             "number": 7,
             "state": "closed",
@@ -1459,8 +1476,8 @@ class U2ReleaseContractTests(unittest.TestCase):
             "upstream": upstream,
             "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
             "upstream_ref": "refs/heads/main",
-            "fork_main": "f" * 40,
-            "marker_fork_main": "f" * 40,
+            "fork_main": upstream,
+            "marker_fork_main": upstream,
             "fork_main_is_ancestor": True,
             "marker_tree": tree,
             "candidate_tree": tree,
@@ -1504,7 +1521,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         tree = "c" * 40
         before = "d" * 40
         after = "e" * 40
-        marker = build_provenance_marker(upstream, candidate, tree, "f" * 40, "2.1.27", 237)
+        marker = build_provenance_marker(upstream, candidate, tree, upstream, "2.1.27", 237)
         pr = json.dumps({
             "number": 7,
             "state": "closed",
@@ -1528,8 +1545,8 @@ class U2ReleaseContractTests(unittest.TestCase):
             "upstream": upstream,
             "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
             "upstream_ref": "refs/heads/main",
-            "fork_main": "f" * 40,
-            "marker_fork_main": "f" * 40,
+            "fork_main": upstream,
+            "marker_fork_main": upstream,
             "fork_main_is_ancestor": True,
             "marker_tree": tree,
             "candidate_tree": tree,
