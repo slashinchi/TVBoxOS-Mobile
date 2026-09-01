@@ -31,7 +31,7 @@ The implementation must be testable with `TVBOX_U2_ENABLED=false`; enabling U2c 
 
 - `workflow_dispatch` is accepted only for actor `slashinchi` on `refs/heads/patched`.
 - The only legal intent values are `release`, `recover`, and `noop-smoke`; one dispatch carries exactly one intent.
-- `release` requires an expected current `patched` SHA and derives the version from the live canonical baseline. `recover` requires the expected source SHA and expected version identity. `noop-smoke` stops after baseline/debt computation and cannot reach qualification, prep, build, sign, publish, issue write, or ref write jobs.
+- `release` requires an expected current `patched` SHA and derives the version from the live canonical baseline. `recover` requires the expected source SHA and expected version identity. `noop-smoke` runs only the trusted baseline/debt computation and cannot reach U1 replay qualification, prep, build, sign, publish, issue write, or ref write jobs.
 - Any missing, duplicated, malformed, or intent-inconsistent input fails closed. Queue order never grants release authority.
 
 ## 5. Ledger and Metadata
@@ -45,7 +45,8 @@ The implementation must be testable with `TVBOX_U2_ENABLED=false`; enabling U2c 
 ## 6. Canary and Retirement
 
 - `TVBOX_U2_ENABLED=false` remains in force through local and remote code validation.
-- Disposable canary cleanup is restricted to exact run-owned `u2-canary-<run>-attempt<n>` objects. It never wildcard-deletes `rc-control-*`, formal `v*`, Releases, rulesets, or policies.
+- The explicitly authorized U2c canary may call the isolated signer in the existing `rc-pipeline.yml` and its `release-signing` Environment only to produce a disposable signed test artifact and attestations. It may not publish a formal Release, move production tags/refs, write production metadata, or change secrets, rulesets, or policies. All other temporary canaries remain secret-free.
+- Canary artifacts use exact run-owned names such as `u2-canary-<run>-attempt<n>-signed.apk`; cleanup is restricted to exact names and current-run ownership. It never wildcard-deletes `rc-control-*`, formal `v*`, Releases, rulesets, or policies.
 - `rc-control-v1` is retired only after a new-code canary proves signer, APK, attestation, workflow identity, and branch/ref policy. Retirement is staged: disable ingress, drain Actions runs and pending deployments, verify no active consumer, then remove workflow/tag policy in a separate change. Any incomplete cleanup returns `REVIEW_PENDING`.
 - U2c enablement (`TVBOX_U2_ENABLED=true`) is last, followed by an enabled no-op smoke. The first formal immutable Release remains a separate live-observation batch.
 

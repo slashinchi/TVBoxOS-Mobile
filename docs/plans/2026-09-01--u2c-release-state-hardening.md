@@ -4,7 +4,7 @@
 
 **Goal:** Harden replay, release identity, ledger reconciliation, manual intents, and control-ref retirement so U2c can be enabled without losing or rewriting release state.
 
-**Architecture:** Keep the existing single `release-production` publish job and isolated `rc-pipeline.yml`. Add a pure strict replay validator, expand U1 fork-owned preservation, and make post-delivery metadata a single bounded CAS commit containing both `update.json` and `verified-releases.json`. Add explicit manual intent gates and a trusted no-op barrier; retire `rc-control-v1` only after an exact canary and drain.
+**Architecture:** Keep the existing single `release-production` publish job and isolated `rc-pipeline.yml`. Add a pure strict replay validator, expand U1 fork-owned preservation, and make post-delivery metadata a single bounded CAS commit containing both `update.json` and `verified-releases.json`. Add explicit manual intent gates and a trusted no-op barrier; retire `rc-control-v1` only after an exact canary and drain. The explicitly authorized U2c canary may use the isolated signer for a non-published artifact and passes an exact run/attempt artifact namespace through the shared RC pipeline.
 
 **Tech Stack:** Python 3 stdlib/unittest, Bash, GitHub Actions YAML, `gh` CLI, GitHub Contents/Actions APIs, `gws` Drive control plane.
 
@@ -18,6 +18,7 @@
 - Ledger append and `update.json` update occur in one identity-bound metadata commit after immutable and delivery verification; `git push --atomic` is not used to bind a later ledger commit to an already-created tag.
 - `release`, `recover`, and `noop-smoke` are mutually exclusive manual intents; trusted no-op reaches no build/sign/publish/issue/ref write job.
 - Preserve all fork-owned `.github/**`, `scripts/**`, `AGENTS.md`, `README.md`, `update.json`, and both Gradle trust manifests during U1 candidate generation.
+- Only the named U2c canary may use `release-signing`; it must never publish a formal Release, move production refs/tags, write production metadata, or change secrets, rulesets, or policies. All canary artifacts use the exact run/attempt namespace.
 - Use no new Python dependencies and do not modify signing secrets or unrelated app/runtime code.
 - FACTS is append-only, HANDOFF is holistic current state, ACTIVE-PLAN is living current plan, and DECISIONS append or supersede.
 
@@ -101,12 +102,13 @@
 
 **Files:**
 - Create: `.github/workflows/u2-canary-harness.yml`
+- Modify: `.github/workflows/rc-pipeline.yml` for the controlled canary artifact-name prefix only
 - Modify: `.github/workflows/rc-control.yml` only if the canary requires an explicit deprecation guard
 - Modify: `scripts/tests/test_u2_release.py`
 - Modify: `docs/plans/2026-09-01--u2c-release-state-hardening.md`
 
 - [x] **Step 1:** Add structural tests requiring dispatch-only actor gating, exact run-owned canary namespace, no production tag/Release/update writes, same `rc-pipeline.yml` reference, and `always()` cleanup.
-- [x] **Step 2:** Implement the harness with exact-run cleanup; it may use temporary drafts/refs only and must never wildcard-delete `rc-control-*`, formal `v*`, Releases, rulesets, or policies.
+- [x] **Step 2:** Implement the harness and the controlled `rc-pipeline.yml` canary artifact prefix with exact-run cleanup; the explicitly authorized canary may use the isolated signer only for a non-published artifact and must never wildcard-delete `rc-control-*`, formal `v*`, Releases, rulesets, or policies.
   - Local implementation intentionally creates no draft, ref, PR, Release, or production-metadata object. It calls the existing `rc-pipeline.yml`, verifies the exact signed artifact and both attestation identities, uploads only namespaced non-secret evidence, and deletes only exact artifacts owned by the current run. Remote canary, drain, retirement, and flag changes remain pending Steps 3-6.
 - [ ] **Step 3:** Merge workflow changes through PR, run the harness with `TVBOX_U2_ENABLED=false`, and verify signer, APK, full SAN workflow identity, attestation, and zero residue.
 - [ ] **Step 4:** Drain Actions runs, queued runs, and pending deployments before changing any reviewer or signer ingress policy; record the readback.
