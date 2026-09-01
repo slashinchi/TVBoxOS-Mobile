@@ -2056,7 +2056,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         ):
             self.assertIn(field, build["with"], field)
             self.assertEqual(str(build["with"][field]).strip("'\""), "")
-        self.assertNotIn("secrets", build)
+        self.assertEqual(build["secrets"], "inherit")
         self.assertNotIn("environment", build)
         self.assertEqual(build["permissions"]["actions"], "read")
         self.assertEqual(build["permissions"]["id-token"], "write")
@@ -2256,6 +2256,12 @@ class U2ReleaseContractTests(unittest.TestCase):
             "attest_input_artifact_name",
         ):
             self.assertIn(output_name, tree["on"]["workflow_call"]["outputs"], output_name)
+
+        comparison_outputs = tree["jobs"]["compare_reproducibility"]["outputs"]
+        self.assertEqual(
+            comparison_outputs["report_artifact_name"],
+            "${{ steps.outputs.outputs.artifact_name }}",
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "github-output"
