@@ -82,7 +82,7 @@
 - [x] **Step 4:** Add a CLI round-trip test using temporary ledger and metadata files.
 - [x] **Step 5:** Replace the publish metadata step with a bounded normal-CAS loop: fetch remote `patched`, reread both remote files, reconcile both, commit both files together, push normally, and retry only after a fresh read/rebuild on non-fast-forward.
 - [x] **Step 6:** Make remote read failure, malformed ledger/update, different same-version identity, and retry exhaustion fail closed; keep exact identity recovery idempotent.
-- [x] **Step 7:** Verify both remote blobs byte-exactly after a successful push and commit the batch; five review rounds and scoped re-reviews are clean.
+- [x] **Step 7:** Verify both remote metadata files (`update.json` and `gradle/verified-releases.json`) byte-exactly after a successful push and commit the batch; five review rounds and scoped re-reviews are clean.
 
 ### Task 4: Manual Intent, Trusted NOOP, and Publish Identity Freeze
 
@@ -91,7 +91,7 @@
 - Modify: `scripts/tests/test_u2_release.py`
 
 - [x] **Step 1: Write failing structural tests** for `release/recover/noop-smoke` choice inputs, actor/ref/expected-SHA validation, mutually exclusive routing, and a no-op dependency barrier covering every build/sign/publish/issue/ref-write job.
-- [ ] **Step 2: Run the structural tests and confirm the current workflow fails them.
+- [x] **Step 2:** Run the structural tests and confirm the current workflow fails them.
 - [x] **Step 3:** Add the explicit dispatch intent contract and pass the intent through gate, qualify, prep, summary, watch, and publish outputs.
 - [x] **Step 4:** Add hard `noop != true` guards to all substantive jobs; make `noop-smoke` compute baseline/debt only and stop before any write-capable job.
 - [x] **Step 5:** Add final live baseline/version collision revalidation before CAS promote, then re-read the Release/tag/draft identity after the first create/asset operation and require exact target, tag, version, asset names, and digests for all later steps.
@@ -114,7 +114,7 @@
 - [x] **Step 3:** Merge workflow changes through PR, run the harness with `TVBOX_U2_ENABLED=false`, and verify signer, APK, full SAN workflow identity, attestation, and zero residue. PR #32 merged at `28aabd14`; canary run `33517784492` passed with namespace `u2-canary-33517784492-attempt-1`, both attestations verified, and zero current-run artifacts after exact cleanup.
 - [x] **Step 4:** Drain Actions runs, queued runs, and pending deployments before changing any reviewer or signer ingress policy; record the readback. No non-completed Actions runs or pending deployments remained; deployment `6203110466` finished successfully.
 - [x] **Step 5:** Disable `rc-control-v1` ingress and remove its workflow/tag policy only in a separate PR after canary evidence; if any active consumer or cleanup residue remains, return `REVIEW_PENDING` instead of deleting broadly. PR #33 merged at `fd54b5c`; `.github/workflows/rc-control.yml` is deleted; exact Environment policy `58404945` and rulesets `21661426`/`21657722` are deleted; historical tag `rc-control-v1` was retained unchanged.
-- [x] **Step 6:** Re-run local and remote CI, verify formal Release `v2.1.26.1`, production `update.json`, signing secrets, and `TVBOX_U2_ENABLED=false` are unchanged. Post-merge `build-apk` run `33520494270` and local `192/192` suite passed; final readback is recorded in `outputs/evidence/2026-09-01--u2c-retirement-after/`.
+- [x] **Step 6:** Re-run local and remote CI, verify formal Release `v2.1.26.1`, production `update.json`, signing secrets, and `TVBOX_U2_ENABLED=false` are unchanged. Post-merge `build-apk` runs `33520494270`, `33521425148`, and `33521763998` passed; local `192/192` suite passed; final readback is recorded in `outputs/evidence/2026-09-01--u2c-retirement-after/`.
 
 ### Task 6: U2c Enablement and Closeout
 
@@ -122,9 +122,9 @@
 - Drive: HANDOFF, ACTIVE-PLAN, DECISIONS, FACTS
 - GitHub repository variable: `TVBOX_U2_ENABLED`
 
-- [ ] **Step 1:** Run executor evidence review and Gemini 3.7 Flash high copy review; use Grok 4.6 xhigh only if a frontend task exists (none is planned).
-- [ ] **Step 2:** Fix all P0/P1/P2 findings and rerun the complete verification suite.
-- [ ] **Step 3:** Read back Environment, reviewer, immutable-release, ruleset, signer workflow, active runs, and canary residue state.
+- [x] **Step 1:** Run executor evidence review and Gemini 3.7 Flash high copy review; use Grok 4.6 xhigh only if a frontend task exists (none is planned). Executor-pro completed the bounded evidence review; Gemini 3.7 Flash high completed the control-plane copy review; no frontend task exists.
+- [ ] **Step 2:** Fix all P0/P1/P2 findings and rerun the complete verification suite. Repository and Drive wording findings are fixed; the remaining `release-signing` administrator-bypass setting requires the documented GitHub UI action and remains `HUMAN_ACTION_REQUIRED`.
+- [x] **Step 3:** Read back Environment, reviewer, immutable-release, ruleset, signer workflow, active runs, and canary residue state. All readbacks are green except `release-signing.can_admins_bypass=true`; no supported REST write exists, so the UI toggle remains the only open control-plane action.
 - [ ] **Step 4:** Set `TVBOX_U2_ENABLED=true` as the last setting change only after all prior evidence is green.
 - [ ] **Step 5:** Run the enabled `noop-smoke` dispatch and verify it stops before prep/build/sign/publish/issue/ref writes.
 - [ ] **Step 6:** Write Drive HANDOFF to `REVIEW_PENDING`, append FACTS and the final decision, and stop before the first formal Release live-observation batch.
