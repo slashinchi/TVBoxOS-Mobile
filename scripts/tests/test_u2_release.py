@@ -1924,6 +1924,222 @@ class U2ReleaseContractTests(unittest.TestCase):
             self.assertIn("noop=true", written)
             self.assertIn("qualified=false", written)
 
+    def test_u2_manual_dispatch_has_explicit_intent_and_live_sha_lock(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        dispatch = tree["on"]["workflow_dispatch"]
+        self.assertIn("inputs", dispatch)
+        inputs = dispatch["inputs"]
+        self.assertEqual(inputs["intent"]["type"], "choice")
+        self.assertTrue(inputs["intent"]["required"] == "true")
+        self.assertEqual(
+            inputs["intent"]["options"],
+            ["release", "recover", "noop-smoke"],
+        )
+        self.assertEqual(inputs["expected_sha"]["type"], "string")
+        self.assertTrue(inputs["expected_sha"]["required"] == "true")
+
+        gate = self._job_block(workflow, "gate")
+        gate_run = gate[gate.index("run: |") :]
+        for token in (
+            "INPUT_INTENT",
+            "EXPECTED_SHA",
+            '[[ "$ACTOR" == "slashinchi" ]]',
+            '[[ "$REF" == "refs/heads/patched" ]]',
+            '[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]',
+            "git ls-remote",
+            "live_patched",
+            '[[ "$live_patched" == "$EXPECTED_SHA" ]]',
+            '[[ "$GITHUB_SHA" == "$EXPECTED_SHA" ]]',
+            'echo "intent=$INPUT_INTENT"',
+        ):
+            self.assertIn(token, gate_run, token)
+
+        manual = gate_run[gate_run.index('elif [[ "$EVENT" == "workflow_dispatch" ]]') :]
+        manual = manual[: manual.index("else")]
+        self.assertNotIn("PUSH_BEFORE", manual)
+        self.assertNotIn("PUSH_AFTER", manual)
+        self.assertIn('echo "source_sha=$EXPECTED_SHA"', gate_run)
+
+    def test_u2_intent_is_mutually_exclusive_and_cross_job_identity_is_explicit(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        jobs = tree["jobs"]
+        gate = jobs["gate"]
+        gate_outputs = gate["outputs"]
+        self.assertIn("intent", gate_outputs)
+        self.assertIn("noop", gate_outputs)
+        gate_run = self._job_block(workflow, "gate")
+        self.assertIn('case "$INPUT_INTENT" in', gate_run)
+        for intent in ("release", "recover", "noop-smoke"):
+            self.assertIn(intent, gate_run)
+        self.assertIn("intent=$INPUT_INTENT", gate_run)
+
+        for job_id in ("qualify", "prep"):
+            self.assertIn("intent", jobs[job_id]["outputs"], job_id)
+            self.assertIn("noop", jobs[job_id]["outputs"], job_id)
+            self.assertIn("INTENT", self._job_block(workflow, job_id), job_id)
+
+        summary = jobs["rc_summary"]
+        self.assertIn("INTENT", summary["outputs"])
+        self.assertIn("NOOP", summary["outputs"])
+        summary_text = self._job_block(workflow, "rc_summary")
+        self.assertIn("needs.qualify.outputs.intent", summary_text)
+        self.assertIn("needs.qualify.outputs.noop", summary_text)
+
+        watch = self._job_block(workflow, "watch_approval")
+        self.assertIn("needs.rc_summary.outputs.INTENT", watch)
+        self.assertIn("needs.rc_summary.outputs.NOOP", watch)
+
+        publish = jobs["publish"]
+        self.assertIn("outputs", publish)
+        self.assertIn("intent", publish["outputs"])
+        self.assertIn("noop", publish["outputs"])
+        publish_text = self._job_block(workflow, "publish")
+        self.assertIn("needs.rc_summary.outputs.INTENT", publish_text)
+        self.assertIn("needs.rc_summary.outputs.NOOP", publish_text)
+
+    def test_u2_noop_smoke_has_a_read_only_dependency_barrier(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        jobs = tree["jobs"]
+        for job_id in ("prep", "build_rc", "rc_summary", "watch_approval", "publish"):
+            condition = str(jobs[job_id].get("if", ""))
+            self.assertIn("needs.qualify.outputs.noop != 'true'", condition, job_id)
+            self.assertIn("needs.qualify.outputs.intent != 'noop-smoke'", condition, job_id)
+
+        qualify = self._job_block(workflow, "qualify")
+        for token in (
+            'INTENT: ${{ needs.gate.outputs.intent }}',
+            'if [[ "$INTENT" == "noop-smoke" ]]',
+            'NOOP=true',
+            'INTENT" == "noop-smoke"',
+            "baseline",
+            "release-debt",
+        ):
+            self.assertIn(token, qualify, token)
+        self.assertIn("return 0", qualify)
+        self.assertIn("gh issue create", qualify)
+        watcher = qualify[qualify.index("watch_debt()") : qualify.index("# Strict U1 qualification")]
+        self.assertIn('[[ "$INTENT" == "noop-smoke" || "$NOOP" == "true" ]]', watcher)
+
+        for job_id in ("prep", "build_rc", "publish"):
+            text = self._job_block(workflow, job_id)
+            self.assertNotIn('if: always()', text)
+
+    def test_u2_promote_revalidates_live_baseline_and_version_collision(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        publish_steps = tree["jobs"]["publish"]["steps"]
+        names = [step.get("name", "") for step in publish_steps]
+        preflight_index = names.index("Preflight verified release metadata")
+        promote_index = names.index("Promote patched to exact release SHA (CAS)")
+        self.assertLess(preflight_index, promote_index)
+
+        preflight = publish_steps[preflight_index]
+        self.assertIn("baseline_tag", str(preflight))
+        self.assertIn("baseline_target", str(preflight))
+        self.assertIn("current_version", str(preflight))
+        self.assertIn("current_update_digest", str(preflight))
+        self.assertIn("current_ledger_digest", str(preflight))
+
+        promote = publish_steps[promote_index]
+        promote_text = promote["run"]
+        for token in (
+            "PREFLIGHT_BASELINE_TAG",
+            "PREFLIGHT_BASELINE_TARGET",
+            "PREFLIGHT_CURRENT_VERSION",
+            "PREFLIGHT_UPDATE_DIGEST",
+            "PREFLIGHT_LEDGER_DIGEST",
+            "canonical-release-baseline",
+            "parse-update-metadata",
+            "monotonic-compare",
+            "version collision",
+            "current update.json",
+            "current verified-releases.json",
+        ):
+            self.assertIn(token, promote_text, token)
+        live_read = promote_text.index("git ls-remote")
+        decision = promote_text.index('if [[ "$current" == "$RELEASE_SHA" ]]')
+        self.assertLess(live_read, decision)
+        self.assertIn("refusing to continue", promote_text)
+
+    def test_u2_freezes_release_identity_after_first_operation_and_reuses_it(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        steps = tree["jobs"]["publish"]["steps"]
+        names = [step.get("name", "") for step in steps]
+        create_index = names.index("Create or reconcile draft Release with exact identity")
+        self.assertIn("Freeze Release identity after first draft/asset operation", names)
+        freeze_index = names.index("Freeze Release identity after first draft/asset operation")
+        attach_index = names.index("Attach missing assets only (no clobber)")
+        revalidate_index = names.index("Revalidate frozen Release identity after asset operation")
+        verify_index = names.index("Verify both assets before publish (API digest + download bytes)")
+        publish_index = names.index("Publish verified draft")
+        self.assertLess(create_index, freeze_index)
+        self.assertLess(freeze_index, attach_index)
+        self.assertLess(attach_index, revalidate_index)
+        self.assertLess(revalidate_index, verify_index)
+        self.assertLess(verify_index, publish_index)
+
+        freeze = str(steps[freeze_index])
+        for token in (
+            "gh release view",
+            "git/ref/tags",
+            "tagTargetSha",
+            "targetCommitish",
+            "EXPECTED_VERSION",
+            "EXPECTED_APK",
+            "update_digest",
+            "exact target",
+            "asset",
+            "GITHUB_OUTPUT",
+        ):
+            self.assertIn(token, freeze, token)
+        self.assertIn("frozen_tag", freeze)
+        self.assertIn("frozen_target_sha", freeze)
+
+        revalidate = str(steps[revalidate_index])
+        for token in (
+            "gh release view",
+            "git/ref/tags",
+            "FROZEN_TAG",
+            "FROZEN_TARGET_SHA",
+            "FROZEN_VERSION",
+            "FROZEN_APK_DIGEST",
+            "FROZEN_UPDATE_DIGEST",
+            "exactly 2 assets",
+            "fail closed",
+        ):
+            self.assertIn(token, revalidate, token)
+
+        later_steps = steps[attach_index:]
+        later_text = "\n".join(str(step) for step in later_steps)
+        for token in (
+            "steps.freeze.outputs.frozen_tag",
+            "steps.freeze.outputs.frozen_target_sha",
+            "steps.freeze.outputs.frozen_version",
+            "steps.freeze.outputs.frozen_apk_digest",
+            "steps.freeze.outputs.frozen_update_digest",
+        ):
+            self.assertIn(token, later_text, token)
+
+    def test_u2_publish_forbids_publish_command_upload_clobber_tag_movement_and_second_build(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        steps = tree["jobs"]["publish"]["steps"]
+        run_text = "\n".join(step.get("run", "") for step in steps)
+        self.assertNotIn("gh release publish", run_text)
+        attach = next(step for step in steps if step.get("name") == "Attach missing assets only (no clobber)")
+        self.assertIn("gh release upload", attach.get("run", ""))
+        self.assertNotIn("--clobber", attach.get("run", ""))
+        self.assertNotIn("./gradlew", run_text)
+        self.assertNotIn("assembleRelease", run_text)
+        self.assertNotIn("git tag -f", run_text)
+        self.assertNotIn("git update-ref", run_text)
+        self.assertNotIn("refs/tags/", "\n".join(step.get("run", "") for step in steps if "git push" in step.get("run", "")))
+        self.assertEqual(run_text.count("actions/artifacts/${{ needs.build_rc.outputs.signed_artifact_id }}/zip"), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
