@@ -114,7 +114,7 @@
 - [x] **Step 3:** Merge workflow changes through PR, run the harness with `TVBOX_U2_ENABLED=false`, and verify signer, APK, full SAN workflow identity, attestation, and zero residue. PR #32 merged at `28aabd14`; canary run `33517784492` passed with namespace `u2-canary-33517784492-attempt-1`, both attestations verified, and zero current-run artifacts after exact cleanup.
 - [x] **Step 4:** Drain Actions runs, queued runs, and pending deployments before changing any reviewer or signer ingress policy; record the readback. No non-completed Actions runs or pending deployments remained; deployment `6203110466` finished successfully.
 - [x] **Step 5:** Disable `rc-control-v1` ingress and remove its workflow/tag policy only in a separate PR after canary evidence; if any active consumer or cleanup residue remains, return `REVIEW_PENDING` instead of deleting broadly. PR #33 merged at `fd54b5c`; `.github/workflows/rc-control.yml` is deleted; exact Environment policy `58404945` and rulesets `21661426`/`21657722` are deleted; historical tag `rc-control-v1` was retained unchanged.
-- [x] **Step 6:** Re-run local and remote CI, verify formal Release `v2.1.26.1`, production `update.json`, signing secrets, and `TVBOX_U2_ENABLED=false` are unchanged. Post-merge `build-apk` runs `33520494270`, `33521425148`, `33521763998`, and `33563308573` passed; local `192/192` suite passed; final readback is recorded in `outputs/evidence/2026-09-01--u2c-retirement-after/`.
+- [x] **Step 6:** Re-run local and remote CI, verify formal Release `v2.1.26.1`, production `update.json`, signing secrets, and `TVBOX_U2_ENABLED=false` are unchanged. Post-merge `build-apk` runs `33520494270`, `33521425148`, `33521763998`, `33563308573`, and `33566013088` passed; local `192/192` suite passed; final readback is recorded in `outputs/evidence/2026-09-01--u2c-retirement-after/`.
 
 ### Task 6: U2c Enablement and Closeout
 
@@ -125,9 +125,14 @@
 - [x] **Step 1:** Run executor evidence review and Gemini 3.7 Flash high copy review; use Grok 4.6 xhigh only if a frontend task exists (none is planned). Executor-pro completed the bounded evidence review; Gemini 3.7 Flash high completed the control-plane copy review; no frontend task exists.
 - [x] **Step 2:** Fix all P0/P1/P2 findings and rerun the complete verification suite. Repository and Drive wording findings are fixed and merged in PR #35; local `192/192` and required remote CI are green; the `release-signing` administrator-bypass UI setting is closed and read back false.
 - [x] **Step 3:** Read back Environment, reviewer, immutable-release, ruleset, signer workflow, active runs, and canary residue state. All readbacks are green: `release-signing.can_admins_bypass=false`, no active runs or pending deployments, and no canary residue.
-- [ ] **Step 4:** Set `TVBOX_U2_ENABLED=true` as the last setting change only after all prior evidence is green.
-- [ ] **Step 5:** Run the enabled `noop-smoke` dispatch and verify it stops before prep/build/sign/publish/issue/ref writes.
-- [ ] **Step 6:** Write Drive HANDOFF to `REVIEW_PENDING`, append FACTS and the final decision, and stop before the first formal Release live-observation batch.
+- [x] **Step 4:** Set `TVBOX_U2_ENABLED=true` as the last setting change only after all prior evidence is green. Preflight was green, the repository variable changed from false to true, and no other setting changed afterward.
+- [x] **Step 5:** Run the enabled `noop-smoke` dispatch and verify it stops before prep/build/sign/publish/issue/ref writes. Run `33566543762` succeeded at gate/qualification; all write-capable jobs were skipped and run artifacts/pending deployments are empty.
+- [x] **Step 6:** Write Drive HANDOFF to `REVIEW_PENDING`, append FACTS and the final decision, and stop before the first formal Release live-observation batch. HANDOFF is `REVIEW_PENDING / HUMAN_ACTION_REQUIRED`; FACTS and DECISIONS record the exact run and no formal Release live-observation has started.
+
+### Residual Cleanup
+
+- [x] Archive exact SHA/PR/run evidence for the temporary branches before deletion.
+- [ ] Delete the exact remote audit branches `u2c-canary-replan-20260901`, `u2c-canary-secret-inherit-20260901`, and `u2c-retire-rc-control-v1-20260901`; retain the archived evidence and commit/PR history.
 
 ## Rollback
 
