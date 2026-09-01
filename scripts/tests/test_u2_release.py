@@ -1340,8 +1340,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         # (drafts have no git tag ref; gh release view succeeds for drafts).
         promote_step = next(s for s in steps if "Promote patched to exact release SHA" in str(s))
         promote_text = str(promote_step)
-        self.assertIn("git/ref/tags/${tag}", promote_text)
-        self.assertIn("tag object $tag exists", promote_text)
+        self.assertIn("refs/tags/${tag}^{}", promote_text)
+        self.assertIn("peeled tag target commit", promote_text)
         self.assertNotIn('gh release view "$tag"', promote_text)
         # Metadata reconciliation must fail closed when the remote baseline
         # cannot be read (never treat an empty current as "may advance").
@@ -1412,10 +1412,9 @@ class U2ReleaseContractTests(unittest.TestCase):
         # fallback (gh api prints the error body to stdout even on exit 1).
         draft_step = next(s for s in steps if "Create or reconcile draft" in str(s))
         draft_run = str(draft_step).replace("\\n", "\n")
-        tag_ref_line = next(l for l in draft_run.splitlines() if "git/ref/tags" in l)
-        self.assertNotIn("--silent", tag_ref_line)
-        self.assertIn("if tag_target_sha=$(", tag_ref_line)
-        self.assertIn("2>/dev/null); then", tag_ref_line)
+        self.assertNotIn("--silent", draft_run)
+        self.assertIn("if tag_target_sha=$(git ls-remote --exit-code", draft_run)
+        self.assertIn("refs/tags/${tag}^{}", draft_run)
 
     def test_u2_metadata_reconciliation_is_bounded_two_file_normal_cas(self):
         workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
@@ -2015,13 +2014,14 @@ class U2ReleaseContractTests(unittest.TestCase):
             'NOOP=true',
             'INTENT" == "noop-smoke"',
             "baseline",
-            "release-debt",
+            'bash "$trusted_root/scripts/u2_qualify.sh"',
         ):
             self.assertIn(token, qualify, token)
         self.assertIn("return 0", qualify)
-        self.assertIn("gh issue create", qualify)
         watcher = qualify[qualify.index("watch_debt()") : qualify.index("# Strict U1 qualification")]
         self.assertIn('[[ "$INTENT" == "noop-smoke" || "$NOOP" == "true" ]]', watcher)
+        debt_watcher = self._job_block(workflow, "debt_watcher")
+        self.assertIn("gh issue create", debt_watcher)
 
         for job_id in ("prep", "build_rc", "publish"):
             text = self._job_block(workflow, job_id)
@@ -2086,7 +2086,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         for token in (
             "gh release view",
             "git/ref/tags",
-            "tagTargetSha",
+            "tag_target_sha",
             "targetCommitish",
             "EXPECTED_VERSION",
             "EXPECTED_APK",
@@ -2137,8 +2137,162 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("assembleRelease", run_text)
         self.assertNotIn("git tag -f", run_text)
         self.assertNotIn("git update-ref", run_text)
-        self.assertNotIn("refs/tags/", "\n".join(step.get("run", "") for step in steps if "git push" in step.get("run", "")))
+        push_lines = [
+            line
+            for step in steps
+            for line in step.get("run", "").splitlines()
+            if "git push" in line
+        ]
+        self.assertNotIn("refs/tags/", "\n".join(push_lines))
         self.assertEqual(run_text.count("actions/artifacts/${{ needs.build_rc.outputs.signed_artifact_id }}/zip"), 1)
+
+    def test_u2_manual_source_identity_is_used_for_all_read_only_checkouts(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        jobs = tree["jobs"]
+
+        qualify_checkout = jobs["qualify"]["steps"][0]["with"]["ref"]
+        watch_checkout = jobs["watch_approval"]["steps"][0]["with"]["ref"]
+        publish_checkout = jobs["publish"]["steps"][0]["with"]["ref"]
+        self.assertEqual(qualify_checkout, "${{ needs.gate.outputs.source_sha }}")
+        self.assertEqual(watch_checkout, "${{ needs.rc_summary.outputs.RELEASE_SHA }}")
+        self.assertEqual(publish_checkout, "${{ needs.rc_summary.outputs.RELEASE_SHA }}")
+        for ref in (qualify_checkout, watch_checkout, publish_checkout):
+            self.assertNotEqual(ref, "refs/heads/patched")
+
+    def test_u2_disabled_noop_smoke_gate_is_executable_and_enters_read_only_path(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        gate_run = self._yaml_tree(workflow)["jobs"]["gate"]["steps"][0]["run"]
+        expected = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$1\" == \"ls-remote\" ]]; then\n"
+                f"  printf '%s\\trefs/heads/patched\\n' '{expected}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exec /usr/bin/git \"$@\"\n"
+            )
+            fake_git.chmod(0o755)
+            output = root / "github-output"
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "GITHUB_OUTPUT": str(output),
+                "U2_ENABLED": "false",
+                "NOOP_CONFIG": "false",
+                "EVENT": "workflow_dispatch",
+                "ACTOR": "slashinchi",
+                "REF": "refs/heads/patched",
+                "INPUT_INTENT": "noop-smoke",
+                "EXPECTED_SHA": expected,
+                "GITHUB_SHA": expected,
+                "REPO": "slashinchi/TVBoxOS-Mobile",
+            }
+            result = subprocess.run(
+                ["bash", "-c", gate_run],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output_text = output.read_text()
+            self.assertIn("enabled=true", output_text)
+            self.assertIn("mode=manual-noop", output_text)
+            self.assertIn("source_sha=" + expected, output_text)
+            self.assertIn("intent=noop-smoke", output_text)
+            self.assertIn("noop=true", output_text)
+            for intent in ("release", "recover"):
+                output.write_text("")
+                env["INPUT_INTENT"] = intent
+                result = subprocess.run(
+                    ["bash", "-c", gate_run],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("enabled=false", output.read_text())
+
+    def test_u2_recovery_forward_requires_recover_intent_and_peeled_tag_target(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        publish = tree["jobs"]["publish"]
+        promote = next(
+            step for step in publish["steps"]
+            if step.get("name") == "Promote patched to exact release SHA (CAS)"
+        )
+        promote_text = str(promote)
+        promote_run = promote["run"]
+        self.assertIn("INTENT", promote["env"])
+        self.assertEqual(promote["env"]["INTENT"], "${{ needs.rc_summary.outputs.INTENT }}")
+        self.assertIn('elif [[ "$INTENT" == "recover" ]] && git merge-base --is-ancestor', promote_run)
+        self.assertNotRegex(promote_run, r"elif git merge-base --is-ancestor")
+        local_baseline = promote_run.index('git fetch --no-tags origin "+refs/heads/patched:refs/heads/patched"')
+        current_read = promote_run.index('current=$(git rev-parse refs/heads/patched)')
+        self.assertLess(local_baseline, current_read)
+        self.assertIn("refs/tags/${tag}^{}", promote_run)
+        self.assertIn("peeled", promote_text)
+        self.assertIn('"$tag_target_sha" == "$RELEASE_SHA"', promote_run)
+
+        for step_name in (
+            "Create or reconcile draft Release with exact identity",
+            "Freeze Release identity after first draft/asset operation",
+            "Revalidate frozen Release identity after asset operation",
+            "Publish verified draft",
+        ):
+            step = next(step for step in publish["steps"] if step.get("name") == step_name)
+            text = str(step)
+            self.assertIn("peeled", text, step_name)
+            self.assertRegex(text, r"refs/tags/\$\{(?:tag|FROZEN_TAG)\}\^\{\}", step_name)
+        create = next(
+            step for step in publish["steps"]
+            if step.get("name") == "Create or reconcile draft Release with exact identity"
+        )
+        self.assertLess(
+            create["run"].index("refs/tags/${tag}^{}"),
+            create["run"].index('gh release create "$tag"'),
+        )
+
+    def test_u2_noop_has_a_separate_issue_watcher_and_no_issue_permission_on_qualify(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        tree = self._yaml_tree(workflow)
+        jobs = tree["jobs"]
+        self.assertNotIn("issues", jobs["qualify"]["permissions"])
+        self.assertNotIn("gh issue", self._job_block(workflow, "qualify"))
+        self.assertIn("debt_watcher", jobs)
+
+        watcher = jobs["debt_watcher"]
+        watcher_if = str(watcher["if"])
+        for token in (
+            "needs.gate.outputs.intent != 'noop-smoke'",
+            "needs.gate.outputs.noop != 'true'",
+            "needs.gate.outputs.mode == 'auto-upstream'",
+        ):
+            self.assertIn(token, watcher_if, token)
+        watcher_text = self._job_block(workflow, "debt_watcher")
+        self.assertIn("gh issue create", watcher_text)
+        self.assertIn("gh issue list", watcher_text)
+        self.assertEqual(
+            watcher["steps"][0]["with"]["ref"],
+            "${{ needs.qualify.outputs.source_sha }}",
+        )
+
+        for job_id in ("prep", "build_rc", "rc_summary", "watch_approval", "publish"):
+            condition = str(jobs[job_id].get("if", ""))
+            self.assertIn("noop", condition, job_id)
+            self.assertIn("noop-smoke", condition, job_id)
 
 
 if __name__ == "__main__":

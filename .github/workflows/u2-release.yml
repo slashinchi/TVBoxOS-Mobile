@@ -100,18 +100,22 @@ jobs:
               echo "enabled=false" >> "$GITHUB_OUTPUT"
               exit 1
             }
+            if [[ "$INPUT_INTENT" == "noop-smoke" ]]; then
+              echo "mode=manual-noop" >> "$GITHUB_OUTPUT"
+              echo "source_sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+              echo "intent=noop-smoke" >> "$GITHUB_OUTPUT"
+              echo "noop=true" >> "$GITHUB_OUTPUT"
+              echo "enabled=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::U2 disabled gate permits only trusted noop-smoke read-only qualification"
+              exit 0
+            fi
             [[ "${U2_ENABLED:-}" == "true" ]] || {
               echo "U2 is disabled (TVBOX_U2_ENABLED is not 'true'). Manual release is gated."
               echo "enabled=false" >> "$GITHUB_OUTPUT"
               exit 0
             }
-            if [[ "$INPUT_INTENT" == "noop-smoke" ]]; then
-              echo "mode=manual-noop" >> "$GITHUB_OUTPUT"
-              echo "noop=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "mode=manual-local" >> "$GITHUB_OUTPUT"
-              echo "noop=${NOOP_CONFIG:-false}" >> "$GITHUB_OUTPUT"
-            fi
+            echo "mode=manual-local" >> "$GITHUB_OUTPUT"
+            echo "noop=${NOOP_CONFIG:-false}" >> "$GITHUB_OUTPUT"
             echo "source_sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
             echo "intent=$INPUT_INTENT" >> "$GITHUB_OUTPUT"
           else
@@ -129,7 +133,6 @@ jobs:
       contents: read
       actions: read
       pull-requests: read
-      issues: write
     outputs:
       source_sha: ${{ steps.qualify.outputs.source_sha }}
       release_sha: ${{ steps.qualify.outputs.release_sha }}
@@ -147,11 +150,12 @@ jobs:
       candidate_pr: ${{ steps.qualify.outputs.candidate_pr }}
       provenance_marker: ${{ steps.qualify.outputs.provenance_marker }}
       intent: ${{ steps.qualify.outputs.intent }}
+      debt_issue_reason: ${{ steps.qualify.outputs.debt_issue_reason }}
     steps:
       - name: Check out patched
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: refs/heads/patched
+          ref: ${{ needs.gate.outputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
       - id: qualify
@@ -206,42 +210,13 @@ jobs:
             exit 0
           fi
           if [[ "$MODE" == "auto-upstream" ]]; then
-            # Non-U1 push debt watcher: open one deduplicated local-release-debt Issue.
+            # Record the reason for the separate read/write debt watcher job.
             watch_debt() {
               local reason="$1"
               if [[ "$INTENT" == "noop-smoke" || "$NOOP" == "true" ]]; then
-                echo "::notice::trusted no-op does not open release-debt issues"
                 return 0
               fi
-              local debt version baseline classification
-              debt=$(grep '^release_debt=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
-              version=$(grep '^expected_version_name=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
-              baseline=$(grep '^baseline_tag=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
-              classification=$(grep '^debt_classification=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2)
-              if [[ "$classification" == "docs-only" ]]; then
-                return 0
-              fi
-              local title="local-release-debt: ${baseline} -> patched (${classification})"
-              local existing
-              existing=$(gh issue list --repo "$REPO" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
-              if [[ -n "$existing" ]]; then
-                echo "::notice::local-release-debt issue already open: #${existing}"
-                return 0
-              fi
-              gh issue create --repo "$REPO" \
-                --title "$title" \
-                --body "Non-U1 push to patched carries unabsorbed release debt.
-
-                - Mode: auto-upstream (rejected: ${reason})
-                - Source: $SOURCE_SHA
-                - Baseline: $baseline
-                - Debt fingerprint: $debt
-                - Classification: $classification
-                - Planned version: ${version:-none}
-
-                U2 cannot build an RC from this push because it is not a valid U1 merge.
-                Open until the debt is absorbed by a qualified U1 merge or manual-local release."
-              echo "::notice::local-release-debt issue opened for ${SOURCE_SHA}"
+              echo "debt_issue_reason=$reason" >> "$GITHUB_OUTPUT"
             }
             # Strict U1 qualification: only a real U1 candidate merge qualifies.
             parents=$(git rev-list --parents -n 1 "$PUSH_AFTER" | awk '{for(i=2;i<=NF;i++) printf "%s%s", sep, $i; sep=" "}')
@@ -387,6 +362,58 @@ jobs:
           qualified=$(grep '^qualified=' "$GITHUB_OUTPUT" | cut -d= -f2)
           [[ -n "$qualified" ]] || { echo "::error::qualify output missing qualified"; exit 1; }
           # u2_qualify.sh emits the rc-pipeline-compatible mode.
+
+  debt_watcher:
+    name: Record local release debt
+    needs: [gate, qualify]
+    if: always() && needs.gate.outputs.enabled == 'true' && needs.gate.outputs.mode == 'auto-upstream' && needs.gate.outputs.intent != 'noop-smoke' && needs.gate.outputs.noop != 'true' && needs.qualify.outputs.qualified == 'false' && needs.qualify.outputs.debt_issue_reason != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out source SHA
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.qualify.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Open identity-bound release-debt issue
+        env:
+          REASON: ${{ needs.qualify.outputs.debt_issue_reason }}
+          SOURCE_SHA: ${{ needs.qualify.outputs.source_sha }}
+          BASELINE_TAG: ${{ needs.qualify.outputs.baseline_tag }}
+          RELEASE_DEBT: ${{ needs.qualify.outputs.release_debt }}
+          CLASSIFICATION: ${{ needs.qualify.outputs.debt_classification }}
+          EXPECTED_VERSION: ${{ needs.qualify.outputs.expected_version_name }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$REASON" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "::error::debt watcher reason is invalid"; exit 1; }
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::debt watcher source SHA is invalid"; exit 1; }
+          [[ "$RELEASE_DEBT" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::debt watcher fingerprint is invalid"; exit 1; }
+          [[ "$CLASSIFICATION" != "docs-only" ]] || { echo "::notice::docs-only debt does not open an issue"; exit 0; }
+          title="local-release-debt: ${BASELINE_TAG} -> patched (${CLASSIFICATION})"
+          existing=$(gh issue list --repo "$REPO" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
+          if [[ -n "$existing" ]]; then
+            echo "::notice::local-release-debt issue already open: #${existing}"
+            exit 0
+          fi
+          gh issue create --repo "$REPO" \
+            --title "$title" \
+            --body "Non-U1 push to patched carries unabsorbed release debt.
+
+          - Mode: auto-upstream (rejected: ${REASON})
+          - Source: $SOURCE_SHA
+          - Baseline: $BASELINE_TAG
+          - Debt fingerprint: $RELEASE_DEBT
+          - Classification: $CLASSIFICATION
+          - Planned version: ${EXPECTED_VERSION:-none}
+
+          U2 cannot build an RC from this push because it is not a valid U1 merge.
+          Open until the debt is absorbed by a qualified U1 merge or manual-local release."
+          echo "::notice::local-release-debt issue opened for ${SOURCE_SHA}"
 
   prep:
     name: Derive version and create prep commit
@@ -614,7 +641,7 @@ jobs:
       - name: Check out patched
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: refs/heads/patched
+          ref: ${{ needs.rc_summary.outputs.RELEASE_SHA }}
           fetch-depth: 0
           persist-credentials: false
       - name: Scan for rejected reviews and open identity-bound human-blocked issue
@@ -674,7 +701,7 @@ jobs:
       - name: Check out patched
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: refs/heads/patched
+          ref: ${{ needs.rc_summary.outputs.RELEASE_SHA }}
           fetch-depth: 0
           persist-credentials: false
       - name: Load release identity
@@ -911,6 +938,7 @@ jobs:
           PREFLIGHT_CURRENT_VERSION: ${{ steps.preflight.outputs.current_version }}
           PREFLIGHT_UPDATE_DIGEST: ${{ steps.preflight.outputs.current_update_digest }}
           PREFLIGHT_LEDGER_DIGEST: ${{ steps.preflight.outputs.current_ledger_digest }}
+          INTENT: ${{ needs.rc_summary.outputs.INTENT }}
           TOKEN: ${{ secrets.TVBOX_RELEASE_TOKEN }}
         run: |
           set -euo pipefail
@@ -992,6 +1020,7 @@ jobs:
           PY
            fi
           echo "::notice::final live baseline/version collision revalidation passed before CAS promote"
+          git fetch --no-tags origin "+refs/heads/patched:refs/heads/patched"
           current=$(git rev-parse refs/heads/patched)
           [[ "$current" == "$preflight_sha" ]] || {
             echo "::error::local patched ref does not match metadata preflight SHA; refusing to continue"; exit 1;
@@ -999,7 +1028,7 @@ jobs:
           tag="v${EXPECTED_VERSION}"
           if [[ "$current" == "$RELEASE_SHA" ]]; then
             echo "::notice::patched already at release SHA; no promote needed"
-          elif git merge-base --is-ancestor "$RELEASE_SHA" "$current"; then
+          elif [[ "$INTENT" == "recover" ]] && git merge-base --is-ancestor "$RELEASE_SHA" "$current"; then
             # Recovery: patched advanced past release SHA is only valid when the
             # formal TAG OBJECT already exists (metadata commit or resumed
             # publish). A draft is NOT a tag: drafts have no git tag ref, so a
@@ -1022,23 +1051,31 @@ jobs:
               echo "::error::promotion tag read classification returned no action"; exit 1;
             }
             if [[ "$tag_read_action" == "present" ]]; then
-              if tag_ref=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
-                : # success: stdout holds the tag object SHA
+              if tag_target_sha=$(git ls-remote --exit-code \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
+                "refs/tags/${tag}^{}" | awk 'NF {print $1}'); then
+                [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                  echo "::error::peeled tag target commit does not equal release SHA; refusing recovery"; exit 1;
+                }
               else
-                echo "::error::tag was present but the promotion identity read failed; refusing to continue"; exit 1
+                echo "::error::tag was present but its peeled target commit could not be read; refusing to continue"; exit 1
               fi
             elif [[ "$tag_read_action" == "missing" ]]; then
-              tag_ref=""
+              tag_target_sha=""
             else
               echo "::error::promotion tag read failed (status=$tag_read_status http=$tag_http_status); only explicit HTTP 404 may report missing"; exit 1
             fi
-            if [[ -n "$tag_ref" && "$tag_ref" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::notice::recovery: patched advanced past release SHA but tag object $tag exists ($tag_ref); continuing"
+            if [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]]; then
+              echo "::notice::recovery: peeled tag target commit equals release SHA ($tag_target_sha); continuing"
             else
-              echo "::error::patched advanced past the release SHA and formal tag $tag does not exist; pending RC is stale"
+              echo "::error::patched advanced past the release SHA and formal tag target commit is not exact; pending RC is stale"
               exit 1
             fi
           else
+            if git merge-base --is-ancestor "$RELEASE_SHA" "$current"; then
+              echo "::error::release intent cannot enter recovery-forward after patched advanced; use intent=recover"
+              exit 1
+            fi
             git fetch --no-tags origin "+refs/heads/patched:refs/remotes/origin/patched"
             remote=$(git rev-parse refs/remotes/origin/patched)
             [[ "$remote" == "$current" ]] || { echo "::error::patched moved during promote; CAS failed"; exit 1; }
@@ -1216,10 +1253,14 @@ jobs:
             tag_target_sha=""
             case "$tag_read_action" in
               present)
-                if tag_target_sha=$(GH_TOKEN="$TOKEN" gh api "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
-                  : # success: stdout holds the tag object SHA
+                if tag_target_sha=$(git ls-remote --exit-code \
+                  "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
+                  "refs/tags/${tag}^{}" | awk 'NF {print $1}'); then
+                  [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                    echo "::error::peeled tag target commit does not equal release SHA; refusing to mutate"; exit 1;
+                  }
                 else
-                  echo "::error::tag was present but the identity read failed; refusing to fallback"; exit 1
+                  echo "::error::tag was present but its peeled target commit could not be read; refusing to fallback"; exit 1
                 fi
                 ;;
               missing)
@@ -1230,7 +1271,8 @@ jobs:
                 exit 1
                 ;;
             esac
-            if [[ -z "$tag_target_sha" ]]; then
+            is_draft=$(echo "$existing" | jq -r '.isDraft')
+            if [[ -z "$tag_target_sha" && "$is_draft" == "true" ]]; then
               commitish=$(echo "$existing" | jq -r '.targetCommitish // ""')
               if [[ "$commitish" =~ ^[0-9a-f]{40}$ ]]; then
                 tag_target_sha="$commitish"
@@ -1239,7 +1281,6 @@ jobs:
             if [[ -n "$tag_target_sha" ]]; then
               existing=$(echo "$existing" | jq --arg sha "$tag_target_sha" '.tagTargetSha = $sha')
             fi
-            is_draft=$(echo "$existing" | jq -r '.isDraft')
             if [[ "$is_draft" == "true" ]]; then
               decision=$(python3 scripts/u2_publish.py reconcile-draft \
                 --draft "$existing" \
@@ -1283,6 +1324,31 @@ jobs:
               esac
             fi
           else
+            tag_read="$RUNNER_TEMP/u2-create-tag-read.txt"
+            set +e
+            GH_TOKEN="$TOKEN" gh api --include \
+              "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" > "$tag_read" 2>&1
+            tag_read_status=$?
+            set -e
+            tag_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$tag_read")
+            tag_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+              --status "$tag_read_status" --http-status "$tag_http_status") || {
+              echo "::error::pre-create tag identity classification failed; fail closed"; exit 1;
+            }
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
+            if [[ "$tag_read_action" == "present" ]]; then
+              tag_target_sha=$(git ls-remote --exit-code \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
+                "refs/tags/${tag}^{}" | awk 'NF {print $1}') || {
+                echo "::error::pre-create peeled tag target commit read failed; fail closed"; exit 1;
+              }
+              [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                echo "::error::pre-create peeled tag target commit does not equal release SHA; fail closed"; exit 1;
+              }
+              echo "::notice::pre-create peeled tag target commit equals release SHA ($tag_target_sha)"
+            elif [[ "$tag_read_action" != "missing" ]]; then
+              echo "::error::pre-create tag identity is unreadable; fail closed"; exit 1
+            fi
             run_url="https://github.com/slashinchi/TVBoxOS-Mobile/actions/runs/${{ github.run_id }}"
             notes=$(printf '%s\n' \
               "## Build / Release Evidence" \
@@ -1344,24 +1410,29 @@ jobs:
              echo "::error::first Release tag identity classification failed; fail closed"; exit 1;
            }
            tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
-           tagTargetSha=""
-           if [[ "$tag_read_action" == "present" ]]; then
-             tagTargetSha=$(GH_TOKEN="$TOKEN" gh api \
-               "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null) || {
-               echo "::error::first Release tag object read failed; fail closed"; exit 1;
-             }
-           elif [[ "$tag_read_action" != "missing" ]]; then
-             echo "::error::first Release tag read failed; fail closed"; exit 1
-           fi
+            tag_target_sha=""
+            if [[ "$tag_read_action" == "present" ]]; then
+              if tag_target_sha=$(git ls-remote --exit-code \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
+                "refs/tags/${tag}^{}" | awk 'NF {print $1}'); then
+                [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$RELEASE_SHA" ]] || {
+                  echo "::error::first Release peeled tag target commit does not equal release SHA; fail closed"; exit 1;
+                }
+              else
+                echo "::error::first Release peeled tag target commit read failed; fail closed"; exit 1;
+              fi
+            elif [[ "$tag_read_action" != "missing" ]]; then
+              echo "::error::first Release tag read failed; fail closed"; exit 1
+            fi
            if [[ "$is_draft" == "true" ]]; then
              [[ "$target_commitish" == "$RELEASE_SHA" ]] || {
                echo "::error::first draft exact target identity changed; fail closed"; exit 1;
              }
-             [[ -z "$tagTargetSha" || "$tagTargetSha" == "$RELEASE_SHA" ]] || {
+              [[ -z "$tag_target_sha" || "$tag_target_sha" == "$RELEASE_SHA" ]] || {
                echo "::error::first draft tag target changed; fail closed"; exit 1;
              }
            else
-             [[ "$tagTargetSha" == "$RELEASE_SHA" ]] || {
+              [[ "$tag_target_sha" == "$RELEASE_SHA" ]] || {
                echo "::error::first published Release tag target changed; fail closed"; exit 1;
              }
            fi
@@ -1470,12 +1541,17 @@ jobs:
              echo "::error::post-asset tag identity classification failed; fail closed"; exit 1;
            }
            tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
-           tagTargetSha=""
-           if [[ "$tag_read_action" == "present" ]]; then
-             tagTargetSha=$(GH_TOKEN="$TOKEN" gh api \
-               "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${FROZEN_TAG}" --jq '.object.sha' 2>/dev/null) || {
-               echo "::error::post-asset tag object read failed; fail closed"; exit 1;
-             }
+            tag_target_sha=""
+            if [[ "$tag_read_action" == "present" ]]; then
+              if tag_target_sha=$(git ls-remote --exit-code \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
+                "refs/tags/${FROZEN_TAG}^{}" | awk 'NF {print $1}'); then
+                [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
+                  echo "::error::post-asset peeled tag target commit changed; fail closed"; exit 1;
+                }
+              else
+                echo "::error::post-asset peeled tag target commit read failed; fail closed"; exit 1;
+              fi
            elif [[ "$tag_read_action" != "missing" ]]; then
              echo "::error::post-asset tag read failed; fail closed"; exit 1
            fi
@@ -1483,11 +1559,11 @@ jobs:
              [[ "$target_commitish" == "$FROZEN_TARGET_SHA" ]] || {
                echo "::error::post-asset draft target changed; fail closed"; exit 1;
              }
-             [[ -z "$tagTargetSha" || "$tagTargetSha" == "$FROZEN_TARGET_SHA" ]] || {
+              [[ -z "$tag_target_sha" || "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
                echo "::error::post-asset draft tag target changed; fail closed"; exit 1;
              }
            else
-             [[ "$DECISION" == "published" && "$tagTargetSha" == "$FROZEN_TARGET_SHA" ]] || {
+              [[ "$DECISION" == "published" && "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
                echo "::error::post-asset published target changed; fail closed"; exit 1;
              }
            fi
@@ -1564,22 +1640,41 @@ jobs:
            [[ "$(jq -er '.tagName' <<<"$state")" == "$tag" ]] || {
              echo "::error::pre-publish Release tag changed; fail closed"; exit 1;
            }
-           target_commitish=$(jq -er '.targetCommitish // ""' <<<"$state")
-           is_draft=$(jq -er '.isDraft' <<<"$state")
-           tag_target_sha=""
-           if tag_target_sha=$(GH_TOKEN="$TOKEN" gh api \
-             "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null); then
-             :
-           elif [[ "$is_draft" == "true" ]]; then
-             :
-           else
-             echo "::error::pre-publish tag object read failed; fail closed"; exit 1
-           fi
+            target_commitish=$(jq -er '.targetCommitish // ""' <<<"$state")
+            is_draft=$(jq -er '.isDraft' <<<"$state")
+            tag_read="$RUNNER_TEMP/u2-pre-publish-tag-read.txt"
+            set +e
+            GH_TOKEN="$TOKEN" gh api --include \
+              "repos/slashinchi/TVBoxOS-Mobile/git/ref/tags/${tag}" > "$tag_read" 2>&1
+            tag_read_status=$?
+            set -e
+            tag_http_status=$(awk '$1 ~ /^HTTP\// { status=$2 } END { print status + 0 }' "$tag_read")
+            tag_read_result=$(python3 scripts/u2_publish.py classify-release-read \
+              --status "$tag_read_status" --http-status "$tag_http_status") || {
+              echo "::error::pre-publish tag identity classification failed; fail closed"; exit 1;
+            }
+            tag_read_action=$(jq -er '.action' <<<"$tag_read_result")
+            tag_target_sha=""
+            if [[ "$tag_read_action" == "present" ]]; then
+              if tag_target_sha=$(git ls-remote --exit-code \
+                "https://github.com/slashinchi/TVBoxOS-Mobile.git" \
+                "refs/tags/${tag}^{}" | awk 'NF {print $1}'); then
+                [[ "$tag_target_sha" =~ ^[0-9a-f]{40}$ && "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
+                  echo "::error::pre-publish peeled tag target commit changed; fail closed"; exit 1;
+                }
+              else
+                echo "::error::pre-publish peeled tag target commit read failed; fail closed"; exit 1;
+              fi
+            elif [[ "$tag_read_action" == "missing" && "$is_draft" == "true" ]]; then
+              : # Draft Releases have no formal tag ref yet.
+            else
+              echo "::error::pre-publish tag identity is missing or unreadable; fail closed"; exit 1
+            fi
            if [[ "$is_draft" == "true" ]]; then
              [[ "$target_commitish" == "$FROZEN_TARGET_SHA" ]] || {
                echo "::error::pre-publish draft target changed; fail closed"; exit 1;
              }
-             [[ -z "$tag_target_sha" || "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
+              [[ -z "$tag_target_sha" || "$tag_target_sha" == "$FROZEN_TARGET_SHA" ]] || {
                echo "::error::pre-publish draft tag target changed; fail closed"; exit 1;
              }
            else
