@@ -716,31 +716,8 @@ class U2ReleaseContractTests(unittest.TestCase):
         self.assertIn("attestations: write", attestor)
         self.assertIn("verify_signed.outputs.signed_sha256", attestor)
 
-    def test_rc_control_workflow_is_dispatch_gated_and_sha_locked(self):
-        self.assertTrue(CONTROL_WORKFLOW.is_file())
-        workflow = CONTROL_WORKFLOW.read_text()
-        self.assertIn("workflow_dispatch:", workflow)
-        self.assertNotIn("workflow_call:", workflow)
-        self.assertIn("refs/tags/rc-control-v1", workflow)
-        self.assertIn("github.actor == 'slashinchi'", workflow)
-        self.assertIn("refs/heads/patched", workflow)
-        self.assertNotIn("release-signing", workflow)
-        self.assertNotIn("${{ secrets", workflow)
-        self.assertIn("uses: ./.github/workflows/rc-pipeline.yml", workflow)
-        resolve = self._job_block(workflow, "resolve")
-        self.assertIn("actions/github-script", resolve)
-        self.assertIn("getCommit", resolve)
-        self.assertIn("hex", resolve)
-        call = self._job_block(workflow, "call_rc_pipeline")
-        self.assertIn("secrets: inherit", call)
-        self.assertIn("needs.resolve.outputs.patched_sha", call)
-        self.assertIn("source_sha: ${{ needs.resolve.outputs.patched_sha }}", call)
-        self.assertIn("release_sha: ${{ needs.resolve.outputs.patched_sha }}", call)
-        self.assertIn("mode: manual-local", call)
-        outer = workflow[: workflow.index("jobs:")]
-        self.assertIn("contents: read", outer)
-        self.assertNotIn("id-token: write", outer)
-        self.assertNotIn("attestations: write", outer)
+    def test_rc_control_workflow_is_retired_after_u2c_canary(self):
+        self.assertFalse(CONTROL_WORKFLOW.exists())
 
     def test_build_workflow_has_no_signing_entry_and_no_tag_publisher(self):
         workflow = BUILD_WORKFLOW.read_text()

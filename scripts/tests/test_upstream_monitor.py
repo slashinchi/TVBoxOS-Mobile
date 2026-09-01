@@ -199,7 +199,7 @@ class U1aContractTests(unittest.TestCase):
         signed_block = rc_workflow[signed_start:verify_start]
         attestor_block = rc_workflow[rc_workflow.index("  attest_signed:"):]
 
-        self.assertIn("uses: ./.github/workflows/rc-pipeline.yml", (ROOT / ".github/workflows/rc-control.yml").read_text())
+        self.assertFalse((ROOT / ".github/workflows/rc-control.yml").exists())
         self.assertIn("environment: release-signing", signed_block)
         self.assertNotIn("environment: release-signing", attestor_block)
 
