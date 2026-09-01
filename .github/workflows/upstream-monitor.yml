@@ -198,7 +198,12 @@ jobs:
           set -euo pipefail
            trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
            cp scripts/upstream_monitor.py "$trusted_helper"
-           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+           existing_fork_main=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
+           if [[ -n "$existing_fork_main" && "$existing_fork_main" != "$FORK_MAIN_SHA" ]]; then
+             echo "::error::fork main baseline changed during candidate write"
+             exit 1
+           fi
+           git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
 
@@ -358,10 +363,33 @@ jobs:
         env:
           UPSTREAM_REPO: kukuqi666/TVBoxOS-Mobile
           UPSTREAM_SHA: ${{ needs.probe.outputs.upstream_sha }}
+          FORK_MAIN_SHA: ${{ needs.probe.outputs.fork_main_sha }}
         run: |
           set +e
            trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
            cp scripts/upstream_monitor.py "$trusted_helper"
+           existing_fork_main=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
+           if [[ -n "$existing_fork_main" && "$existing_fork_main" != "$FORK_MAIN_SHA" ]]; then
+             echo "Candidate validation fork main baseline changed during checkout."
+             echo 'validation=fail' >> "$GITHUB_OUTPUT"
+             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
+             exit 0
+           fi
+           if ! git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main; then
+             echo "Candidate validation could not fetch fork main without rewriting local evidence."
+             echo 'validation=fail' >> "$GITHUB_OUTPUT"
+             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
+             exit 0
+           fi
+           if [[ "$(git rev-parse refs/remotes/origin/main)" != "$FORK_MAIN_SHA" ]]; then
+             echo "Candidate validation fork main SHA changed during validation."
+             echo 'validation=fail' >> "$GITHUB_OUTPUT"
+             echo 'classification=unknown/high-risk' >> "$GITHUB_OUTPUT"
+             echo 'candidate_needed=false' >> "$GITHUB_OUTPUT"
+             exit 0
+           fi
            git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
           if [[ "$(git rev-parse refs/remotes/upstream/main)" != "$UPSTREAM_SHA" ]]; then
@@ -408,10 +436,11 @@ jobs:
              upstream_version=$(jq -r '.versionName' <<<"$upstream_version_json")
              upstream_code=$(jq -r '.versionCode' <<<"$upstream_version_json")
              provenance_marker=$(python3 scripts/u2_release.py provenance-marker \
-               --upstream "$UPSTREAM_SHA" \
-               --candidate "$candidate_sha" \
-               --tree "$validated_tree" \
-               --upstream-version "$upstream_version" \
+              --upstream "$UPSTREAM_SHA" \
+              --candidate "$candidate_sha" \
+              --tree "$validated_tree" \
+              --fork-main "$FORK_MAIN_SHA" \
+              --upstream-version "$upstream_version" \
                --upstream-code "$upstream_code")
            fi
            changed_paths_b64=$(jq -jr '.changed_paths | join("\u0000")' "$result_file" | base64 -w 0)
@@ -528,7 +557,12 @@ jobs:
           set -euo pipefail
            trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
            cp scripts/upstream_monitor.py "$trusted_helper"
-           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+           existing_fork_main=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
+           if [[ -n "$existing_fork_main" && "$existing_fork_main" != "$FORK_MAIN_SHA" ]]; then
+             echo "::error::fork main baseline changed during recovery"
+             exit 1
+           fi
+           git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
           git fetch --no-tags origin +refs/heads/patched:refs/remotes/origin/patched
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
@@ -575,11 +609,12 @@ jobs:
            upstream_version_file="$RUNNER_TEMP/upstream-app-build.gradle"
            git show "$UPSTREAM_SHA:app/build.gradle" > "$upstream_version_file"
            upstream_version_json=$(python3 scripts/u2_release.py parse-app-version --file "$upstream_version_file")
-           provenance_marker=$(python3 scripts/u2_release.py provenance-marker \
-             --upstream "$UPSTREAM_SHA" \
-             --candidate "$candidate_sha" \
-             --tree "$VALIDATED_TREE" \
-             --upstream-version "$(jq -r '.versionName' <<<"$upstream_version_json")" \
+            provenance_marker=$(python3 scripts/u2_release.py provenance-marker \
+              --upstream "$UPSTREAM_SHA" \
+              --candidate "$candidate_sha" \
+              --tree "$VALIDATED_TREE" \
+              --fork-main "$FORK_MAIN_SHA" \
+              --upstream-version "$(jq -r '.versionName' <<<"$upstream_version_json")" \
              --upstream-code "$(jq -r '.versionCode' <<<"$upstream_version_json")")
            test "$provenance_marker" = "$EXPECTED_PROVENANCE_MARKER"
 
@@ -683,10 +718,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
-          cp scripts/upstream_monitor.py "$trusted_helper"
-          candidate_branch=$(python3 "$trusted_helper" candidate-branch --upstream-sha "$UPSTREAM_SHA")
-          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+           trusted_helper="$RUNNER_TEMP/trusted-upstream-monitor.py"
+           cp scripts/upstream_monitor.py "$trusted_helper"
+           candidate_branch=$(python3 "$trusted_helper" candidate-branch --upstream-sha "$UPSTREAM_SHA")
+           existing_fork_main=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
+           if [[ -n "$existing_fork_main" && "$existing_fork_main" != "$FORK_MAIN_SHA" ]]; then
+             echo "::error::fork main baseline changed during recovery"
+             exit 1
+           fi
+           git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
           git fetch --no-tags origin +refs/heads/patched:refs/remotes/origin/patched
           git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
             +refs/heads/main:refs/remotes/upstream/main
@@ -715,11 +755,12 @@ jobs:
            upstream_version_file="$RUNNER_TEMP/upstream-app-build.gradle"
            git show "$UPSTREAM_SHA:app/build.gradle" > "$upstream_version_file"
            upstream_version_json=$(python3 scripts/u2_release.py parse-app-version --file "$upstream_version_file")
-           provenance_marker=$(python3 scripts/u2_release.py provenance-marker \
-             --upstream "$UPSTREAM_SHA" \
-             --candidate "$CANDIDATE_BRANCH_OID" \
-             --tree "$expected_tree" \
-             --upstream-version "$(jq -r '.versionName' <<<"$upstream_version_json")" \
+            provenance_marker=$(python3 scripts/u2_release.py provenance-marker \
+              --upstream "$UPSTREAM_SHA" \
+              --candidate "$CANDIDATE_BRANCH_OID" \
+              --tree "$expected_tree" \
+              --fork-main "$FORK_MAIN_SHA" \
+              --upstream-version "$(jq -r '.versionName' <<<"$upstream_version_json")" \
              --upstream-code "$(jq -r '.versionCode' <<<"$upstream_version_json")")
            if ! python3 "$trusted_helper" tree-check --actual "$actual_tree" --expected "$expected_tree"; then
              echo 'failure_reason=validated-tree-mismatch' >> "$GITHUB_OUTPUT"

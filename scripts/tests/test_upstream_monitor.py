@@ -281,6 +281,9 @@ class U1aContractTests(unittest.TestCase):
             (repo / "scripts").mkdir()
             (repo / "scripts/upstream_monitor.py").write_text("fork helper\n")
             (repo / "scripts/sync_release_metadata.sh").write_text("fork metadata\n")
+            (repo / "gradle").mkdir()
+            (repo / "gradle/verified-releases.json").write_text("{\"fork\":true}\n")
+            (repo / "gradle/legacy-dependencies.lock.json").write_text("{\"fork\":true}\n")
             self._commit(repo, "fork control plane")
             _git(repo, "checkout", "-b", "upstream", "main")
             (repo / "AGENTS.md").write_text("upstream rules\n")
@@ -290,6 +293,9 @@ class U1aContractTests(unittest.TestCase):
             (repo / "scripts").mkdir()
             (repo / "scripts/upstream_monitor.py").write_text("upstream helper\n")
             (repo / "scripts/sync_release_metadata.sh").write_text("upstream metadata\n")
+            (repo / "gradle").mkdir()
+            (repo / "gradle/verified-releases.json").write_text("{\"upstream\":true}\n")
+            (repo / "gradle/legacy-dependencies.lock.json").write_text("{\"upstream\":true}\n")
             (repo / "runtime.txt").write_text("upstream runtime\n")
             self._commit(repo, "upstream control plane changes")
 
@@ -301,6 +307,8 @@ class U1aContractTests(unittest.TestCase):
                     ".github/workflows/new-upstream.yml",
                     ".github/workflows/upstream-monitor.yml",
                     "AGENTS.md",
+                    "gradle/legacy-dependencies.lock.json",
+                    "gradle/verified-releases.json",
                     "scripts/sync_release_metadata.sh",
                     "scripts/upstream_monitor.py",
                 ],
@@ -312,6 +320,11 @@ class U1aContractTests(unittest.TestCase):
             )
             self.assertEqual((repo / "scripts/upstream_monitor.py").read_text(), "fork helper\n")
             self.assertEqual((repo / "scripts/sync_release_metadata.sh").read_text(), "fork metadata\n")
+            self.assertEqual((repo / "gradle/verified-releases.json").read_text(), "{\"fork\":true}\n")
+            self.assertEqual(
+                (repo / "gradle/legacy-dependencies.lock.json").read_text(),
+                "{\"fork\":true}\n",
+            )
             self.assertFalse((repo / ".github/workflows/new-upstream.yml").exists())
             self.assertIn("runtime.txt", result.changed_paths)
 
@@ -539,6 +552,9 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("gradle/verified-releases.json", workflow)
         self.assertIn("gradle/legacy-dependencies.lock.json", workflow)
         self.assertIn("git diff --quiet \"$PATCHED_SHA\" \"$actual_candidate_oid\"", workflow)
+        self.assertIn("FORK_MAIN_SHA", workflow)
+        self.assertIn("--fork-main", workflow)
+        self.assertNotIn("origin +refs/heads/main", workflow)
 
     def test_candidate_pr_binds_versioned_provenance_marker(self):
         workflow = WORKFLOW.read_text()
@@ -546,6 +562,7 @@ class U1aContractTests(unittest.TestCase):
         self.assertIn("EXPECTED_PROVENANCE_MARKER", workflow)
         self.assertIn("provenance-marker", workflow)
         self.assertIn("parse-app-version", workflow)
+        self.assertIn("fork-main", workflow)
 
     def test_candidate_jobs_continue_using_a_trusted_helper_copy(self):
         workflow = WORKFLOW.read_text()

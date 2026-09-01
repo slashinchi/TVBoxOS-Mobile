@@ -111,18 +111,30 @@ jobs:
           set -euo pipefail
           trusted_root="$RUNNER_TEMP/u2-trusted-control"
           mkdir -p "$trusted_root/scripts"
-          git show "$PUSH_BEFORE:scripts/u2_release.py" > "$trusted_root/scripts/u2_release.py"
-          git show "$PUSH_BEFORE:scripts/upstream_monitor.py" > "$trusted_root/scripts/upstream_monitor.py"
-          chmod +x "$trusted_root/scripts/u2_release.py" "$trusted_root/scripts/upstream_monitor.py"
+          if [[ "$MODE" == "auto-upstream" ]]; then
+            [[ -n "$PUSH_BEFORE" && -n "$PUSH_AFTER" ]] || {
+              echo "::error::auto-upstream qualification requires push before/after SHAs"; exit 1;
+            }
+            git show "$PUSH_BEFORE:scripts/u2_release.py" > "$trusted_root/scripts/u2_release.py"
+            git show "$PUSH_BEFORE:scripts/upstream_monitor.py" > "$trusted_root/scripts/upstream_monitor.py"
+            git show "$PUSH_BEFORE:scripts/u2_qualify.sh" > "$trusted_root/scripts/u2_qualify.sh"
+          else
+            git show "$SOURCE_SHA:scripts/u2_release.py" > "$trusted_root/scripts/u2_release.py"
+            git show "$SOURCE_SHA:scripts/upstream_monitor.py" > "$trusted_root/scripts/upstream_monitor.py"
+            git show "$SOURCE_SHA:scripts/u2_qualify.sh" > "$trusted_root/scripts/u2_qualify.sh"
+          fi
+          chmod +x "$trusted_root/scripts/u2_release.py" "$trusted_root/scripts/upstream_monitor.py" "$trusted_root/scripts/u2_qualify.sh"
           # u2_qualify.sh stays fork-owned; require the source merge to retain
           # the pre-merge copy, then execute it against the checked-out repo with
           # the pre-merge trusted u2_release helper.
-          git diff --quiet "$PUSH_BEFORE" "$PUSH_AFTER" -- scripts/u2_qualify.sh || {
-            echo "::error::U1 source merge changed the trusted qualification wrapper"; exit 1;
-          }
+          if [[ "$MODE" == "auto-upstream" ]]; then
+            git diff --quiet "$PUSH_BEFORE" "$PUSH_AFTER" -- scripts/u2_qualify.sh || {
+              echo "::error::U1 source merge changed the trusted qualification wrapper"; exit 1;
+            }
+          fi
           U2_REPO_ROOT="$PWD" \
             U2_RELEASE_HELPER="$trusted_root/scripts/u2_release.py" \
-            bash scripts/u2_qualify.sh
+            bash "$trusted_root/scripts/u2_qualify.sh"
           if [[ "$MODE" == "auto-upstream" ]]; then
             # Non-U1 push debt watcher: open one deduplicated local-release-debt Issue.
             watch_debt() {
@@ -183,8 +195,7 @@ jobs:
             upstream_sha=$(jq -r '.upstream' <<<"$parsed")
             candidate=$(jq -r '.candidate' <<<"$parsed")
             candidate_tree=$(jq -r '.tree' <<<"$parsed")
-            upstream_version=$(jq -r '.upstreamVersion' <<<"$parsed")
-            upstream_code=$(jq -r '.upstreamCode' <<<"$parsed")
+            marker_fork_main=$(jq -r '.forkMain' <<<"$parsed")
             upstream_is_ancestor=false
             if git merge-base --is-ancestor "$upstream_sha" "$candidate" 2>/dev/null; then
               upstream_is_ancestor=true
@@ -193,7 +204,6 @@ jobs:
             actual_candidate_tree=$(git rev-parse "${candidate}^{tree}")
             source_parents=$(git rev-list --parents -n 1 "$PUSH_AFTER" | jq -R 'rtrimstr("\n") | split(" ") | .[1:]')
             candidate_parents=$(git rev-list --parents -n 1 "$candidate" | jq -R 'rtrimstr("\n") | split(" ") | .[1:]')
-            git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
             git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
               +refs/heads/main:refs/remotes/upstream/main
             live_upstream=$(git rev-parse refs/remotes/upstream/main)
@@ -204,6 +214,20 @@ jobs:
               echo "qualified=false" >> "$GITHUB_OUTPUT"
               exit 0
             }
+            upstream_version_file="$RUNNER_TEMP/upstream-app-build.gradle"
+            git show "$upstream_sha:app/build.gradle" > "$upstream_version_file"
+            upstream_version_json=$(python3 "$trusted_root/scripts/u2_release.py" parse-app-version --file "$upstream_version_file")
+            upstream_version=$(jq -r '.versionName' <<<"$upstream_version_json")
+            upstream_code=$(jq -r '.versionCode' <<<"$upstream_version_json")
+            existing_fork_main=$(git rev-parse refs/remotes/origin/main 2>/dev/null || true)
+            if [[ -n "$existing_fork_main" && "$existing_fork_main" != "$marker_fork_main" ]]; then
+              echo "::error::fork main baseline differs from the trusted candidate marker";
+              watch_debt "fork-main-baseline-mismatch"
+              sed -i '/^qualified=/d' "$GITHUB_OUTPUT"
+              echo "qualified=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
             fork_main=$(git rev-parse refs/remotes/origin/main)
             fork_main_is_ancestor=false
             if git merge-base --is-ancestor "$fork_main" "$upstream_sha" 2>/dev/null; then
@@ -247,6 +271,7 @@ jobs:
               --arg upstream_repository "$UPSTREAM_REPO" \
               --arg upstream_ref "$UPSTREAM_REF" \
               --arg fork_main "$fork_main" \
+              --arg marker_fork_main "$marker_fork_main" \
               --arg marker_tree "$candidate_tree" \
               --arg candidate_tree "$actual_candidate_tree" \
               --arg rebuilt_tree "$rebuilt_tree" \
@@ -255,7 +280,7 @@ jobs:
               --argjson candidate_parents "$candidate_parents" \
               --argjson candidate_needed "$replay_candidate_needed" \
               --argjson fork_main_is_ancestor "$fork_main_is_ancestor" \
-              '{status:$status,candidate_needed:$candidate_needed,before:$before,source_after:$source_after,source_parents:$source_parents,candidate:$candidate,candidate_parents:$candidate_parents,upstream:$upstream,upstream_repository:$upstream_repository,upstream_ref:$upstream_ref,fork_main:$fork_main,fork_main_is_ancestor:$fork_main_is_ancestor,marker_tree:$marker_tree,candidate_tree:$candidate_tree,rebuilt_tree:$rebuilt_tree,source_tree:$source_tree}' \
+              '{status:$status,candidate_needed:$candidate_needed,before:$before,source_after:$source_after,source_parents:$source_parents,candidate:$candidate,candidate_parents:$candidate_parents,upstream:$upstream,upstream_repository:$upstream_repository,upstream_ref:$upstream_ref,fork_main:$fork_main,marker_fork_main:$marker_fork_main,fork_main_is_ancestor:$fork_main_is_ancestor,marker_tree:$marker_tree,candidate_tree:$candidate_tree,rebuilt_tree:$rebuilt_tree,source_tree:$source_tree}' \
               > "$replay_file"
             result=$(python3 "$trusted_root/scripts/u2_release.py" qualify-u1 \
               --before "$PUSH_BEFORE" \
@@ -268,6 +293,8 @@ jobs:
               --marker "$marker" \
               --candidate-tree "$candidate_tree" \
               --upstream-ancestor "$upstream_is_ancestor" \
+              --upstream-version "$upstream_version" \
+              --upstream-code "$upstream_code" \
               --replay-file "$replay_file")
             if [[ "$(jq -r '.qualified' <<<"$result")" != "true" ]]; then
               reason=$(jq -r '.reason' <<<"$result")

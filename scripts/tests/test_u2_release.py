@@ -20,7 +20,6 @@ from scripts.u2_release import (
     debt_manifest,
     derive_integrated_upstream_sha,
     fingerprint_manifest,
-    fresh_integration_replay,
     normalize_version_overlay,
     parse_app_version,
     parse_provenance_marker,
@@ -90,6 +89,7 @@ class U2ReleaseContractTests(unittest.TestCase):
             "a" * 40,
             "b" * 40,
             "c" * 40,
+            "d" * 40,
             "2.1.27",
             237,
         )
@@ -99,12 +99,15 @@ class U2ReleaseContractTests(unittest.TestCase):
                 "upstream": "a" * 40,
                 "candidate": "b" * 40,
                 "tree": "c" * 40,
+                "forkMain": "d" * 40,
                 "upstreamVersion": "2.1.27",
                 "upstreamCode": "237",
             },
         )
         with self.assertRaises(ValueError):
             parse_provenance_marker(marker.replace("tree=" + "c" * 40, "tree=short"))
+        with self.assertRaises(ValueError):
+            parse_provenance_marker(marker.replace(" forkMain=" + "d" * 40, ""))
 
     def test_strict_u1_merge_requires_pr_lineage_and_replay(self):
         upstream = "a" * 40
@@ -112,7 +115,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         tree = "c" * 40
         before = "d" * 40
         after = "e" * 40
-        marker = build_provenance_marker(upstream, candidate, tree, "2.1.27", 237)
+        marker = build_provenance_marker(upstream, candidate, tree, "f" * 40, "2.1.27", 237)
         pr = {
             "number": 7,
             "state": "closed",
@@ -124,6 +127,25 @@ class U2ReleaseContractTests(unittest.TestCase):
             "head": candidate_branch_name(upstream),
             "head_sha": candidate,
             "merge_commit_sha": after,
+        }
+        replay = {
+            "status": "clean",
+            "candidate_needed": True,
+            "before": before,
+            "source_after": after,
+            "source_parents": [before, candidate],
+            "candidate": candidate,
+            "candidate_parents": [before, upstream],
+            "upstream": upstream,
+            "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
+            "upstream_ref": "refs/heads/main",
+            "fork_main": "f" * 40,
+            "marker_fork_main": "f" * 40,
+            "fork_main_is_ancestor": True,
+            "marker_tree": tree,
+            "candidate_tree": tree,
+            "rebuilt_tree": tree,
+            "source_tree": tree,
         }
 
         qualified = qualify_u1_merge(
@@ -137,12 +159,12 @@ class U2ReleaseContractTests(unittest.TestCase):
             marker=marker,
             candidate_tree=tree,
             upstream_is_ancestor=True,
-            replay=("clean", tree, tree),
+            upstream_version="2.1.27",
+            upstream_code=237,
+            replay=replay,
         )
 
         self.assertTrue(qualified["qualified"])
-        self.assertEqual(fresh_integration_replay("clean", tree, tree)["reason"], "replay-match")
-        self.assertEqual(fresh_integration_replay("clean", tree, "f" * 40)["reason"], "replay-tree-mismatch")
         pr["author"] = "human"
         self.assertEqual(
             qualify_u1_merge(
@@ -156,7 +178,9 @@ class U2ReleaseContractTests(unittest.TestCase):
                 marker=marker,
                 candidate_tree=tree,
                 upstream_is_ancestor=True,
-                replay=("clean", tree, tree),
+                upstream_version="2.1.27",
+                upstream_code=237,
+                replay=replay,
             )["reason"],
             "associated-pr-mismatch",
         )
@@ -174,6 +198,7 @@ class U2ReleaseContractTests(unittest.TestCase):
             "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
             "upstream_ref": "refs/heads/main",
             "fork_main": "e" * 40,
+            "marker_fork_main": "e" * 40,
             "fork_main_is_ancestor": True,
             "marker_tree": "f" * 40,
             "candidate_tree": "f" * 40,
@@ -215,6 +240,108 @@ class U2ReleaseContractTests(unittest.TestCase):
         self._assert_replay_rejected(invalid, "replay-fork-main-not-ancestor")
         invalid = dict(valid, candidate_needed=False)
         self._assert_replay_rejected(invalid, "replay-candidate-not-built")
+        invalid = dict(valid, marker_fork_main="0" * 40)
+        self._assert_replay_rejected(invalid, "replay-fork-main-mismatch")
+
+        marker = build_provenance_marker(
+            valid["upstream"], valid["candidate"], valid["marker_tree"], "0" * 40, "2.1.27", 237
+        )
+        pr = {
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-28T00:00:00Z",
+            "base": "patched",
+            "merged_by": "slashinchi",
+            "author": "github-actions[bot]",
+            "head_repository": "slashinchi/TVBoxOS-Mobile",
+            "head": candidate_branch_name(valid["upstream"]),
+            "head_sha": valid["candidate"],
+            "merge_commit_sha": valid["source_after"],
+        }
+        result = qualify_u1_merge(
+            before=valid["before"],
+            after=valid["source_after"],
+            parents=valid["source_parents"],
+            push_actor="slashinchi",
+            pr=pr,
+            repository="slashinchi/TVBoxOS-Mobile",
+            upstream_sha=valid["upstream"],
+            marker=marker,
+            candidate_tree=valid["marker_tree"],
+            upstream_is_ancestor=True,
+            upstream_version="2.1.27",
+            upstream_code=237,
+            replay=valid,
+        )
+        self.assertEqual(result["reason"], "provenance-fork-main-mismatch")
+
+    def test_strict_qualifier_rejects_legacy_replay_tuple(self):
+        evidence = self._replay_evidence()
+        marker = build_provenance_marker(
+            evidence["upstream"], evidence["candidate"], evidence["marker_tree"], evidence["fork_main"], "2.1.27", 237
+        )
+        pr = {
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-28T00:00:00Z",
+            "base": "patched",
+            "merged_by": "slashinchi",
+            "author": "github-actions[bot]",
+            "head_repository": "slashinchi/TVBoxOS-Mobile",
+            "head": candidate_branch_name(evidence["upstream"]),
+            "head_sha": evidence["candidate"],
+            "merge_commit_sha": evidence["source_after"],
+        }
+        result = qualify_u1_merge(
+            before=evidence["before"],
+            after=evidence["source_after"],
+            parents=evidence["source_parents"],
+            push_actor="slashinchi",
+            pr=pr,
+            repository="slashinchi/TVBoxOS-Mobile",
+            upstream_sha=evidence["upstream"],
+            marker=marker,
+            candidate_tree=evidence["marker_tree"],
+            upstream_is_ancestor=True,
+            upstream_version="2.1.27",
+            upstream_code=237,
+            replay=("clean", evidence["marker_tree"], evidence["marker_tree"]),
+        )
+        self.assertEqual(result["reason"], "replay-evidence-required")
+
+    def test_u1_marker_version_must_match_fixed_upstream_object(self):
+        evidence = self._replay_evidence()
+        marker = build_provenance_marker(
+            evidence["upstream"], evidence["candidate"], evidence["marker_tree"], evidence["fork_main"], "99.99.99", 9999
+        )
+        pr = {
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-28T00:00:00Z",
+            "base": "patched",
+            "merged_by": "slashinchi",
+            "author": "github-actions[bot]",
+            "head_repository": "slashinchi/TVBoxOS-Mobile",
+            "head": candidate_branch_name(evidence["upstream"]),
+            "head_sha": evidence["candidate"],
+            "merge_commit_sha": evidence["source_after"],
+        }
+        result = qualify_u1_merge(
+            before=evidence["before"],
+            after=evidence["source_after"],
+            parents=evidence["source_parents"],
+            push_actor="slashinchi",
+            pr=pr,
+            repository="slashinchi/TVBoxOS-Mobile",
+            upstream_sha=evidence["upstream"],
+            marker=marker,
+            candidate_tree=evidence["marker_tree"],
+            upstream_is_ancestor=True,
+            upstream_version="2.1.27",
+            upstream_code=237,
+            replay=evidence,
+        )
+        self.assertEqual(result["reason"], "provenance-version-mismatch")
 
     def test_manual_integrated_upstream_and_canonical_release_baseline_fail_closed(self):
         sha = "a" * 40
@@ -1223,6 +1350,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         for token in (
             'git show "$PUSH_BEFORE:scripts/u2_release.py"',
             'git show "$PUSH_BEFORE:scripts/upstream_monitor.py"',
+            'git show "$PUSH_BEFORE:scripts/u2_qualify.sh"',
             'refs/remotes/upstream/main',
             'refs/remotes/origin/main',
             'git worktree add --detach',
@@ -1230,10 +1358,29 @@ class U2ReleaseContractTests(unittest.TestCase):
             'candidate_parents',
             'replay_file',
             '--replay-file',
+            '--upstream-version',
+            '--upstream-code',
+            'marker_fork_main',
         ):
             self.assertIn(token, qualify, token)
+        self.assertIn('git show "$SOURCE_SHA:scripts/u2_release.py"', qualify)
+        self.assertIn('git show "$SOURCE_SHA:scripts/upstream_monitor.py"', qualify)
+        self.assertIn('git show "$SOURCE_SHA:scripts/u2_qualify.sh"', qualify)
+        self.assertIn('bash "$trusted_root/scripts/u2_qualify.sh"', qualify)
+        self.assertNotIn("--replay-status", qualify)
+        self.assertNotIn("--replay-tree", qualify)
+        self.assertNotIn("--replay-actual-tree", qualify)
         self.assertIn("U2_REPO_ROOT", qualify_script)
         self.assertIn("U2_RELEASE_HELPER", qualify_script)
+
+    def test_manual_dispatch_does_not_depend_on_push_event_shas(self):
+        workflow = (ROOT / ".github/workflows/u2-release.yml").read_text()
+        qualify = workflow[workflow.index("  qualify:"):workflow.index("  prep:")]
+        self.assertIn('if [[ "$MODE" == "auto-upstream" ]]; then', qualify)
+        self.assertIn('git show "$SOURCE_SHA:scripts/u2_release.py"', qualify)
+        self.assertIn('git show "$SOURCE_SHA:scripts/upstream_monitor.py"', qualify)
+        auto_section = qualify[qualify.index('if [[ "$MODE" == "auto-upstream" ]]; then'):]
+        self.assertIn('[[ -n "$PUSH_BEFORE" && -n "$PUSH_AFTER" ]]', auto_section)
 
     def test_release_debt_cli_computes_canonical_baseline_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1288,54 +1435,7 @@ class U2ReleaseContractTests(unittest.TestCase):
         tree = "c" * 40
         before = "d" * 40
         after = "e" * 40
-        marker = build_provenance_marker(upstream, candidate, tree, "2.1.27", 237)
-        pr = json.dumps({
-            "number": 7,
-            "state": "closed",
-            "merged_at": "2026-08-28T00:00:00Z",
-            "base": "patched",
-            "merged_by": "slashinchi",
-            "author": "github-actions[bot]",
-            "head_repository": "slashinchi/TVBoxOS-Mobile",
-            "head": candidate_branch_name(upstream),
-            "head_sha": candidate,
-            "merge_commit_sha": after,
-        })
-        base = [
-            "python3", "scripts/u2_release.py", "qualify-u1",
-            "--before", before,
-            "--after", after,
-            "--parents", before, candidate,
-            "--actor", "slashinchi",
-            "--pr", pr,
-            "--repository", "slashinchi/TVBoxOS-Mobile",
-            "--upstream", upstream,
-            "--marker", marker,
-            "--candidate-tree", tree,
-            "--upstream-ancestor", "true",
-            "--replay-status", "clean",
-            "--replay-tree", tree,
-            "--replay-actual-tree", tree,
-        ]
-        ok = subprocess.run(base, cwd=ROOT, text=True, capture_output=True)
-        self.assertEqual(ok.returncode, 0, ok.stderr)
-        self.assertEqual(json.loads(ok.stdout)["qualified"], True)
-        bad = subprocess.run(
-            base + ["--parents", before, "f" * 40],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(bad.returncode, 0, bad.stderr)
-        self.assertEqual(json.loads(bad.stdout)["reason"], "merge-parent-mismatch")
-
-    def test_qualify_u1_cli_accepts_structured_replay_file(self):
-        upstream = "a" * 40
-        candidate = "b" * 40
-        tree = "c" * 40
-        before = "d" * 40
-        after = "e" * 40
-        marker = build_provenance_marker(upstream, candidate, tree, "2.1.27", 237)
+        marker = build_provenance_marker(upstream, candidate, tree, "f" * 40, "2.1.27", 237)
         pr = json.dumps({
             "number": 7,
             "state": "closed",
@@ -1360,6 +1460,76 @@ class U2ReleaseContractTests(unittest.TestCase):
             "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
             "upstream_ref": "refs/heads/main",
             "fork_main": "f" * 40,
+            "marker_fork_main": "f" * 40,
+            "fork_main_is_ancestor": True,
+            "marker_tree": tree,
+            "candidate_tree": tree,
+            "rebuilt_tree": tree,
+            "source_tree": tree,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            replay_path = Path(tmp) / "replay.json"
+            replay_path.write_text(json.dumps(replay))
+            base = [
+                "python3", "scripts/u2_release.py", "qualify-u1",
+                "--before", before,
+                "--after", after,
+                "--parents", before, candidate,
+                "--actor", "slashinchi",
+                "--pr", pr,
+                "--repository", "slashinchi/TVBoxOS-Mobile",
+                "--upstream", upstream,
+                "--marker", marker,
+                "--candidate-tree", tree,
+                "--upstream-ancestor", "true",
+                "--upstream-version", "2.1.27",
+                "--upstream-code", "237",
+                "--replay-file", str(replay_path),
+            ]
+            ok = subprocess.run(base, cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertEqual(json.loads(ok.stdout)["qualified"], True)
+            bad = subprocess.run(
+                base + ["--parents", before, "f" * 40],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(bad.returncode, 0, bad.stderr)
+            self.assertEqual(json.loads(bad.stdout)["reason"], "merge-parent-mismatch")
+
+    def test_qualify_u1_cli_accepts_structured_replay_file(self):
+        upstream = "a" * 40
+        candidate = "b" * 40
+        tree = "c" * 40
+        before = "d" * 40
+        after = "e" * 40
+        marker = build_provenance_marker(upstream, candidate, tree, "f" * 40, "2.1.27", 237)
+        pr = json.dumps({
+            "number": 7,
+            "state": "closed",
+            "merged_at": "2026-08-28T00:00:00Z",
+            "base": "patched",
+            "merged_by": "slashinchi",
+            "author": "github-actions[bot]",
+            "head_repository": "slashinchi/TVBoxOS-Mobile",
+            "head": candidate_branch_name(upstream),
+            "head_sha": candidate,
+            "merge_commit_sha": after,
+        })
+        replay = {
+            "status": "clean",
+            "candidate_needed": True,
+            "before": before,
+            "source_after": after,
+            "source_parents": [before, candidate],
+            "candidate": candidate,
+            "candidate_parents": [before, upstream],
+            "upstream": upstream,
+            "upstream_repository": "kukuqi666/TVBoxOS-Mobile",
+            "upstream_ref": "refs/heads/main",
+            "fork_main": "f" * 40,
+            "marker_fork_main": "f" * 40,
             "fork_main_is_ancestor": True,
             "marker_tree": tree,
             "candidate_tree": tree,
@@ -1382,6 +1552,8 @@ class U2ReleaseContractTests(unittest.TestCase):
                     "--marker", marker,
                     "--candidate-tree", tree,
                     "--upstream-ancestor", "true",
+                    "--upstream-version", "2.1.27",
+                    "--upstream-code", "237",
                     "--replay-file", str(replay_path),
                 ],
                 cwd=ROOT,
