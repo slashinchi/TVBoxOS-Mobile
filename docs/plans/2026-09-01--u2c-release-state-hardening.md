@@ -127,7 +127,7 @@
 - [x] **Step 3:** Read back Environment, reviewer, immutable-release, ruleset, signer workflow, active runs, and canary residue state. All readbacks are green: `release-signing.can_admins_bypass=false`, no active runs or pending deployments, and no canary residue.
 - [x] **Step 4:** Set `TVBOX_U2_ENABLED=true` as the last setting change only after all prior evidence is green. Preflight was green, the repository variable changed from false to true, and no other setting changed afterward.
 - [x] **Step 5:** Run the enabled `noop-smoke` dispatch and verify it stops before prep/build/sign/publish/issue/ref writes. Run `33566543762` succeeded at gate/qualification; all write-capable jobs were skipped and run artifacts/pending deployments are empty.
-- [x] **Step 6:** Write Drive HANDOFF to `REVIEW_PENDING`, append FACTS and the final decision, and stop before the first formal Release live-observation batch. HANDOFF is `REVIEW_PENDING / HUMAN_ACTION_REQUIRED`; FACTS and DECISIONS record the exact run and no formal Release live-observation has started.
+- [x] **Step 6:** Close the U2c batch on the Drive control plane and stop before the first formal Release live-observation batch. HANDOFF is `U2c CLOSED`; FACTS and DECISIONS record the exact run and close; no formal Release live-observation has started and any such batch requires new explicit authorization.
 
 ### Residual Cleanup
 
