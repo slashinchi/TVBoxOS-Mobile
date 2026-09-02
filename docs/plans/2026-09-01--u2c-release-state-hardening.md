@@ -132,7 +132,11 @@
 ### Residual Cleanup
 
 - [x] Archive exact SHA/PR/run evidence for the temporary branches before deletion.
-- [ ] Delete the exact remote audit branches `u2c-canary-replan-20260901`, `u2c-canary-secret-inherit-20260901`, and `u2c-retire-rc-control-v1-20260901`; retain the archived evidence and commit/PR history.
+- [x] Delete the exact remote audit branches `u2c-canary-replan-20260901`, `u2c-canary-secret-inherit-20260901`, and `u2c-retire-rc-control-v1-20260901`; retain the archived evidence and commit/PR history. Pre-deletion evidence is preserved in `outputs/evidence/2026-09-02--u2c-final-cleanup-before/`; all three remote branches are verified deleted and no temporary U2c branches remain.
+
+### Post-closeout Guard
+
+- [x] Add path filters to prevent docs/tests/U2-workflow-only pushes from triggering the release orchestrator; verify post-merge CI and closeout stop condition. PR #39 merged at `40f54e1fa5e5193449f59bf3247a1dd63eb78822` adding `paths-ignore` (`docs/**`, `scripts/tests/**`, `.github/workflows/u2-release.yml`) and structural regression tests; post-merge `build-apk` run `33572358831` passed without triggering U2 Release Orchestrator. Formal Release `v2.1.26.1`, tag, and `patched/update.json` remain unchanged; execution status remains `REVIEW_PENDING / HUMAN_ACTION_REQUIRED` and stops before the separately authorized first formal Release live-observation batch.
 
 ## Rollback
 
