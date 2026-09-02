@@ -22,6 +22,7 @@ on:
       - docs/**
       - scripts/tests/**
       - .github/workflows/u2-release.yml
+      - tmp/**
 
 permissions:
   contents: read
