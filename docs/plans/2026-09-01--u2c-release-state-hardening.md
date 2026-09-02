@@ -136,7 +136,7 @@
 
 ### Post-closeout Guard
 
-- [x] Add path filters to prevent docs/tests/tmp/U2-workflow-only pushes from triggering the release orchestrator; verify post-merge CI and closeout stop condition. PR #39 merged at `40f54e1fa5e5193449f59bf3247a1dd63eb78822` initially added `paths-ignore` for `docs/**`, `scripts/tests/**`, and `.github/workflows/u2-release.yml`; cleanup run `33584630719` exposed that `tmp/**` was not covered, so PR #43 adds `tmp/**` and the matching structural regression assertion. The cleanup run completed with signing/build/publish jobs skipped but incorrectly created Issue #42; that false-positive issue is closed as not planned. Formal Release `v2.1.26.1`, tag, and `patched/update.json` remain unchanged; execution status remains `REVIEW_PENDING / HUMAN_ACTION_REQUIRED` and stops before the separately authorized first formal Release live-observation batch.
+- [x] Add path filters to prevent docs/tests/tmp/U2-workflow-only pushes from triggering the release orchestrator; verify post-merge CI and closeout stop condition. PR #39 merged at `40f54e1fa5e5193449f59bf3247a1dd63eb78822` initially added `paths-ignore` for `docs/**`, `scripts/tests/**`, and `.github/workflows/u2-release.yml`; cleanup run `33584630719` exposed that `tmp/**` was not covered, so PR #43 adds `tmp/**` and the matching structural regression assertion. The cleanup run completed with signing/build/publish jobs skipped but incorrectly created Issue #42; that false-positive issue is closed as not planned. Formal Release `v2.1.26.1`, tag, and `patched/update.json` remain unchanged; U2c is CLOSED; formal Release live-observation has not started and requires new explicit authorization.
 
 ## Rollback
 
