@@ -1,3 +1,4 @@
+import collections
 import subprocess
 import tempfile
 import unittest
@@ -202,6 +203,34 @@ class U1aContractTests(unittest.TestCase):
         self.assertFalse((ROOT / ".github/workflows/rc-control.yml").exists())
         self.assertIn("environment: release-signing", signed_block)
         self.assertNotIn("environment: release-signing", attestor_block)
+
+    def test_build_apk_setup_android_packages_platform_tools(self):
+        tree = self._yaml_tree(BUILD_WORKFLOW.read_text())
+        job = tree["jobs"]["build-apk"]
+        step = self._named_step(job["steps"], "Set up Android SDK")
+        self.assertEqual(
+            step["uses"].split("#", 1)[0].strip(),
+            "android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407",
+        )
+        self.assertEqual(step["with"]["packages"], "platform-tools")
+        install = self._named_step(job["steps"], "Install Android API 34")
+        self.assertIn("platforms;android-34", install["run"])
+        self.assertIn("build-tools;34.0.0", install["run"])
+
+    def test_candidate_validation_setup_android_packages_platform_tools(self):
+        tree = self._yaml_tree(WORKFLOW.read_text())
+        job = tree["jobs"]["candidate_validation"]
+        step = self._named_step(job["steps"], "Set up Android SDK for candidate build")
+        self.assertEqual(
+            step["uses"].split("#", 1)[0].strip(),
+            "android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407",
+        )
+        self.assertEqual(step["with"]["packages"], "platform-tools")
+        install = self._named_step(
+            job["steps"], "Install Android API 34 for candidate build"
+        )
+        self.assertIn("platforms;android-34", install["run"])
+        self.assertIn("build-tools;34.0.0", install["run"])
 
     def test_risk_classification_stays_narrow(self):
         self.assertEqual(classify_paths(["README.md", "docs/MIGRATION.md"]), "docs-only")
@@ -707,6 +736,102 @@ class U1aContractTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command, ["gh", "api", "repos/fork/repo/issues"])
         self.assertNotIn("shell", run.call_args.kwargs)
+
+    @staticmethod
+    def _named_step(steps, name):
+        matches = [step for step in steps if isinstance(step, dict) and step.get("name") == name]
+        if len(matches) != 1:
+            raise AssertionError(f"expected exactly one step named {name!r}, found {len(matches)}")
+        return matches[0]
+
+    @staticmethod
+    def _yaml_tree(text):
+        """Minimal indentation-based YAML block parser (pure stdlib).
+
+        Returns nested dicts/lists for the subset used by GitHub workflow
+        structure assertions (jobs, steps, needs, permissions, environment,
+        concurrency, run blocks). No external dependencies.
+        """
+        lines = text.splitlines()
+
+        def parse_block(idx, indent):
+            node = collections.OrderedDict()
+            while idx < len(lines):
+                line = lines[idx]
+                if not line.strip() or line.lstrip().startswith("#"):
+                    idx += 1
+                    continue
+                cur_indent = len(line) - len(line.lstrip(" "))
+                if cur_indent < indent:
+                    break
+                if cur_indent > indent:
+                    raise AssertionError(f"unexpected indent {cur_indent} > {indent}: {line!r}")
+                stripped = line.strip()
+                if stripped.startswith("- "):
+                    seq = node.setdefault("__seq__", [])
+                    body = stripped[2:]
+                    nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
+                    child_indent = len(nxt) - len(nxt.lstrip(" ")) if nxt.strip() else -1
+                    has_children = child_indent > cur_indent
+                    if ":" in body:
+                        key, _, value = body.partition(":")
+                        value = value.strip()
+                        item = {key: value} if value else {}
+                        if has_children:
+                            child, idx = parse_block(idx + 1, cur_indent + 2)
+                            if isinstance(child, collections.OrderedDict):
+                                item.update(child)
+                            else:
+                                item[key] = child
+                        else:
+                            idx += 1
+                        seq.append(item)
+                    else:
+                        seq.append(body)
+                        idx += 1
+                    continue
+                key, sep, value = stripped.partition(":")
+                if not sep:
+                    raise AssertionError(f"expected key: value, got {stripped!r}")
+                value = value.strip()
+                if value in ("|", ">", "|-", ">-"):
+                    buf = []
+                    idx += 1
+                    block_indent = None
+                    while idx < len(lines):
+                        line = lines[idx]
+                        if not line.strip():
+                            buf.append("")
+                            idx += 1
+                            continue
+                        line_indent = len(line) - len(line.lstrip(" "))
+                        if block_indent is None:
+                            block_indent = line_indent
+                        if line_indent < block_indent:
+                            break
+                        buf.append(line[block_indent:] if line_indent >= block_indent else "")
+                        idx += 1
+                    node[key] = "\n".join(buf)
+                    continue
+                if value:
+                    node[key] = value
+                    idx += 1
+                    continue
+                child, idx = parse_block(idx + 1, cur_indent + 2)
+                node[key] = child
+            return node, idx
+
+        def normalize(node):
+            if isinstance(node, collections.OrderedDict):
+                if "__seq__" in node and len(node) == 1:
+                    return node["__seq__"]
+                return {k: normalize(v) for k, v in node.items()}
+            if isinstance(node, list):
+                return [normalize(item) for item in node]
+            return node
+
+        tree, _ = parse_block(0, 0)
+        return normalize(tree)
 
     @staticmethod
     def _new_repo(parent):
